@@ -24,7 +24,7 @@ class StateError(Die):
 
 def parse_gates(text: str) -> list[dict]:
     raw = text.replace("\r", "").strip()
-    if not raw:
+    if not raw or raw == "# Gates":
         return []
     prefix = "# Gates\n\n## "
     if not raw.startswith(prefix):
@@ -59,7 +59,7 @@ def parse_gates(text: str) -> list[dict]:
 
 def render_gates(gates: list[dict]) -> str:
     if not gates:
-        return ""
+        return "# Gates\n"
     blocks = []
     for gate in gates:
         lines = [f"## {gate['id']}", ""]

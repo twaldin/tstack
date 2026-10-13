@@ -35,9 +35,10 @@ class GatesFormat(unittest.TestCase):
         self.assertEqual(parse_gates(render_gates(gates)), gates)
         self.assertEqual(render_gates(parse_gates(render_gates(gates))), render_gates(gates))
 
-    def test_empty_file_has_no_gates(self):
+    def test_empty_file_and_bare_heading_have_no_gates(self):
         self.assertEqual(parse_gates(""), [])
-        self.assertEqual(render_gates([]), "")
+        self.assertEqual(parse_gates("# Gates\n"), [])
+        self.assertEqual(render_gates([]), "# Gates\n")
 
     def test_malformed_inputs_are_errors(self):
         bad = {
