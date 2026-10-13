@@ -83,7 +83,8 @@ else:
 STUB_EASL = r'''#!/usr/bin/env python3
 """Fake easl: logs argv; asks live in stubs/asks.json. agent.restart refuses (conflict) when stubs/easl-busy
 exists unless --force, and fails when stubs/easl-fail exists; agent.wait fails when stubs/easl-wait-fail exists;
-agent.prompt fails when stubs/easl-prompt-fail exists; agent.list returns stubs/agents.json."""
+agent.prompt fails when stubs/easl-prompt-fail exists, else answers delivery `message` for a tile whose
+agents.json entry has protocol 1 (`typed` otherwise); agent.list returns stubs/agents.json."""
 import json, os, sys
 from pathlib import Path
 stubs = Path(os.environ["STUBS"])
@@ -120,6 +121,11 @@ elif args[0] == "agent.wait" and (stubs / "easl-wait-fail").exists():
     sys.exit(1)
 elif args[0] == "agent.list":
     print((stubs / "agents.json").read_text() if (stubs / "agents.json").exists() else json.dumps({"agents": []}))
+elif args[0] == "agent.prompt":
+    agents = json.loads((stubs / "agents.json").read_text())["agents"] if (stubs / "agents.json").exists() else []
+    tile = args[args.index("--target") + 1]
+    takes = any(a.get("tile") == tile and (a.get("protocol") or 0) >= 1 for a in agents)
+    out({"delivery": "message" if takes else "typed", "submittedAt": "2026-10-13T00:00:00Z"})
 else:
     out({"object": {"id": "obj_tile"}, "created": True})
 '''
@@ -221,16 +227,16 @@ class Sandbox(unittest.TestCase):
     def board(self) -> None:
         (self.seat / "state" / "board.json").write_text(json.dumps({"host": "testbox", "board": "brd_test", "tile": "obj_seat"}))
 
-    def seat_tile(self, last: dict, state: str = "working", by_session_id: bool = True, **agent) -> None:
-        """easl lists the seat's omp tile as `state`; its session file ends with the entry `last`. Found through
-        the tile's sessionId, or (by_session_id False) as the newest session in the seat's own folder."""
+    def seat_tile(self, state: str = "idle", last: dict | None = None, **agent) -> None:
+        """easl lists the seat's omp tile as `state`, its integration taking messages (protocol 1) unless
+        `agent` says otherwise. With `last`, the tile's session file ends with that entry."""
         sid = "01a1345b-0000-7000-0000-000000000001"
-        folder = "-fake" if by_session_id else "-" + str(self.seat.relative_to(self.home)).replace("/", "-")
-        session = self.home / ".omp" / "agent" / "sessions" / folder / f"2026-10-13T00-00-00-000Z_{sid}.jsonl"
-        session.parent.mkdir(parents=True, exist_ok=True)
-        session.write_text(json.dumps({"type": "session", "id": sid}) + "\n" + json.dumps(last) + "\n")
+        if last:
+            session = self.home / ".omp" / "agent" / "sessions" / "-fake" / f"2026-10-13T00-00-00-000Z_{sid}.jsonl"
+            session.parent.mkdir(parents=True, exist_ok=True)
+            session.write_text(json.dumps({"type": "session", "id": sid}) + "\n" + json.dumps(last) + "\n")
         tile = {"tile": "obj_seat", "kind": "omp", "lifecycle": {"state": state}, "focused": False, "draft": False,
-                **({"sessionId": sid} if by_session_id else {}), **agent}
+                "protocol": 1, "sessionId": sid, **agent}
         (self.stubs / "agents.json").write_text(json.dumps({"agents": [tile]}))
 
     # running the CLIs
@@ -267,17 +273,22 @@ class Sandbox(unittest.TestCase):
 
     def pr_stub(self, head: str = "a" * 40, state: str = "OPEN", checks=(("test", "SUCCESS"),), mergeable: str = "MERGEABLE",
                 merge_state: str = "CLEAN", comments=(), branch: str | None = None, review_decision: str = "",
-                created: str = "2026-10-13T00:00:00Z") -> None:
+                created: str = "2026-10-13T00:00:00Z", statuses=()) -> None:
         """`comments`: ids (the id is also the body), (id, body) or (id, body, author). The default author is the
-        gh login the operator and the lanes share. `checks`: (name, conclusion) or (name, conclusion, completedAt)."""
+        gh login the operator and the lanes share. `checks`: CheckRuns as (name, conclusion) or (name, conclusion,
+        completedAt). `statuses`: legacy commit statuses as (context, state, startedAt), shaped as gh prints them,
+        each at one fixed target URL."""
         rows = [c if isinstance(c, tuple) else (c, c) for c in comments]
+        rollup = [{"__typename": "CheckRun", "name": c[0], "conclusion": c[1], "detailsUrl": f"https://ci.example/{c[0]}",
+                   "completedAt": c[2] if len(c) > 2 else "2026-10-13T00:00:00Z"} for c in checks]
+        rollup += [{"__typename": "StatusContext", "context": s[0], "state": s[1], "startedAt": s[2],
+                    "targetUrl": f"https://legacy-ci.example/{s[0]}"} for s in statuses]
         pr = {"headRefOid": head, "headRefName": branch, "baseRefName": "main", "state": state, "isDraft": False,
               "mergeable": mergeable, "mergeStateStatus": merge_state, "latestReviews": [], "reviewRequests": [],
               "reviews": [], "reviewDecision": review_decision,
               "comments": [{"id": row[0], "body": row[1], "author": {"login": row[2] if len(row) > 2 else "shared-login"},
                             "createdAt": created} for row in rows],
-              "statusCheckRollup": [{"name": c[0], "conclusion": c[1], "detailsUrl": f"https://ci.example/{c[0]}",
-                                     "completedAt": c[2] if len(c) > 2 else "2026-10-13T00:00:00Z"} for c in checks]}
+              "statusCheckRollup": rollup}
         (self.stubs / "gh" / "pr.json").write_text(json.dumps(pr))
 
     def gh_api(self, path: str, value=None, error: str | None = None) -> None:

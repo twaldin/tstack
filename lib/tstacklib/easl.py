@@ -87,14 +87,15 @@ def upsert_note(board: dict, key: str, markdown: str, width: int = 640) -> None:
 
 
 def agent(board: dict) -> dict | None:
-    """The seat tile's entry in `agent.list`: lifecycle, sessionId, focused, draft, pid."""
+    """The seat tile's entry in `agent.list`: lifecycle, protocol (1 and up: its integration takes messages),
+    pid."""
     agents = call("agent.list", host=board["host"]).get("agents", [])
     return next((a for a in agents if a.get("tile") == board["tile"]), None)
 
 
 def restart(board: dict, force: bool = False) -> None:
     """Resume the seat's tile in place. Raises EaslConflict while it works or the operator types, unless
-    `force`, which ends whatever runs in the tile."""
+    `force`, which ends whatever runs in the tile; only `tstack restart-self`, run by the seat itself, forces."""
     call("agent.restart", "--target", board["tile"], "--mode", "resume", *(["--force"] if force else []),
          host=board["host"], timeout=120)
 
@@ -106,5 +107,8 @@ def wait_idle(board: dict, seconds: float = 90) -> None:
          host=board["host"], timeout=seconds + 30)
 
 
-def prompt(board: dict, text: str) -> None:
-    call("agent.prompt", "--target", board["tile"], "--text", text, "--from", "tstack", host=board["host"])
+def prompt(board: dict, text: str, message: str | None = None) -> dict:
+    """Prompt the seat's tile from tstack; `message` gives an out-of-band message an id easl sends at most once.
+    Returns easl's answer, whose `delivery` says `message` or `typed`."""
+    return call("agent.prompt", "--target", board["tile"], "--text", text, "--from", "tstack",
+                *(["--message", message] if message else []), host=board["host"])

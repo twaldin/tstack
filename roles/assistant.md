@@ -22,6 +22,8 @@ State on disk is the truth. Your conversation is a cache that compaction and res
 
 A turn the operator starts by typing in your tile works the same way without a batch: read state, answer, write and commit state, and leave the running wait alone.
 
+A message from tstack asking for `tstack restart-self` waits for your next safe point: with a batch in hand, finish it and ack it (step 5) first, then run `tstack restart-self`. It ends this session; tstack's restart prompt takes over from there.
+
 ## Intake
 
 Every item ends as exactly one outcome, written on its intake line:

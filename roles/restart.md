@@ -1,4 +1,4 @@
-tstack restarted this session in place, after an update, a stale heartbeat or high memory. Your system prompt was reloaded from the current files and now wins over everything earlier in this conversation. Where an earlier turn's rules, markers or remembered values differ from the files, follow the files.
+This session was restarted in place: you ran `tstack restart-self` after files you load changed or memory grew, or liveness restarted it after your wait went quiet. Your system prompt was reloaded from the current files and now wins over everything earlier in this conversation. Where an earlier turn's rules, markers or remembered values differ from the files, follow the files.
 
 Background jobs ended with the old process, your `tstack wait` included. Before anything else:
 

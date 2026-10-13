@@ -20,28 +20,28 @@ const HINT =
 const SAFE_ENV_SUFFIX = /^\.env\.(example|sample|template|dist)$/i;
 
 // The file a tool path names, without read-tool selectors: `?q=…&raw=true` queries, `#…`, and trailing
-// `:raw`, `:img`, `:conflicts`, `:N-M`, `:-N`, `:N+M`, `:A-B,C-D` in any order. Archive members
-// (`x.zip:dir/auth.json`) keep their member name as the base.
+// `:raw`, `:img`, `:conflicts`, `:N-M`, `:-N`, `:N+M`, `:A-B,C-D` in any order. An archive member
+// (`x.zip:dir/.secrets/token`) reads as a path inside the archive: its `:` is a directory separator.
 function underlyingPath(p: string): string {
   let clean = p.replace(/[?#].*$/s, "");
   for (let prev = ""; prev !== clean; ) {
     prev = clean;
     clean = clean.replace(/:(?:raw|img|conflicts|-?\d[\d,+\-]*)$/i, "");
   }
-  return clean.replace(/\/+$/, "");
+  return clean.replace(/:/g, "/").replace(/\/+$/, "");
 }
 
 function isSecretPath(p: string): boolean {
   const clean = underlyingPath(p);
-  const base = clean.split(/[/:]/).pop() ?? "";
+  const base = clean.split("/").pop() ?? "";
   if (/^\.env(\..+)?$/i.test(base) && !SAFE_ENV_SUFFIX.test(base)) return true;
   if (/\.(pem|p12|pfx|key)$/i.test(base) && !/\.pub$/i.test(base)) return true;
   if (/^id_(rsa|ecdsa|ed25519|dsa)$/.test(base)) return true;
   if (/^(auth|relay)\.json$/i.test(base)) return true;
   if (/(^|\/)\.secrets(\/|$)/.test(clean)) return true;
   if (/\.keychain(-db)?$/i.test(base) || /(^|\/)Library\/Keychains(\/|$)/.test(clean)) return true;
-  if (/\/\.config\/gcloud\/.*(credentials|access_tokens|legacy_credentials)/i.test(clean)) return true;
-  if (/\/\.config\/gcloud\/(credentials\.db|access_tokens\.db|application_default_credentials\.json)$/i.test(clean)) return true;
+  if (/(^|\/)\.config\/gcloud\/.*(credentials|access_tokens|legacy_credentials)/i.test(clean)) return true;
+  if (/(^|\/)\.config\/gcloud\/(credentials\.db|access_tokens\.db|application_default_credentials\.json)$/i.test(clean)) return true;
   return false;
 }
 

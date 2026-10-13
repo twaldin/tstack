@@ -146,13 +146,15 @@ def threads(url: str, me: str | None = None) -> list[dict]:
 
 
 def check_runs(pr: dict) -> str | None:
-    """Identity of the check runs behind a finished CI verdict (the failing runs when red, every run when green),
-    each by name, result, completion time and run URL; None while CI is pending. A rerun of the same head that
-    fails the same way has a new completion time and run URL, so a new identity."""
+    """Identity of the check results behind a finished CI verdict (the failing ones when red, all when green),
+    each by name, result, time and URL; None while CI is pending. The time is a CheckRun's completion, or for a
+    legacy commit status (StatusContext, no completion time) its creation, which gh gives as `startedAt`: a
+    rerun that fails the same way, even at the same URL, has a new identity."""
     verdict = classify(pr)
     if verdict == "pending":
         return None
-    runs = sorted([check_name(item), check_state(item), item.get("completedAt") or "",
+    runs = sorted([check_name(item), check_state(item),
+                   item.get("completedAt") or item.get("startedAt") or item.get("createdAt") or "",
                    item.get("detailsUrl") or item.get("targetUrl") or ""]
                   for item in pr.get("statusCheckRollup") or []
                   if verdict == "green" or check_state(item) not in GREEN | PENDING)

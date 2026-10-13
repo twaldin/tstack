@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 from . import prwatch
@@ -492,9 +493,10 @@ def gh_api(path: str):
 
 def only_review_unmet(url: str, pr: dict, base: str) -> None:
     """Refuse unless GitHub's branch rules prove a missing review is the only unmet requirement: the rules
-    API answers, every ruleset rule is of a type modeled here, classic protection (when the repo has any)
-    asks for nothing beyond reviews, checks and conversation resolution, every required status check has a
-    passing run on the head, a strict policy finds the head up to date, and required conversation
+    API answers, every ruleset rule is of a type modeled here, classic protection answers (GitHub's 404
+    "Branch not protected" counts as none) and asks for nothing beyond reviews, checks and conversation
+    resolution, every required status check has a passing run on the head (from the GitHub App the rule
+    names, when it names one), a strict policy finds the head up to date, and required conversation
     resolution finds no open thread. An unreadable or unmodeled rule refuses."""
     owner, repo, _ = prwatch.parse_url(url)
     head = pr["headRefOid"]
@@ -504,6 +506,7 @@ def only_review_unmet(url: str, pr: dict, base: str) -> None:
     rules, error = gh_api(f"repos/{owner}/{repo}/rules/branches/{base}")
     if error or not isinstance(rules, list):
         refuse(f"GitHub's rules for {base} are unreadable ({error or 'not a list'})")
+    # required checks as (context, GitHub App id or None for any source)
     review, required, strict, resolve = False, set(), False, False
     for rule in rules:
         kind, params = rule.get("type"), rule.get("parameters") or {}
@@ -511,18 +514,20 @@ def only_review_unmet(url: str, pr: dict, base: str) -> None:
             review = True
             resolve |= bool(params.get("required_review_thread_resolution"))
         elif kind == "required_status_checks":
-            required |= {c.get("context") for c in params.get("required_status_checks") or []}
+            required |= {(c.get("context"), c.get("integration_id")) for c in params.get("required_status_checks") or []}
             strict |= bool(params.get("strict_required_status_checks_policy"))
         elif kind not in RULES_MET:
             refuse(f"branch rule `{kind}` is not one lane merge can check")
     protection, error = gh_api(f"repos/{owner}/{repo}/branches/{base}/protection")
-    if error and not re.search(r"HTTP 40[34]", error):
+    if error and not re.search(r"Branch not protected \(HTTP 404\)", error):
         refuse(f"classic branch protection for {base} is unreadable ({error})")
     for key, value in (protection or {}).items():
         if key == "required_pull_request_reviews":
             review = True
         elif key == "required_status_checks":
-            required |= set(value.get("contexts") or []) | {c.get("context") for c in value.get("checks") or []}
+            checks = {(c.get("context"), c.get("app_id")) for c in value.get("checks") or []}
+            named = {context for context, _ in checks}
+            required |= checks | {(c, None) for c in value.get("contexts") or [] if c not in named}
             strict |= bool(value.get("strict"))
         elif key == "required_conversation_resolution":
             resolve |= bool(value.get("enabled"))
@@ -533,7 +538,22 @@ def only_review_unmet(url: str, pr: dict, base: str) -> None:
     states: dict[str, list[str]] = {}
     for item in pr["statusCheckRollup"]:
         states.setdefault(prwatch.check_name(item), []).append(prwatch.check_state(item))
-    unproven = sorted(c for c in required - {None} if not states.get(c) or any(s not in prwatch.GREEN for s in states[c]))
+    unproven = []
+    for context, app in sorted(required, key=lambda c: (str(c[0]), str(c[1]))):
+        if context is None:
+            continue
+        if app in (None, -1):
+            if not states.get(context) or any(s not in prwatch.GREEN for s in states[context]):
+                unproven.append(context)
+            continue
+        runs, error = gh_api(f"repos/{owner}/{repo}/commits/{head}/check-runs?"
+                             f"check_name={urllib.parse.quote(context, safe='')}&filter=latest")
+        if error:
+            refuse(f"check runs for {context} on {head[:12]} are unreadable ({error})")
+        mine = [r for r in (runs or {}).get("check_runs") or [] if (r.get("app") or {}).get("id") == app]
+        if not mine or any(r.get("status") != "completed" or (r.get("conclusion") or "").upper() not in prwatch.GREEN
+                           for r in mine):
+            unproven.append(f"{context} (from GitHub App {app})")
     if unproven:
         refuse(f"required checks without a passing run on {head[:12]}: {', '.join(unproven)}")
     if strict:

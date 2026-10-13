@@ -58,6 +58,10 @@ class SecretGuard(unittest.TestCase):
             {"toolName": "read", "input": {"path": "/fictional/app/.env:1+3"}},
             {"toolName": "read", "input": {"path": "~/.secrets/service-token:1-2,4-5"}},
             {"toolName": "read", "input": {"path": "/fictional/backup.zip:home/auth.json"}},
+            {"toolName": "read", "input": {"path": "/fictional/backup.zip:.secrets/service-token:raw"}},
+            {"toolName": "read", "input": {"path": "/fictional/home.tar.gz:u/.secrets/service-token"}},
+            {"toolName": "read", "input": {"path": "/fictional/backup.zip:Library/Keychains/login.keychain-db"}},
+            {"toolName": "read", "input": {"path": "/fictional/backup.zip:.config/gcloud/credentials.db"}},
             {"toolName": "eval", "input": {"code": "print(read('/fictional/auth.json?q=.apiKey&raw=true'))"}},
             {"toolName": "eval", "input": {"code": "print(read('/fictional/app/.env:raw'))"}},
         ]
@@ -66,6 +70,7 @@ class SecretGuard(unittest.TestCase):
             {"toolName": "bash", "input": {"command": "git log --oneline"}},
             {"toolName": "read", "input": {"path": "package.json?q=.name&raw=true"}},
             {"toolName": "read", "input": {"path": "src/auth.ts:10-20:raw"}},
+            {"toolName": "read", "input": {"path": "/fictional/backup.zip:docs/secrets.md:raw"}},
             {"toolName": "bash", "input": {"command": "secret-check info file:~/.secrets/service-token"}},
         ]
         out = self.guard(calls=blocked + allowed)["calls"]

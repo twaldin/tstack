@@ -146,7 +146,7 @@ class Parser:
         return self.scalar(content, self.lines[i]["n"], path), i + 1
 
     def map(self, i: int, indent: int, path: str):
-        entries = []
+        entries, seen = [], set()
         while i < len(self.lines) and self.lines[i]["indent"] == indent and not is_item(self.lines[i]["content"]):
             line = self.lines[i]
             match = KEY.match(line["content"])
@@ -155,6 +155,9 @@ class Parser:
             raw_key, rest = match.group(1), (match.group(2) or "").strip()
             key = self.key(raw_key, line["n"], path)
             here = child(path, key)
+            if key in seen:
+                raise ConfigError(here, "duplicate key", line["n"] + 1)
+            seen.add(key)
             entry = {"key": key, "raw_key": raw_key, "line": line["n"], "col": line["col"], "indent": indent}
             i += 1
             if BLOCK_SCALAR.match(rest):
@@ -323,6 +326,7 @@ def reconcile(text: str, keep_directory) -> tuple[str, list[str]]:
             elif value is not None and not isinstance(value, list):
                 raise ConfigError("skills.customDirectories", "not a list", directories["line"] + 1)
     if not changes:
+        verify(text, text, keep_directory)
         return text, []
     if parser.flow:
         raise ConfigError(*parser.flow[0])
@@ -348,7 +352,7 @@ def bun_parse(*texts: str) -> list[dict]:
     """Bun.YAML.parse of each text as {"ok", "value"}. Parse errors carry no detail, so no value leaks."""
     bun = shutil.which("bun") or str(HOME / ".bun" / "bin" / "bun")
     if not os.access(bun, os.X_OK):
-        raise ConfigError("", "bun not found to verify the edit")
+        raise ConfigError("", "bun not found to check the file with Bun's YAML parser")
     result = run([bun, "-e", BUN_PARSE], input=json.dumps(texts), check=False, timeout=60)
     if result.returncode != 0:
         raise ConfigError("", f"Bun's YAML parser failed to run (exit {result.returncode})")
@@ -375,9 +379,9 @@ def intended(doc, keep_directory) -> dict:
 
 
 def verify(old: str, new: str, keep_directory) -> None:
-    """Keep an edit only if Bun's YAML parser reads `new` as `old` with exactly the intended changes, and
-    this reader agrees with Bun on every touched key."""
-    before, after = bun_parse(old, new)
+    """Accept `new` (the edited file, or the file as it is when no edit is needed) only if Bun's YAML parser
+    reads it as `old` with exactly the intended changes, and this reader agrees with Bun on every touched key."""
+    before, after = bun_parse(old, new) if new != old else bun_parse(old) * 2
     if not before["ok"]:
         raise ConfigError("", "Bun's YAML parser rejects the current file")
     if not after["ok"]:
@@ -385,7 +389,7 @@ def verify(old: str, new: str, keep_directory) -> None:
     got, mine, expected = after["value"] or {}, load(new), intended(before["value"], keep_directory)
     for path in TOUCHED:
         if not dig(got, path) == dig(mine, path) == dig(expected, path):
-            raise ConfigError(".".join(path), "the edit does not read the same under Bun's YAML parser")
+            raise ConfigError(".".join(path), "reads differently under Bun's YAML parser")
     if got != expected:
         differs = next((k for k in sorted(set(got) | set(expected), key=str) if got.get(k) != expected.get(k)), "")
         raise ConfigError(str(differs), "the edit changes a key it should not")

@@ -3,7 +3,7 @@ import json
 import shutil
 import subprocess
 
-from support import CODE, Sandbox, assistant_entry, git
+from support import CODE, Sandbox, git
 
 
 class Update(Sandbox):
@@ -16,6 +16,9 @@ class Update(Sandbox):
         self.engine_upstream = self.publish(self.engine, "engine")
         self.instance_upstream = self.publish(self.instance, "instance")
         self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home)
+        self.seat_tile()
+        self.run_dir = self.seat / "state" / "run"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
 
     def publish(self, repo, name):
         """Turn `repo` into a clone of a new bare upstream; return a second working clone to push from."""
@@ -38,7 +41,31 @@ class Update(Sandbox):
     def update(self, check=True):
         return self.cli("tstack", "update", cwd=self.home, check=check)
 
-    def test_fast_forward_reruns_setup_and_restarts_the_seat(self):
+    def generation(self) -> str:
+        return f"tstack@{git(self.engine, 'rev-parse', '--short=7', 'HEAD')} agents@{git(self.instance, 'rev-parse', '--short=7', 'HEAD')}"
+
+    def record(self) -> dict:
+        return json.loads((self.run_dir / "recovery.json").read_text())
+
+    def prompts(self) -> list[str]:
+        return [c[c.index("--text") + 1] for c in self.log_lines("easl.log") if c[0] == "agent.prompt"]
+
+    def calls(self) -> list[str]:
+        return [c[0] for c in self.log_lines("easl.log") if c[0] != "agent.list"]
+
+    def heartbeat(self, minutes: int) -> None:
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+        (self.run_dir / "heartbeat.json").write_text(json.dumps({"at": at.strftime("%Y-%m-%dT%H:%M:%SZ")}))
+
+    def restart_self(self, check=True):
+        self.env["EASL_TILE_ID"] = "obj_seat"
+        return self.cli("tstack", "restart-self", check=check)
+
+    def asked(self, generation: str, reasons: str) -> str:
+        return (f"Files you load changed ({reasons}, generation {generation}). At your next safe point, "
+                "after acking your batch, run `tstack restart-self`.")
+
+    def test_fast_forward_reruns_setup_and_asks_the_seat_to_restart_itself(self):
         before = git(self.engine, "rev-parse", "HEAD")
         self.push(self.engine_upstream, "global.md", "# Global rules\n\nNew rule.\n")
         line = self.update().stdout
@@ -46,64 +73,83 @@ class Update(Sandbox):
         self.assertNotEqual(before, after)
         self.assertIn(f"tstack={before[:7]}..{after[:7]}", line)
         self.assertIn("setup=ok check=ok", line)
-        self.assertIn("restarts=demo:restarted(tstack/global.md changed)", line)
+        self.assertIn("seats=demo:asked to restart-self (tstack/global.md)", line)
         self.assertIn("New rule.", (self.home / ".omp" / "agent" / "AGENTS.md").read_text())
-        self.assertEqual([c[0] for c in self.log_lines("easl.log")], ["agent.list", "agent.restart", "agent.wait", "agent.prompt"])
+        self.assertEqual(self.calls(), ["agent.prompt"])
+        self.assertEqual(self.prompts(), [self.asked(self.generation(), "tstack/global.md")])
+        prompt = next(c for c in self.log_lines("easl.log") if c[0] == "agent.prompt")
+        self.assertRegex(prompt[prompt.index("--message") + 1], r"^msg_tstack-restart-[0-9a-f]{20}$")
+        self.assertEqual(self.record()["desired"]["generation"], self.generation())
         log = (self.home / ".local" / "state" / "tstack" / "update.log").read_text().splitlines()
         self.assertEqual(log, [line.strip()])
 
-    def test_busy_seat_restart_is_retried_next_run(self):
+    def test_the_ask_repeats_each_run_until_the_seat_restarts_itself_then_update_sends_its_restart_prompt(self):
         self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
-        (self.stubs / "easl-busy").touch()
-        self.assertIn("demo:busy,retry", self.update().stdout)
-        (self.stubs / "easl-busy").unlink()
-        self.assertIn("demo:restarted(agents/projects/demo/AGENTS.md changed)", self.update().stdout)
-
-    def heartbeat(self, minutes: int) -> None:
-        run_dir = self.seat / "state" / "run"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
-        (run_dir / "heartbeat.json").write_text(json.dumps({"at": at.strftime("%Y-%m-%dT%H:%M:%SZ")}))
-
-    def test_a_seat_busy_only_with_its_wait_is_restarted_with_force(self):
-        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
-        (self.stubs / "easl-busy").touch()
+        self.update()
+        self.assertIn("demo:asked to restart-self (agents/projects/demo/AGENTS.md)", self.update().stdout)
+        ids = [c[c.index("--message") + 1] for c in self.log_lines("easl.log") if c[0] == "agent.prompt"]
+        self.assertEqual((len(ids), len(set(ids))), (2, 2))
         self.heartbeat(1)
-        self.seat_tile(assistant_entry(120), by_session_id=False)
-        self.assertIn("demo:restarted(agents/projects/demo/AGENTS.md changed, forced)", self.update().stdout)
-        restarts = [c for c in self.log_lines("easl.log") if c[0] == "agent.restart"]
-        self.assertEqual([("--force" in c) for c in restarts], [False, True])
+        self.restart_self()
+        restart = next(c for c in self.log_lines("easl.log") if c[0] == "agent.restart")
+        self.assertEqual((restart[restart.index("--target") + 1], "--force" in restart), ("obj_seat", True))
+        record = self.record()
+        self.assertEqual(record["loaded"], record["desired"]["generation"])
+        self.assertEqual((record["restart"]["by"], record["restart"]["prompted"]), ("self", None))
+        self.assertIn("demo:restart prompt sent", self.update().stdout)
+        self.assertEqual(self.calls(), ["agent.prompt", "agent.prompt", "agent.restart", "agent.wait", "agent.prompt"])
+        self.assertEqual(self.prompts()[-1], "You were restarted in place.\n")
+        self.assertNotIn("seats=", self.update().stdout)
 
-    def test_a_busy_seat_whose_wait_is_not_polling_is_not_forced(self):
+    def test_a_change_after_the_seat_restarted_asks_again(self):
         self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
-        (self.stubs / "easl-busy").touch()
+        self.update()
+        first = self.generation()
+        self.restart_self()
+        self.push(self.engine_upstream, "global.md", "# Global rules\n\nNew rule.\n")
+        self.assertIn("demo:asked to restart-self (tstack/global.md)", self.update().stdout)
+        self.assertNotEqual(self.generation(), first)
+        self.assertEqual(self.prompts()[-1], self.asked(self.generation(), "tstack/global.md"))
+        self.restart_self()
+        self.assertEqual(self.record()["loaded"], self.generation())
+        self.assertNotIn("asked", self.update().stdout)
+        self.assertEqual(self.calls().count("agent.restart"), 2)
+
+    def test_a_seat_whose_omp_takes_no_messages_is_never_typed_at(self):
+        self.seat_tile(protocol=0)
+        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
+        self.assertIn("demo:restart-self not asked (its omp takes no messages now", self.update().stdout)
+        self.assertEqual(self.prompts(), [])
+
+    def test_restart_self_runs_only_in_the_seats_own_tile(self):
+        result = self.cli("tstack", "restart-self", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EASL_TILE_ID is unset", result.stderr)
+        self.env["EASL_TILE_ID"] = "obj_other"
+        result = self.cli("tstack", "restart-self", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not the seat's tile", result.stderr)
+        self.assertEqual(self.log_lines("easl.log"), [])
+
+    def test_a_refused_restart_self_leaves_the_record_as_it_was(self):
+        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
+        self.update()
+        (self.stubs / "easl-fail").touch()
+        result = self.restart_self(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("easl refused the restart", result.stderr)
+        record = self.record()
+        self.assertNotIn("loaded", record)
+        self.assertNotIn("restart", record)
+        self.assertIn("demo:asked to restart-self", self.update().stdout)
+
+    def test_update_sends_a_restart_prompt_liveness_left_owed(self):
         self.heartbeat(40)
-        self.seat_tile(assistant_entry(120), by_session_id=False)
-        self.assertIn("demo:busy,retry", self.update().stdout)
-        self.assertFalse(any("--force" in c for c in self.log_lines("easl.log")))
-
-    def restart_steps(self) -> list[str]:
-        return [c[0] for c in self.log_lines("easl.log") if c[0] != "agent.list"]
-
-    def test_a_failed_restart_prompt_is_sent_by_the_next_liveness_run_without_a_second_restart(self):
-        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
-        self.heartbeat(1)
-        (self.stubs / "easl-prompt-fail").touch()
-        self.assertIn("demo:restart prompt failed: easl agent.prompt: unavailable", self.update().stdout)
-        (self.stubs / "easl-prompt-fail").unlink()
-        live = self.cli("tstack", "check", "--liveness").stdout
-        self.assertIn("update restart demo:restarted(agents/projects/demo/AGENTS.md changed)", live)
-        self.assertEqual(self.restart_steps(), ["agent.restart", "agent.wait", "agent.prompt", "agent.wait", "agent.prompt"])
-        self.assertEqual(json.loads((self.home / ".local" / "state" / "tstack" / "restarts.json").read_text()), {})
-
-    def test_a_failed_restart_prompt_is_retried_by_the_next_update_without_a_second_restart(self):
-        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
-        self.heartbeat(1)
-        (self.stubs / "easl-prompt-fail").touch()
-        self.assertIn("demo:restart prompt failed", self.update().stdout)
-        (self.stubs / "easl-prompt-fail").unlink()
-        self.assertIn("demo:restarted(agents/projects/demo/AGENTS.md changed)", self.update().stdout)
-        self.assertEqual(self.restart_steps(), ["agent.restart", "agent.wait", "agent.prompt", "agent.wait", "agent.prompt"])
+        (self.stubs / "easl-wait-fail").touch()
+        self.assertIn("restart prompt failed", self.cli("tstack", "check", "--liveness").stdout)
+        (self.stubs / "easl-wait-fail").unlink()
+        self.assertIn("demo:restart prompt sent", self.update().stdout)
+        self.assertEqual(self.calls(), ["agent.restart", "agent.wait", "agent.wait", "agent.prompt"])
 
     def test_a_setup_failure_rolls_back_every_moved_repo_and_logs_it(self):
         engine_before, instance_before = git(self.engine, "rev-parse", "HEAD"), git(self.instance, "rev-parse", "HEAD")

@@ -19,7 +19,7 @@ Project code never sits under `~/agents`, because omp loads every ancestor `AGEN
 - `global.md` holds the rules every agent loads. `tstack setup` writes `~/.omp/agent/AGENTS.md` from it, the instance's `global.md` and the machine's `global.md` if present.
 - A role is a directory whose `AGENTS.md` links to a file in `roles/`; the agent's working directory picks its role. The assistant runs in `~/agents/assistant`, coordinators in `~/agents/projects/<name>`.
 - Lanes run `omp -p` in their worktree with `roles/lane.md`, a playbook from `playbooks/`, the project's `pipeline.md` and the brief appended to the system prompt.
-- Seats wake through `tstack wait`, a background job that exits when something needs them. A timer runs `tstack check --liveness` and restarts a seat whose wait went quiet, sending `roles/restart.md` as its first prompt.
+- Seats wake through `tstack wait`, a background job that exits when something needs them. A timer runs `tstack check --liveness` and restarts a seat whose wait went quiet (never forcing one that works); `tstack update` asks a seat whose files changed to run `tstack restart-self` at a safe point. Either way the seat then gets `roles/restart.md` as a prompt.
 - `skills/` holds the six skills every agent may use; `agents/` holds the omp agent types that `task` subagents run as.
 - Guards in `lane` (a lane may act only on itself; `lane merge` checks proof and checks) prevent mistakes, not attacks: lanes run as the same Unix user with the same `gh` login and could write seat files or call `gh` directly.
 

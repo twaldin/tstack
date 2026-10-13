@@ -222,17 +222,26 @@ class MergeGuard(Sandbox):
 
     RULES = "repos/acme/web/rules/branches/main"
     CLASSIC = "repos/acme/web/branches/main/protection"
+    NOT_PROTECTED = "Branch not protected (HTTP 404)"
+    RUNS = f"repos/acme/web/commits/{HEAD}/check-runs?check_name=test&filter=latest"
     REVIEW_RULE = {"type": "pull_request", "parameters": {"required_approving_review_count": 1}}
     TEST_REQUIRED = {"type": "required_status_checks",
                      "parameters": {"required_status_checks": [{"context": "test"}], "strict_required_status_checks_policy": False}}
+    TEST_FROM_APP = {"type": "required_status_checks",
+                     "parameters": {"required_status_checks": [{"context": "test", "integration_id": 15368}]}}
 
     def blocked_on_review(self, checks=(("test", "SUCCESS"),)) -> None:
         self.report("pnpm test=pass")
         self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1", merge_state="BLOCKED", review_decision="REVIEW_REQUIRED",
                      checks=checks)
 
+    @staticmethod
+    def check_runs(app: int, conclusion: str = "success") -> dict:
+        return {"check_runs": [{"name": "test", "status": "completed", "conclusion": conclusion, "app": {"id": app}}]}
+
     def test_a_missing_review_needs_admin_and_auto_merge_is_never_armed(self):
         self.gh_api(self.RULES, [self.REVIEW_RULE, self.TEST_REQUIRED, {"type": "deletion"}])
+        self.gh_api(self.CLASSIC, error=self.NOT_PROTECTED)
         self.blocked_on_review()
         result = self.merge()
         self.assertEqual(result.returncode, 4)
@@ -261,6 +270,17 @@ class MergeGuard(Sandbox):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.merged())
 
+    def test_admin_merge_accepts_a_required_check_from_the_named_github_app(self):
+        self.gh_api(self.RULES, [self.REVIEW_RULE, self.TEST_FROM_APP])
+        self.gh_api(self.CLASSIC, {"required_pull_request_reviews": {},
+                                   "required_status_checks": {"checks": [{"context": "test", "app_id": 15368}]}})
+        self.gh_api(self.RUNS, {"check_runs": [*self.check_runs(15368)["check_runs"],
+                                               *self.check_runs(999, "failure")["check_runs"]]})
+        self.blocked_on_review()
+        result = self.merge("--admin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.merged())
+
     def test_admin_merge_needs_github_to_prove_review_is_the_only_unmet_rule(self):
         open_thread = [{"id": "t1", "isResolved": False, "comments": {"nodes": [{"updatedAt": "x", "body": "b", "author": {"login": "r"}}]}}]
         cases = [
@@ -280,6 +300,17 @@ class MergeGuard(Sandbox):
                 "compare": {"behind_by": 2}}, "up-to-date"),
             ("open conversation", {"rules": [{"type": "pull_request", "parameters": {"required_review_thread_resolution": True}}],
                                    "threads": open_thread}, "open threads"),
+            ("classic forbidden", {"rules": [self.REVIEW_RULE],
+                                   "classic_error": "Resource not accessible by integration (HTTP 403)"}, "unreadable"),
+            ("classic other 404", {"rules": [self.REVIEW_RULE], "classic_error": "Not Found (HTTP 404)"}, "unreadable"),
+            ("check from another source", {"rules": [self.REVIEW_RULE, self.TEST_FROM_APP], "runs": self.check_runs(999)},
+             "test (from GitHub App 15368)"),
+            ("only a legacy status", {"rules": [self.REVIEW_RULE, self.TEST_FROM_APP], "runs": {"check_runs": []}},
+             "test (from GitHub App 15368)"),
+            ("the app's run failed", {"rules": [self.REVIEW_RULE], "classic": {
+                "required_pull_request_reviews": {}, "required_status_checks": {"checks": [{"context": "test", "app_id": 15368}]}},
+                "runs": self.check_runs(15368, "failure")}, "test (from GitHub App 15368)"),
+            ("check runs unreadable", {"rules": [self.REVIEW_RULE, self.TEST_FROM_APP]}, "unreadable"),
         ]
         for name, case, why in cases:
             with self.subTest(name):
@@ -293,6 +324,10 @@ class MergeGuard(Sandbox):
                     self.gh_api(self.CLASSIC, case["classic"])
                 if "classic_error" in case:
                     self.gh_api(self.CLASSIC, error=case["classic_error"])
+                if "classic" not in case and "classic_error" not in case:
+                    self.gh_api(self.CLASSIC, error=self.NOT_PROTECTED)
+                if "runs" in case:
+                    self.gh_api(self.RUNS, case["runs"])
                 if "compare" in case:
                     self.gh_api(f"repos/acme/web/compare/main...{self.HEAD}", case["compare"])
                 self.blocked_on_review(case.get("checks", (("test", "SUCCESS"),)))

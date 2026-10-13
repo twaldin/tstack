@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tstack: set up a host for omp agents, check it, and run the seats' wait, gates, board and liveness."""
+"""tstack: set up a host for omp agents, check it, and run the seats' wait, gates, board, liveness and restarts."""
 
 import argparse
 import sys
@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from tstacklib import board, install, ops, waiter  # noqa: E402
 from tstacklib.util import Die, find_seat, say  # noqa: E402
 
-COMMANDS = "setup,check,wait,gate,board,update"
+COMMANDS = "setup,check,wait,gate,board,update,restart-self"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -23,7 +23,7 @@ def parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("check", help="static checks; --smoke runs headless omp; --liveness restarts stale seats")
     p.add_argument("--smoke", action="store_true", help="headless omp: markers, skills, secret guard, --resume")
-    p.add_argument("--liveness", action="store_true", help="restart seats whose wait heartbeat is stale, then text")
+    p.add_argument("--liveness", action="store_true", help="restart seats whose wait heartbeat is stale (never forced), then text")
     p.add_argument("--machine")
 
     p = sub.add_parser("wait", help="block until something needs the seat; print a batch of events")
@@ -51,7 +51,10 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("board", help="redraw the seat's keyed status tiles from state")
     p.add_argument("--seat")
 
-    sub.add_parser("update", help="fast-forward the repos, rerun setup and check, restart seats whose files changed")
+    sub.add_parser("update", help="fast-forward the repos, rerun setup and check, ask seats whose files changed to restart-self")
+
+    p = sub.add_parser("restart-self", help="run by a seat at a safe point: restart its own tile (tstack then re-prompts it)")
+    p.add_argument("--seat")
     return top
 
 
@@ -96,6 +99,9 @@ def main(argv) -> int:
         code, line = ops.update()
         print(line)
         return code
+    if args.cmd == "restart-self":
+        print(ops.restart_self(find_seat(args.seat)))
+        return 0
     return 2
 
 

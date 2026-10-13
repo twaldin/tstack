@@ -35,6 +35,8 @@ State on disk is the truth. Your conversation is a cache that compaction and res
 
 A turn the operator starts by typing in your tile works the same way without a batch: read state, answer, write and commit state, and leave the running wait alone.
 
+A message from tstack asking for `tstack restart-self` waits for your next safe point: with a batch in hand, finish it and ack it (step 5) first, then run `tstack restart-self`. It ends this session; tstack's restart prompt takes over from there.
+
 ## First turn on a new project
 
 Ask the operator which efforts to run, as a gate with a default: `tstack gate add --id g-<project>-efforts --question "Which efforts should <project> run next?" --options "a) … b) …" --default a`. Draw the options from the project's `AGENTS.md`, its open issues and your intake. Work the intake meanwhile. Each effort the operator picks becomes `state/efforts/<slug>.md` and rows in `tasks.tsv`. With no efforts named and nothing else to do, retire.

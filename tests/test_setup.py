@@ -209,8 +209,21 @@ class OmpConfig(Sandbox):
              "disabledProviders[0] (path-scoped entry names native, line 1)"),
             ('"theme": {"dark": x}\n"skills":\n  "enabled": false\n', "theme (flow mapping, line 1)"),
             ('"skills":\n  "enabled": false\n  "enabled": false\n  "enablePiUser": true\n',
-             "skills.enabled (the edit does not read the same under Bun's YAML parser)"),
+             "skills.enabled (duplicate key, line 3)"),
         ]
+        self.assert_manual_edit(cases)
+
+    def test_configs_that_need_no_edit_are_still_checked(self):
+        """Nothing to edit by this reader's account, yet omp (and Bun) read discovery as disabled."""
+        cases = [
+            ("skills:\n  enabled: true\n  enablePiUser: true\n  enabled: false\n", "skills.enabled (duplicate key, line 4)"),
+            ("skills:\n  enabled: true\n  enablePiUser: true\ndisabledProviders: []\ndisabledProviders:\n  - native\n",
+             "disabledProviders (duplicate key, line 5)"),
+            ("skills:\n  enabled: tRUE\n  enablePiUser: true\n", "skills.enabled (reads differently under Bun's YAML parser)"),
+        ]
+        self.assert_manual_edit(cases)
+
+    def assert_manual_edit(self, cases) -> None:
         for text, where in cases:
             with self.subTest(where):
                 result, check = self.setup_and_check(text)

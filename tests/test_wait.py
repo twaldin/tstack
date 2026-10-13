@@ -194,6 +194,11 @@ class Durability(Sandbox):
             proc.kill()
             proc.communicate()
 
+    def started(self, lane_id: str, runs: int) -> bool:
+        """The lane has `runs` runs and its supervisor accepted the last (so stopping the wait cannot cut the launch)."""
+        record = self.lane_record(lane_id)
+        return len(record["runs"]) == runs and bool(record["runs"][-1].get("accepted"))
+
     def source(self, name: str) -> dict:
         return (json.loads(self.beat.read_text()).get("sources") or {}).get(name) or {} if self.beat.exists() else {}
 
@@ -235,7 +240,7 @@ class Durability(Sandbox):
         lane_id = self.waiting_lane()
         before = self.state.read_text()
         self.pr_stub(checks=(("test", "FAILURE"),))
-        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 2, "the resume")
+        self.until(lambda: self.started(lane_id, 2), "the resume")
         self.state.write_text(before)
         self.settled(lane_id, "waiting")
         proc = self.background()
@@ -249,7 +254,7 @@ class Durability(Sandbox):
         lane_id = self.waiting_lane()
         before = self.state.read_text()
         self.pr_stub(checks=(("test", "SUCCESS"),))
-        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 2, "the resume")
+        self.until(lambda: self.started(lane_id, 2), "the resume")
         self.settled(lane_id, "waiting")
         self.state.write_text(before)
         self.pr_stub(checks=(("test", "SUCCESS"),), comments=(("c-lane", "Green.\n\n<!-- tstack-lane:demo-ci-1 -->"),))
@@ -260,18 +265,24 @@ class Durability(Sandbox):
         self.assertEqual(len(self.lane_record(lane_id)["runs"]), 2)
 
     def test_a_rerun_that_fails_the_same_way_is_a_new_fix_wave(self):
+        self.rerun_fails_again(lambda state, at: dict(checks=(("test", state, at),)))
+
+    def test_a_legacy_status_reported_again_at_the_same_url_is_a_new_fix_wave(self):
+        self.rerun_fails_again(lambda state, at: dict(checks=(), statuses=(("test", state, at),)))
+
+    def rerun_fails_again(self, result) -> None:
         lane_id = self.waiting_lane()
-        self.pr_stub(checks=(("test", "FAILURE", "2026-10-13T01:00:00Z"),))
-        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 2, "the first resume")
+        self.pr_stub(**result("FAILURE", "2026-10-13T01:00:00Z"))
+        self.until(lambda: self.started(lane_id, 2), "the first resume")
         self.settled(lane_id, "waiting")
-        self.pr_stub(checks=(("test", "IN_PROGRESS"),))
+        self.pr_stub(**result("PENDING", "2026-10-13T01:30:00Z"))
 
         def rerun_seen():
             state = json.loads(self.state.read_text())
             return not state.get("dispatches") and state["cursors"]["prs"][lane_id]["fp"]["ci"] == "pending"
         self.until(rerun_seen, "the rerun to start")
-        self.pr_stub(checks=(("test", "FAILURE", "2026-10-13T02:00:00Z"),))
-        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 3, "the second resume")
+        self.pr_stub(**result("FAILURE", "2026-10-13T02:00:00Z"))
+        self.until(lambda: self.started(lane_id, 3), "the second resume")
         self.assertEqual(self.settled(lane_id, "waiting")["waves"], {"test": 2})
 
     def test_a_dispatch_saved_before_a_failed_launch_is_retried(self):
