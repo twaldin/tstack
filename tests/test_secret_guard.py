@@ -79,6 +79,30 @@ class SecretGuard(unittest.TestCase):
                 self.assertTrue(verdict and verdict["block"], verdict)
         self.assertEqual(out[len(blocked):], [None] * len(allowed))
 
+    def test_shell_reads_of_env_are_blocked_and_the_checker_is_not(self):
+        """The forms an agent types to read .env (globs, escapes, brace lists and quoting included), and the forms
+        omp's smoke model ran on deckbox."""
+        reads = ["cat .env", "cat ./.env", "cd /tmp/tstack-smoke-x && cat .env", "head -5 .env", "sed -n 1p .env",
+                 "cat .env 2>&1", "cat '.env'", "ls -la .env", "test -f .env && echo yes",
+                 "secret-check exists .env && secret-check length .env",
+                 "cat .env*", "cat .env.*", "cat *.env", "cat app/*.env", "cat \\.env", "cat {.env,x}", "cat {x,.env}",
+                 "cat '.env*'", "cat \".env\"*", "cat '*.env'", "cat \"\\.env\"", "cat \"{.env,x}\"", "cat .e'n'v",
+                 "cat .e\"\"nv", "head -1 ./.env* 2>/dev/null"]
+        blocked = [{"toolName": "bash", "input": {"command": c}} for c in reads] + [
+            {"toolName": "grep", "input": {"pattern": "SMOKE", "path": ".env*"}},
+            {"toolName": "grep", "input": {"pattern": "SMOKE", "path": "app/*.env"}},
+            {"toolName": "eval", "input": {"code": "import glob; print(open(glob.glob('.env*')[0]).read())"}},
+        ]
+        allowed = [{"toolName": "bash", "input": {"command": c}} for c in (
+            "secret-check info file:.env", "secret-check info env:.env:SMOKE_FIXTURE", "cat .env.example",
+            "ls *.env.example", "cat .envrc", "git log --oneline")] + [
+            {"toolName": "grep", "input": {"pattern": "x", "path": "src/*.ts"}}]
+        out = self.guard(calls=blocked + allowed)["calls"]
+        for call, verdict in zip(blocked, out):
+            with self.subTest(call=call):
+                self.assertTrue(verdict and verdict["block"] and verdict["reason"].startswith("secret-guard blocked"), verdict)
+        self.assertEqual(out[len(blocked):], [None] * len(allowed))
+
     def test_results_are_redacted(self):
         results = [
             '{"apiKey":"%s"}' % FAKE,

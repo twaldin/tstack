@@ -35,6 +35,7 @@ function isSecretPath(p: string): boolean {
   const clean = underlyingPath(p);
   const base = clean.split("/").pop() ?? "";
   if (/^\.env(\..+)?$/i.test(base) && !SAFE_ENV_SUFFIX.test(base)) return true;
+  if (/[*?[{]/.test(base) && namesEnv(base)) return true;
   if (/\.(pem|p12|pfx|key)$/i.test(base) && !/\.pub$/i.test(base)) return true;
   if (/^id_(rsa|ecdsa|ed25519|dsa)$/.test(base)) return true;
   if (/^(auth|relay)\.json$/i.test(base)) return true;
@@ -46,8 +47,15 @@ function isSecretPath(p: string): boolean {
 }
 
 // A `.env` path token inside free text (shell or code), e.g. `cat ~/app/.env`, `open('.env')`,
-// `read(".env:raw")`. A token may end at a read-tool selector (`?`, `#`, `:`).
-const ENV_TOKEN = /(?:^|[\s'"`=/<(:])\.env(?:\.(?!example\b|sample\b|template\b|dist\b)[\w.-]+)?(?=$|[\s'"`;|&)>,?#:])/i;
+// `read(".env:raw")`. A token may end at a read-tool selector (`?`, `#`, `:`); globs, escapes and brace
+// lists count too: `.env*`, `.env.*`, `*.env`, `\.env`, `{.env,x}`.
+const ENV_TOKEN =
+  /(?:^|[\s'"`=/<(:\\*{,])\.env(?:\.(?!example\b|sample\b|template\b|dist\b)[\w.*?[\]-]+)?(?=$|[\s'"`;|&)>,?#:*[}])/i;
+
+// Whether text names a .env file, also once shell quotes and escapes are removed (`.e'n'v`, `".env"*`).
+function namesEnv(text: string): boolean {
+  return ENV_TOKEN.test(text) || ENV_TOKEN.test(text.replace(/['"\\]/g, ""));
+}
 // Credential stores named in free text: auth.json, relay.json, ~/.secrets, keychain files.
 const STORE_TOKEN =
   /(?:^|[\s'"`=/<(:])(?:auth|relay)\.json(?=$|[\s'"`;|&)>,?#:])|(?:^|[\s'"`=/<(:~])\.secrets(?=$|[\s/'"`;|&)>,?#:])|\.keychain(?:-db)?\b|\bLibrary\/Keychains\b/i;
@@ -70,7 +78,7 @@ const CHECKER_ONLY = new RegExp(`^\\s*(?:\\S*/)?${CHECKER}(?:\\s[^;&|\`$()<>]*)?
 
 function shellReason(cmd: string): string | undefined {
   if (CHECKER_ONLY.test(cmd)) return undefined;
-  if (ENV_TOKEN.test(cmd)) return "reads a .env file";
+  if (namesEnv(cmd)) return "reads a .env file";
   if (STORE_TOKEN.test(cmd)) return "reads a credential store";
   for (const [re, what] of SHELL_DENY) if (re.test(cmd)) return what;
   return undefined;
@@ -111,7 +119,7 @@ export default function secretGuard(pi) {
     }
     if (name === "eval") {
       const code = String(input.code ?? "");
-      if (ENV_TOKEN.test(code) || STORE_TOKEN.test(code) || /\bgcloud\s+secrets\s+versions\s+access\b/i.test(code))
+      if (namesEnv(code) || STORE_TOKEN.test(code) || /\bgcloud\s+secrets\s+versions\s+access\b/i.test(code))
         return { block: true, reason: `secret-guard blocked this cell (reads a .env file or secret store). ${HINT}` };
       return;
     }

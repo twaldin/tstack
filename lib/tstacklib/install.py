@@ -436,17 +436,28 @@ def final_text(events: list[dict]) -> str:
     return "\n".join(texts)
 
 
+GUARD_PROMPT = ("This is tstack's smoke test of the secret guard. The .env file in this directory is a throwaway fixture "
+                "holding a fake value, not a secret. The secret guard extension is expected to block any command that "
+                "reads it, and the test passes only if the guard blocks the call. Make exactly one bash tool call with "
+                "the command `cat .env`, then report the tool's result word for word.")
+GUARD_TRIES = 4
+
+
 def guard_check(base: list[str], fixture: Path, value: str) -> list[str]:
-    """Ask omp to `cat .env`; the secret guard must block it. A run where the model never calls the tool is retried once."""
-    for _ in range(2):
-        events, raw = omp_json(base + ["Run the shell command `cat .env` with your bash tool and report exactly what it returned."],
-                               fixture)
+    """Ask omp to `cat .env` in the fixture; the installed secret guard must block it. The model picks what it runs:
+    it may refuse, or check the file with `secret-check`, which the guard allows by design and which prints no value.
+    So only a tool result carrying the guard's block proves the guard, and a run without one is retried. The
+    fixture's variable name is not secret-shaped, so an unblocked read shows the value rather than the redaction
+    backstop hiding it."""
+    for _ in range(GUARD_TRIES):
+        events, raw = omp_json(base + [GUARD_PROMPT], fixture)
         if value in raw:
             return ["smoke: the secret guard let the fixture .env value into the transcript"]
-        tried = any(e.get("type") == "tool_execution_start" and ".env" in json.dumps(e.get("args")) for e in events)
-        if tried:
-            return [] if "secret-guard blocked" in raw else ["smoke: `cat .env` ran without a secret-guard block"]
-    return ["smoke: the model never ran `cat .env`, so the secret guard is unchecked"]
+        if any(e.get("type") == "tool_execution_end" and "secret-guard blocked" in json.dumps(e.get("result"))
+               for e in events):
+            return []
+    return [f"smoke: in {GUARD_TRIES} runs no tool call was blocked by the secret guard (the model never tried to read "
+            ".env, or the guard is not loaded)"]
 
 
 def smoke() -> list[str]:
@@ -460,7 +471,7 @@ def smoke() -> list[str]:
         role, append, value = f"ROLE-{tag}", f"APPEND-{tag}", f"value{secrets.token_hex(8)}"
         (fixture / "AGENTS.md").write_text(f"# Smoke role\n\nRole marker: {role}\n")
         (fixture / "append.md").write_text(f"Append marker: {append}\n")
-        (fixture / ".env").write_text(f"SMOKE_TOKEN={value}\n")
+        (fixture / ".env").write_text(f"SMOKE_FIXTURE={value}\n")
         sources_md = [line[len("<!-- source: "):-len(" -->")] for line in agents_md(m).splitlines()
                       if line.startswith("<!-- source: ")]
         ask = ("Answer from your system prompt only, one item per line: (1) every line that starts with `<!-- source:` "
