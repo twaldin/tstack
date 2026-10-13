@@ -82,10 +82,12 @@ else:
 
 STUB_EASL = r'''#!/usr/bin/env python3
 """Fake easl: logs argv; asks live in stubs/asks.json. agent.restart refuses (conflict) when stubs/easl-busy
-exists unless --force, and fails when stubs/easl-fail exists; agent.wait fails when stubs/easl-wait-fail exists;
-agent.prompt fails when stubs/easl-prompt-fail exists, else answers delivery `message` for a tile whose
-agents.json entry has protocol 1 (`typed` otherwise); agent.list returns stubs/agents.json."""
-import json, os, sys
+exists unless --force, and fails when stubs/easl-fail exists; with stubs/easl-restart-commit ({"repo", "file"})
+it first commits a line appended to that file, as an update landing mid-restart; agent.wait fails when
+stubs/easl-wait-fail exists; agent.prompt fails when stubs/easl-prompt-fail exists, else answers delivery
+`message` for a tile whose agents.json entry has protocol 1 (`typed` otherwise); agent.list returns
+stubs/agents.json."""
+import json, os, subprocess, sys
 from pathlib import Path
 stubs = Path(os.environ["STUBS"])
 args = sys.argv[1:]
@@ -95,6 +97,11 @@ asks_path = stubs / "asks.json"
 asks = json.loads(asks_path.read_text()) if asks_path.exists() else {}
 def out(value):
     print(json.dumps(value))
+if args[0] == "agent.restart" and (stubs / "easl-restart-commit").exists():
+    move = json.loads((stubs / "easl-restart-commit").read_text())
+    with open(Path(move["repo"]) / move["file"], "a") as handle:
+        handle.write("landed mid-restart\n")
+    subprocess.run(["git", "-C", move["repo"], "commit", "--quiet", "-am", "mid-restart"], check=True)
 if args[0] == "ask" and args[1] not in ("get", "cancel", "list"):
     ask_id = f"obj_ask{len(asks) + 1}"
     options = [{"id": o.split("=", 1)[0], "label": o.split("=", 1)[1]} for i, o in enumerate(args) if i and args[i - 1] == "--option"]

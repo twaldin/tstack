@@ -124,6 +124,25 @@ class Liveness(Sandbox):
         self.liveness()
         self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
 
+    def test_a_restart_unconfirmed_for_an_hour_no_longer_blocks_a_liveness_restart(self):
+        """restart-self died before its restart went out, its omp with it: nothing restarted the seat. Once the
+        pending restart expires, liveness restarts it normally and keeps the failed attempt for diagnosis."""
+        self.heartbeat(70)
+        self.env["EASL_TILE_ID"] = "obj_seat"
+        (self.stubs / "easl-kill-caller").touch()
+        self.assertEqual(self.cli("tstack", "restart-self", check=False).returncode, -9)
+        (self.stubs / "easl-kill-caller").unlink()
+        record = self.record()
+        for key in ("pending", "restart"):
+            record[key]["at"] = ago(61)
+        (self.run_dir / "recovery.json").write_text(json.dumps(record))
+        self.assertIn("never confirmed (no wait under a new omp within an hour)", self.liveness())
+        self.liveness()
+        restarts = [c for c in self.log_lines("easl.log") if c[0] == "agent.restart"]
+        self.assertEqual(["--force" in c for c in restarts], [True, False])
+        record = self.record()
+        self.assertEqual((record["restart"]["by"], record["unconfirmed"]["restart"]["by"]), ("liveness", "self"))
+
     def test_an_alert_counts_only_once_it_is_sent(self):
         self.heartbeat(40)
         self.liveness()

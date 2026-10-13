@@ -4,7 +4,7 @@ import json
 import shutil
 import subprocess
 
-from support import CODE, FakeOmp, Sandbox, git
+from support import CODE, FakeOmp, Sandbox, git, write_exe
 
 
 class Update(Sandbox):
@@ -216,6 +216,29 @@ class Update(Sandbox):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is not the seat's tile", result.stderr)
         self.assertEqual(self.log_lines("easl.log"), [])
+
+    def test_restart_self_refuses_when_it_cannot_tell_which_omp_runs_it(self):
+        write_exe(self.root / "no-ps" / "ps", "#!/bin/sh\nexit 1\n")
+        self.env["PATH"] = f"{self.root / 'no-ps'}:{self.env['PATH']}"
+        result = self.restart_self(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot tell which omp runs this command", result.stderr)
+        self.assertFalse((self.run_dir / "recovery.json").exists())
+        self.assertEqual(self.log_lines("easl.log"), [])
+
+    def test_liveness_records_the_generation_from_before_its_restart(self):
+        """An update landing while easl restarts the seat: the new omp loaded the files from before it, so its
+        wait confirms those, and the next update asks for the newer ones."""
+        self.loaded_now()
+        before = self.installed()
+        self.heartbeat(40)
+        (self.stubs / "easl-restart-commit").write_text(json.dumps({"repo": str(self.instance), "file": "global.md"}))
+        self.assertIn("restarted in place", self.cli("tstack", "check", "--liveness").stdout)
+        self.assertNotEqual(self.installed(), before)
+        self.assertEqual(self.record()["pending"]["generation"], before)
+        self.poll_under(FakeOmp(self))
+        self.assertEqual(self.record()["loaded"], before)
+        self.assertIn("demo:asked to restart-self (agents/global.md)", self.update().stdout)
 
     def test_a_refused_restart_self_leaves_the_record_as_it_was(self):
         self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")

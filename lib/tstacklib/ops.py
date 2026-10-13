@@ -130,8 +130,9 @@ def recovery(seat: Path, wait: float | None):
     """The seat's recovery record under its lock, as (record, save); (None, None) when the lock stays busy
     (`wait` None: do not wait for it). Fields: `loaded` (the tstack and agents commits the seat's omp loaded
     its files from), `pending` (a restart made or prepared, with the generation the new omp loads, until a wait
-    under that omp confirms it), `asked`, `restart` (by, at, prompted, attempt), and liveness's `incident`,
-    `attempt`, `alerted`, `source_alerts`."""
+    under that omp confirms it), `unconfirmed` (the last pending restart dropped unconfirmed, for diagnosis),
+    `asked`, `restart` (by, at, prompted, attempt), and liveness's `incident`, `attempt`, `alerted`,
+    `source_alerts`."""
     run_dir = seat / "state" / "run"
     path = run_dir / "recovery.json"
     with flock(run_dir / "recovery.lock", blocking=wait is not None, timeout=wait) as held:
@@ -200,13 +201,13 @@ def unloaded(seat: Path, loaded, now: dict) -> list[str]:
     return changed
 
 
-def prepare_restart(record: dict, by: str, replaces: int | None) -> None:
-    """Record a restart as the seat's recovery: its restart prompt is owed, and `pending` holds the generation
-    the new omp loads, and the pid of the omp it replaces, until a wait under another omp confirms it
-    (`confirm_restart`)."""
+def prepare_restart(record: dict, by: str, replaces: int | None, generation: dict) -> None:
+    """Record a restart as the seat's recovery: its restart prompt is owed, and `pending` holds `generation` (the
+    installed commits read before the restart was requested), and the pid of the omp it replaces, until a wait
+    under another omp confirms it (`confirm_restart`)."""
     at = iso()
     record["restart"] = {"by": by, "at": at, "prompted": None}
-    record["pending"] = {"generation": installed(), "at": at, "by": by, "replaces": replaces}
+    record["pending"] = {"generation": generation, "at": at, "by": by, "replaces": replaces}
 
 
 def confirm_restart(seat: Path, omp: int | None) -> None:
@@ -227,19 +228,29 @@ def confirm_restart(seat: Path, omp: int | None) -> None:
 
 def settle_pending(seat: Path, record: dict) -> str | None:
     """Drop a pending restart that will never be confirmed: the replaced omp's wait still polls two minutes on
-    (restart-self died before its restart went out), or none confirmed it within an hour. Returns a note when
-    dropped; `pending` left in place means a restart is in progress."""
-    pending = record["pending"]
+    (restart-self died before its restart went out), or none confirmed it within an hour. The restart marker it
+    set goes with it, so liveness no longer counts it as the recovery under way and may restart the seat; both
+    are kept in `unconfirmed` for diagnosis. Returns a note when dropped, else None (no pending restart, or one
+    still in progress)."""
+    pending = record.get("pending")
+    if not pending:
+        return None
     beat = heartbeat(seat)
     try:
         due = iso(parse_iso(pending["at"]) + dt.timedelta(seconds=PENDING_GRACE))
     except (KeyError, ValueError):
         due = None
     old_polling = pending.get("replaces") is not None and beat.get("omp") == pending["replaces"] and newer(beat.get("at"), due)
-    if old_polling or (age(pending.get("at")) or 0) > PENDING_TTL:
-        del record["pending"]
-        return f"restart at {pending.get('at')} never confirmed" + (" (the old session still polls)" if old_polling else "")
-    return None
+    if not old_polling and (age(pending.get("at")) or 0) <= PENDING_TTL:
+        return None
+    why = "the old session still polls" if old_polling else "no wait under a new omp within an hour"
+    restart = record.get("restart") or {}
+    matching = restart.get("at") == pending.get("at")
+    record["unconfirmed"] = {"pending": pending, "restart": restart if matching else None, "dropped": iso(), "why": why}
+    del record["pending"]
+    if matching:
+        del record["restart"]
+    return f"restart at {pending.get('at')} never confirmed ({why})"
 
 
 def send_owed_prompt(seat: Path, board: dict, record: dict, save) -> str | None:
@@ -271,18 +282,22 @@ def restart_self(seat: Path) -> str:
     """Run by a seat in its own tile at a safe point: record a prepared restart (`pending`, confirmed only by a
     wait under the restarted omp) with its restart prompt owed (liveness or the next update sends it once the
     tile is idle), then restart the seat's own tile with force. The restart ends this process; when easl
-    refuses, the record goes back."""
+    refuses, the record goes back. Refuses up front when it cannot tell which omp runs it."""
     tile = os.environ.get("EASL_TILE_ID")
     if not tile:
         raise Die("tstack restart-self runs inside the seat's own easl tile; EASL_TILE_ID is unset")
     board = read_board(seat)
     if not board or board.get("tile") != tile:
         raise Die(f"this tile ({tile}) is not the seat's tile in state/board.json ({(board or {}).get('tile')})")
+    omp = session_owner()
+    if omp is None:
+        raise Die("cannot tell which omp runs this command (no ancestor outside its session), so no wait could "
+                  "confirm the restart; nothing recorded, nothing restarted")
     with recovery(seat, lock_wait()) as (record, save):
         if record is None:
             raise Die("the seat's recovery record is busy; run tstack restart-self again in a minute", 3)
         before = {key: copy.deepcopy(record.get(key)) for key in ("restart", "pending")}
-        prepare_restart(record, "self", session_owner())
+        prepare_restart(record, "self", omp, installed())
         save()
     try:
         easl.restart(board, force=True)
@@ -300,10 +315,11 @@ def restart_self(seat: Path) -> str:
 
 
 def liveness() -> list[str]:
-    """For each local seat: send a restart prompt still owed; a wait heartbeat over 30 min stale opens an
-    incident and gets one plain in-place restart unless the seat was restarted since it last polled (easl
-    refuses a working seat; tstack never forces one, it retries next run). Stale over 60 min texts the
-    operator once per incident, as does a wait source failing for an hour; an alert counts only once sent."""
+    """For each local seat: drop a pending restart that will never be confirmed; send a restart prompt still
+    owed; a wait heartbeat over 30 min stale opens an incident and gets one plain in-place restart unless the
+    seat was restarted since it last polled (easl refuses a working seat; tstack never forces one, it retries
+    next run). Stale over 60 min texts the operator once per incident, as does a wait source failing for an
+    hour; an alert counts only once sent."""
     out = []
     for seat, board in local_seats():
         with recovery(seat, None) as (record, save):
@@ -320,6 +336,9 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
     beat = heartbeat(seat)
     at = beat.get("at")
     stale_for = age(at)
+    dropped = settle_pending(seat, record)
+    if dropped:
+        out.append(dropped)
     owed = send_owed_prompt(seat, board, record, save)
     if owed:
         out.append(owed)
@@ -334,6 +353,7 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
         # the recovery under way: a restart since the seat last polled, or any restart when it never polled
         active = newer(restart_at, at) if at else bool(restart_at)
         if not active:
+            generation = installed()
             try:
                 easl.restart(board)
             except easl.EaslConflict as error:
@@ -343,7 +363,7 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
                 record["attempt"] = {"at": iso(), "error": str(error)[:300]}
                 out.append(f"stale since {at or 'never'}; restart failed: {str(error)[:200]}")
             else:
-                prepare_restart(record, "liveness", beat.get("omp"))
+                prepare_restart(record, "liveness", beat.get("omp"), generation)
                 record.pop("attempt", None)
                 save()
                 out.append(f"stale since {at or 'never'}; restarted in place; {send_owed_prompt(seat, board, record, save)}")
@@ -433,16 +453,16 @@ def ask_restarts() -> list[str]:
             if record is None:
                 results.append(f"{name}:recovery record busy, next run compares again")
                 continue
+            dropped = settle_pending(seat, record)
+            if dropped:
+                save()
+                results.append(f"{name}:{dropped}")
             owed = send_owed_prompt(seat, board, record, save)
             if owed:
                 results.append(f"{name}:{owed[:80]}")
             if record.get("pending"):
-                dropped = settle_pending(seat, record)
-                save()
-                if not dropped:
-                    results.append(f"{name}:restart at {record['pending']['at']} in progress")
-                    continue
-                results.append(f"{name}:{dropped}")
+                results.append(f"{name}:restart at {record['pending']['at']} in progress")
+                continue
             reasons = unloaded(seat, record.get("loaded"), now)
             try:
                 agent = easl.agent(board) or {}
