@@ -18,8 +18,9 @@ import time
 from pathlib import Path
 
 from . import easl, lanes, prwatch
+from .ops import confirm_restart
 from .seat import last_occurrence, read_board, read_gates, read_intake, read_schedule, update_gates
-from .util import Die, age, flock, iso, money, parse_iso, read_json, say, write_json
+from .util import Die, age, flock, iso, money, parse_iso, read_json, say, session_owner, write_json
 
 URGENT_SOURCES = {"text", "operator"}
 FIRST_SIGHT_DAYS = 7
@@ -45,6 +46,8 @@ class Waiter:
         self.cursors = self.state["cursors"]
         self.board = None
         self.resumed: list[str] = []
+        # pid of the omp this wait runs under: a poll under a new omp confirms a pending restart
+        self.omp = session_owner()
 
     def save(self) -> None:
         write_json(self.path, self.state)
@@ -230,6 +233,10 @@ class Waiter:
         self.resumed = []
         status, staged, found = {}, [], []
         try:
+            confirm_restart(self.seat, self.omp)
+        except (Die, OSError, ValueError, KeyError) as error:
+            status["recovery"] = f"{type(error).__name__}: {error}"[:300]
+        try:
             self.board = read_board(self.seat)
         except Die as error:
             status["board.json"] = str(error)
@@ -276,8 +283,9 @@ class Waiter:
                 sources[name] = {"ok": error is None, "error": error,
                                  "failing_since": None if error is None else (old.get("failing_since") or iso())}
         unacked = [e["at"] for e in self.state["pending"]] + [e["at"] for b in self.state["batches"].values() for e in b["events"]]
-        write_json(path, {"at": iso(), "pid": os.getpid(), "polling_since": iso() if polling else None, "sources": sources,
-                          "oldest_unacked": min(unacked) if unacked else None, "pending": len(self.state["pending"])})
+        write_json(path, {"at": iso(), "pid": os.getpid(), "omp": self.omp, "polling_since": iso() if polling else None,
+                          "sources": sources, "oldest_unacked": min(unacked) if unacked else None,
+                          "pending": len(self.state["pending"])})
 
     def ready(self, window: float) -> bool:
         pending = self.state["pending"]

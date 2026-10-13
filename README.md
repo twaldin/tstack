@@ -19,9 +19,9 @@ Project code never sits under `~/agents`, because omp loads every ancestor `AGEN
 - `global.md` holds the rules every agent loads. `tstack setup` writes `~/.omp/agent/AGENTS.md` from it, the instance's `global.md` and the machine's `global.md` if present.
 - A role is a directory whose `AGENTS.md` links to a file in `roles/`; the agent's working directory picks its role. The assistant runs in `~/agents/assistant`, coordinators in `~/agents/projects/<name>`.
 - Lanes run `omp -p` in their worktree with `roles/lane.md`, a playbook from `playbooks/`, the project's `pipeline.md` and the brief appended to the system prompt.
-- Seats wake through `tstack wait`, a background job that exits when something needs them. A timer runs `tstack check --liveness` and restarts a seat whose wait went quiet (never forcing one that works); `tstack update` asks a seat whose files changed to run `tstack restart-self` at a safe point. Either way the seat then gets `roles/restart.md` as a prompt.
+- Seats wake through `tstack wait`, a background job that exits when something needs them. A timer runs `tstack check --liveness` and restarts a seat whose wait went quiet (never forcing one that works); every `tstack update` run compares the files a seat loads with the ones its omp loaded and, while they differ, asks it to run `tstack restart-self` at a safe point. Either way the seat then gets `roles/restart.md` as a prompt, and the first wait under the new omp records what it loaded.
 - `skills/` holds the six skills every agent may use; `agents/` holds the omp agent types that `task` subagents run as.
-- Guards in `lane` (a lane may act only on itself; `lane merge` checks proof and checks) prevent mistakes, not attacks: lanes run as the same Unix user with the same `gh` login and could write seat files or call `gh` directly.
+- Guards in `lane` (a lane may act only on itself; `lane merge` checks proof and checks) prevent mistakes, not attacks: lanes run as the same Unix user with the same `gh` login and could write seat files or call `gh` directly. Delivery of the restart-self request is best effort: if the seat's easl integration drops between tstack's check and the send, easl types the text into its editor.
 
 ## Install on a new host
 
@@ -43,7 +43,7 @@ Requirements: git, Python 3.9 or newer, `gh` logged in, omp, and easl (the Mac a
 | `TSTACK_WAIT_POLL` | `60` | seconds between `tstack wait` polls |
 | `TSTACK_WAIT_BATCH` | `180` | seconds `tstack wait` holds non-urgent events to batch them |
 | `TSTACK_SMOKE_MODEL` | `@tiny` | the model `tstack check --smoke` runs |
-| `TSTACK_LOCK_WAIT` | `30` | seconds a command waits for a lane record or gates lock before it reports the lock busy |
+| `TSTACK_LOCK_WAIT` | `30` | seconds a command waits for a lane record, gates or recovery record lock before it reports the lock busy |
 
 ## Starting a seat
 

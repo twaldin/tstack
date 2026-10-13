@@ -156,15 +156,39 @@ def lock_is_held(path: Path) -> bool:
         return not held
 
 
+def lock_wait() -> float:
+    """Seconds a command waits for a short-held lock: $TSTACK_LOCK_WAIT, default 30."""
+    return float(os.environ.get("TSTACK_LOCK_WAIT", 30))
+
+
 @contextlib.contextmanager
 def short_lock(path: Path):
     """A lock held for one read-modify-write. Waits at most $TSTACK_LOCK_WAIT seconds (default 30), then
     raises, so a stuck holder shows up as an error instead of a hang."""
-    wait = float(os.environ.get("TSTACK_LOCK_WAIT", 30))
+    wait = lock_wait()
     with flock(path, timeout=wait) as held:
         if not held:
             raise Die(f"{path} is busy (held for over {wait:g}s)", 3)
         yield
+
+
+def session_owner() -> int | None:
+    """The pid of the process that started this one's session: the nearest ancestor outside this process's own
+    session. omp runs every bash tool command in a session of its own, so for a seat's `tstack wait` or
+    `tstack restart-self` this is the seat's omp. None when it cannot be told."""
+    try:
+        sid, pid = os.getsid(0), os.getppid()
+        while pid > 1:
+            if os.getsid(pid) != sid:
+                return pid
+            parent = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                                    timeout=10).stdout.strip()
+            if not parent.isdigit():
+                return None
+            pid = int(parent)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return None
 
 
 def run(argv: list[str], cwd: Path | None = None, timeout: float = 120, env: dict | None = None,

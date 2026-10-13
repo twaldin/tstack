@@ -117,6 +117,13 @@ class Liveness(Sandbox):
         self.assertIn("--force", self.log_lines("easl.log")[0])
         self.assertEqual(self.record()["restart"]["by"], "self")
 
+    def test_a_seat_that_never_polled_is_restarted_once_whoever_restarted_it(self):
+        self.env["EASL_TILE_ID"] = "obj_seat"
+        self.cli("tstack", "restart-self")
+        self.liveness()
+        self.liveness()
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
+
     def test_an_alert_counts_only_once_it_is_sent(self):
         self.heartbeat(40)
         self.liveness()

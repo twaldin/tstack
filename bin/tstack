@@ -51,7 +51,7 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("board", help="redraw the seat's keyed status tiles from state")
     p.add_argument("--seat")
 
-    sub.add_parser("update", help="fast-forward the repos, rerun setup and check, ask seats whose files changed to restart-self")
+    sub.add_parser("update", help="fast-forward the repos, rerun setup and check, ask seats running older files than installed to restart-self")
 
     p = sub.add_parser("restart-self", help="run by a seat at a safe point: restart its own tile (tstack then re-prompts it)")
     p.add_argument("--seat")

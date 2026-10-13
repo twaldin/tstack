@@ -107,6 +107,9 @@ elif args[:2] == ["ask", "cancel"]:
     asks[args[2]]["status"] = "cancelled"
     asks_path.write_text(json.dumps(asks))
     out({"object": {"id": args[2]}})
+elif args[0] == "agent.restart" and (stubs / "easl-kill-caller").exists():
+    os.kill(os.getppid(), 9)  # the caller dies before its restart goes out
+    sys.exit(1)
 elif args[0] == "agent.restart" and (stubs / "easl-busy").exists() and "--force" not in args:
     print("conflict: the agent is working", file=sys.stderr)
     sys.exit(1)
@@ -148,6 +151,78 @@ STUB_TEXT = r'''#!/bin/sh
 if [ -e "$STUBS/text-fail" ]; then echo "sendblue: 503" >&2; exit 1; fi
 printf '%s\n' "$*" >> "$STUBS/text.log"
 '''
+
+FAKE_OMP = r'''
+"""Fake seat omp: runs each <dir>/<n>.cmd (a JSON argv) in a session of its own, as omp's bash tool does,
+writing the child's pid to <n>.pid and, once it exits, its exit code to <n>.rc."""
+import json, subprocess, sys, time
+from pathlib import Path
+here, running = Path(sys.argv[1]), {}
+def publish(name, value):
+    (here / "tmp").write_text(str(value))
+    (here / "tmp").rename(here / name)
+while True:
+    for cmd in sorted(here.glob("*.cmd")):
+        if cmd.stem not in running:
+            running[cmd.stem] = subprocess.Popen(json.loads(cmd.read_text()), start_new_session=True,
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            publish(f"{cmd.stem}.pid", running[cmd.stem].pid)
+    for stem, child in running.items():
+        if child.poll() is not None and not (here / f"{stem}.rc").exists():
+            publish(f"{stem}.rc", child.returncode)
+    time.sleep(0.05)
+'''
+
+
+class FakeOmp:
+    """A seat omp, started at construction: the tstack commands it runs see it as their session_owner(), the
+    way a seat's omp runs them through its bash tool."""
+
+    def __init__(self, case: "Sandbox"):
+        self.dir, self.count = Path(tempfile.mkdtemp(dir=case.root)), 0
+        self.proc = subprocess.Popen([sys.executable, "-c", FAKE_OMP, str(self.dir)], env=case.env, cwd=case.seat)
+        case.addCleanup(self.stop)
+
+    def until(self, path: Path) -> str:
+        deadline = time.monotonic() + 30
+        while not path.exists():
+            if time.monotonic() > deadline:
+                raise AssertionError(f"fake omp: no {path.name}")
+            time.sleep(0.05)
+        return path.read_text()
+
+    def spawn(self, *args: str) -> str:
+        """Start `tstack <args>` in the seat; returns the command's name for pid() and end()."""
+        self.count += 1
+        name = f"{self.count:03d}"
+        (self.dir / "cmd.tmp").write_text(json.dumps([sys.executable, str(CODE / "bin" / "tstack"), *args]))
+        (self.dir / "cmd.tmp").rename(self.dir / f"{name}.cmd")
+        self.until(self.dir / f"{name}.pid")
+        return name
+
+    def pid(self, name: str) -> int:
+        return int((self.dir / f"{name}.pid").read_text())
+
+    def run(self, *args: str) -> int:
+        """Run `tstack <args>` in the seat to the end; returns its exit code."""
+        return int(self.until(self.dir / f"{self.spawn(*args)}.rc"))
+
+    def end(self, name: str) -> None:
+        """Kill a command still running and wait until the fake omp has reaped it."""
+        if not (self.dir / f"{name}.rc").exists():
+            try:
+                os.kill(self.pid(name), 9)
+            except ProcessLookupError:
+                pass
+            self.until(self.dir / f"{name}.rc")
+
+    def stop(self) -> None:
+        if self.proc.poll() is not None:
+            return
+        for pid in self.dir.glob("*.pid"):
+            self.end(pid.stem)
+        self.proc.kill()
+        self.proc.wait()
 
 
 def write_exe(path: Path, text: str) -> None:

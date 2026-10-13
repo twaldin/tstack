@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import datetime as dt
 import os
 import re
 import secrets
@@ -12,15 +13,17 @@ from pathlib import Path
 
 from . import easl
 from .seat import parse_options, read_board, read_gates, update_gates
-from .util import (HOME, Die, age, all_seats, engine_home, flock, git, instance_home, iso, machine, parse_iso,
-                   read_json, run, seat_name, state_root, write_json)
+from .util import (HOME, Die, age, all_seats, engine_home, flock, git, instance_home, iso, lock_wait, machine, parse_iso,
+                   read_json, run, seat_name, session_owner, state_root, write_json)
 
 STALE = 30 * 60
 ALERT_AFTER = 60 * 60
 SOURCE_FAILING = 60 * 60
 MAX_RSS_MB = 1536
-RECOVERY_LOCK_WAIT = 180
+PENDING_GRACE = 120
+PENDING_TTL = 60 * 60
 GATE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+SEAT_WIDE = ("global.md", "roles/", "skills/", "agents/", "extensions/")
 ASK = ("Files you load changed ({reasons}, generation {generation}). At your next safe point, after acking your "
        "batch, run `tstack restart-self`.")
 
@@ -86,10 +89,11 @@ def gate_lines(seat: Path, open_only: bool) -> list[str]:
     return lines
 
 
-# seat restarts (D18). Update never restarts a seat: when a file the seat loads changed it records the
-# generation the seat should load and asks the seat, by message, to run `tstack restart-self` at a safe point.
+# seat restarts (D18). Update never restarts a seat: every run compares the files a seat loads, as installed,
+# with the generation its omp loaded and asks the seat, by message, to run `tstack restart-self` at a safe point.
 # Liveness restarts a seat whose wait went quiet, with a plain restart that easl refuses while the seat works.
-# Both, and restart-self, share one record per seat: state/run/recovery.json under state/run/recovery.lock.
+# Either restart leaves a pending generation that the first wait under the new omp confirms as loaded. All of
+# them share one record per seat: state/run/recovery.json under state/run/recovery.lock.
 
 def restart_prompt() -> str:
     path = engine_home() / "roles" / "restart.md"
@@ -124,9 +128,10 @@ def send_text(message: str) -> tuple[bool, str]:
 @contextlib.contextmanager
 def recovery(seat: Path, wait: float | None):
     """The seat's recovery record under its lock, as (record, save); (None, None) when the lock stays busy
-    (`wait` None: do not wait for it). Fields: `desired` (generation update wants loaded, with reasons),
-    `loaded` (generation restart-self recorded), `asked`, `restart` (by, at, prompted, attempt), and
-    liveness's `incident`, `attempt`, `alerted`, `source_alerts`."""
+    (`wait` None: do not wait for it). Fields: `loaded` (the tstack and agents commits the seat's omp loaded
+    its files from), `pending` (a restart made or prepared, with the generation the new omp loads, until a wait
+    under that omp confirms it), `asked`, `restart` (by, at, prompted, attempt), and liveness's `incident`,
+    `attempt`, `alerted`, `source_alerts`."""
     run_dir = seat / "state" / "run"
     path = run_dir / "recovery.json"
     with flock(run_dir / "recovery.lock", blocking=wait is not None, timeout=wait) as held:
@@ -147,6 +152,94 @@ def newer(when: str | None, than: str | None) -> bool:
 
 def heartbeat(seat: Path) -> dict:
     return read_json(seat / "state" / "run" / "heartbeat.json") or {}
+
+
+def repos() -> tuple[tuple[str, Path], ...]:
+    return (("tstack", engine_home()), ("agents", instance_home()))
+
+
+def installed() -> dict:
+    """The generation a seat starting now loads: the tstack and agents commits checked out (None where a repo
+    is not a git checkout)."""
+    return {name: git(path, "rev-parse", "HEAD", check=False) or None for name, path in repos()}
+
+
+def label(generation: dict) -> str:
+    return " ".join(f"{name}@{(generation.get(name) or '?')[:7]}" for name, _ in repos())
+
+
+def loads(seat: Path, repo: str, rel: str) -> bool:
+    """Whether the seat's omp loads file `rel` of repo `repo`: globals, roles, skills, agents and extensions reach
+    every seat (the machine's too); an instance .md outside state/ reaches the seats at or below its directory."""
+    m = machine()
+    if rel.startswith(SEAT_WIDE) or (repo == "agents" and rel.startswith(
+            (f"machines/{m}/global.md", f"machines/{m}/skills/", f"machines/{m}/agents/"))):
+        return True
+    if repo == "agents" and rel.endswith(".md") and "/state/" not in f"/{rel}":
+        folder = (instance_home() / rel).parent.resolve()
+        return seat.resolve() == folder or folder in seat.resolve().parents
+    return False
+
+
+def unloaded(seat: Path, loaded, now: dict) -> list[str]:
+    """The files the seat loads that differ between the generation its omp loaded and the one installed now;
+    one reason in their place when what it loaded is unknown."""
+    if not isinstance(loaded, dict):
+        return ["no record of what this session loaded"]
+    changed = []
+    for name, path in repos():
+        old, new = loaded.get(name), now.get(name)
+        if old == new:
+            continue
+        if not old or not new:
+            return [f"no record of the {name} commit this session loaded"]
+        diff = run(["git", "-C", str(path), "diff", "--name-only", old, new], check=False)
+        if diff.returncode:
+            return [f"the {name} commit this session loaded ({old[:7]}) is not in {path}"]
+        changed += [f"{name}/{rel}" for rel in diff.stdout.splitlines() if loads(seat, name, rel)]
+    return changed
+
+
+def prepare_restart(record: dict, by: str, replaces: int | None) -> None:
+    """Record a restart as the seat's recovery: its restart prompt is owed, and `pending` holds the generation
+    the new omp loads, and the pid of the omp it replaces, until a wait under another omp confirms it
+    (`confirm_restart`)."""
+    at = iso()
+    record["restart"] = {"by": by, "at": at, "prompted": None}
+    record["pending"] = {"generation": installed(), "at": at, "by": by, "replaces": replaces}
+
+
+def confirm_restart(seat: Path, omp: int | None) -> None:
+    """Run by the seat's wait at every poll, with the pid of the omp it runs under (`session_owner`): a wait under
+    any omp but the replaced one runs in the restarted omp, so the pending generation becomes the loaded one. A
+    wait under the replaced omp (its restart never happened) leaves it pending. Pids, not clocks: a process's
+    start time reads up to a second or two early on Linux, and a reused pid only delays confirmation."""
+    if not omp or "pending" not in (read_json(seat / "state" / "run" / "recovery.json") or {}):
+        return
+    with recovery(seat, None) as (record, save):
+        pending = (record or {}).get("pending")
+        if pending and omp != pending.get("replaces"):
+            record["loaded"] = pending["generation"]
+            record["loaded_by"] = {"omp": omp, "confirmed": iso()}
+            del record["pending"]
+            save()
+
+
+def settle_pending(seat: Path, record: dict) -> str | None:
+    """Drop a pending restart that will never be confirmed: the replaced omp's wait still polls two minutes on
+    (restart-self died before its restart went out), or none confirmed it within an hour. Returns a note when
+    dropped; `pending` left in place means a restart is in progress."""
+    pending = record["pending"]
+    beat = heartbeat(seat)
+    try:
+        due = iso(parse_iso(pending["at"]) + dt.timedelta(seconds=PENDING_GRACE))
+    except (KeyError, ValueError):
+        due = None
+    old_polling = pending.get("replaces") is not None and beat.get("omp") == pending["replaces"] and newer(beat.get("at"), due)
+    if old_polling or (age(pending.get("at")) or 0) > PENDING_TTL:
+        del record["pending"]
+        return f"restart at {pending.get('at')} never confirmed" + (" (the old session still polls)" if old_polling else "")
+    return None
 
 
 def send_owed_prompt(seat: Path, board: dict, record: dict, save) -> str | None:
@@ -175,28 +268,26 @@ def send_owed_prompt(seat: Path, board: dict, record: dict, save) -> str | None:
 
 
 def restart_self(seat: Path) -> str:
-    """Run by a seat in its own tile at a safe point: record the generation update asked for as loaded, mark
-    the restart prompt owed (liveness or the next update sends it once the tile is idle), then restart the
-    seat's own tile with force. The restart ends this process; when easl refuses, the record goes back."""
+    """Run by a seat in its own tile at a safe point: record a prepared restart (`pending`, confirmed only by a
+    wait under the restarted omp) with its restart prompt owed (liveness or the next update sends it once the
+    tile is idle), then restart the seat's own tile with force. The restart ends this process; when easl
+    refuses, the record goes back."""
     tile = os.environ.get("EASL_TILE_ID")
     if not tile:
         raise Die("tstack restart-self runs inside the seat's own easl tile; EASL_TILE_ID is unset")
     board = read_board(seat)
     if not board or board.get("tile") != tile:
         raise Die(f"this tile ({tile}) is not the seat's tile in state/board.json ({(board or {}).get('tile')})")
-    with recovery(seat, RECOVERY_LOCK_WAIT) as (record, save):
+    with recovery(seat, lock_wait()) as (record, save):
         if record is None:
             raise Die("the seat's recovery record is busy; run tstack restart-self again in a minute", 3)
-        before = {key: copy.deepcopy(record.get(key)) for key in ("loaded", "restart")}
-        desired = (record.get("desired") or {}).get("generation")
-        if desired:
-            record["loaded"] = desired
-        record["restart"] = {"by": "self", "at": iso(), "prompted": None}
+        before = {key: copy.deepcopy(record.get(key)) for key in ("restart", "pending")}
+        prepare_restart(record, "self", session_owner())
         save()
     try:
         easl.restart(board, force=True)
     except Die as error:
-        with recovery(seat, RECOVERY_LOCK_WAIT) as (record, save):
+        with recovery(seat, lock_wait()) as (record, save):
             if record is not None:
                 for key, value in before.items():
                     if value is None:
@@ -239,8 +330,10 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
             record.pop(key, None)
     else:
         record.setdefault("incident", iso())
-        since = at or record["incident"]
-        if not newer((record.get("restart") or {}).get("at"), since):
+        restart_at = (record.get("restart") or {}).get("at")
+        # the recovery under way: a restart since the seat last polled, or any restart when it never polled
+        active = newer(restart_at, at) if at else bool(restart_at)
+        if not active:
             try:
                 easl.restart(board)
             except easl.EaslConflict as error:
@@ -250,7 +343,7 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
                 record["attempt"] = {"at": iso(), "error": str(error)[:300]}
                 out.append(f"stale since {at or 'never'}; restart failed: {str(error)[:200]}")
             else:
-                record["restart"] = {"by": "liveness", "at": iso(), "prompted": None}
+                prepare_restart(record, "liveness", beat.get("omp"))
                 record.pop("attempt", None)
                 save()
                 out.append(f"stale since {at or 'never'}; restarted in place; {send_owed_prompt(seat, board, record, save)}")
@@ -258,7 +351,7 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
         stale_total = stale_for if stale_for is not None else STALE + (age(record["incident"]) or 0)
         if stale_total > ALERT_AFTER and record.get("alerted") != record["incident"]:
             restart = record.get("restart") or {}
-            if not newer(restart.get("at"), since):
+            if not (newer(restart.get("at"), at) if at else restart.get("at")):
                 state = f"not restarted: {(record.get('attempt') or {}).get('error')}"
             elif restart.get("prompted"):
                 state = f"restarted at {restart['at']} ({restart.get('by')}), still not polling"
@@ -282,40 +375,12 @@ def watch(seat: Path, board: dict, record: dict, save) -> list[str]:
 
 # update
 
-SEAT_WIDE = ("global.md", "roles/", "skills/", "agents/", "extensions/")
-
-
-def seats_touched(changes: dict, seats: list[Path]) -> dict:
-    """Which seats load a changed file, as seat path -> the changed files: engine/instance globals, skills and
-    agents reach every seat; an instance .md outside state/ reaches the seats at or below its directory."""
-    touched = {}
-    m = machine()
-    for repo, paths in changes.items():
-        for rel in paths:
-            wide = rel.startswith(SEAT_WIDE) or (repo == "agents" and rel.startswith(
-                (f"machines/{m}/global.md", f"machines/{m}/skills/", f"machines/{m}/agents/")))
-            for seat in seats:
-                inside = False
-                if repo == "agents" and rel.endswith(".md") and "/state/" not in f"/{rel}":
-                    folder = (instance_home() / rel).parent.resolve()
-                    inside = seat.resolve() == folder or folder in seat.resolve().parents
-                if wide or inside:
-                    touched.setdefault(str(seat), []).append(f"{repo}/{rel}")
-    return touched
-
-
 def rss_mb(agent: dict) -> float | None:
     pid = agent.get("pid")
     if not pid:
         return None
     result = run(["ps", "-o", "rss=", "-p", str(pid)], check=False)
     return int(result.stdout.strip()) / 1024 if result.stdout.strip().isdigit() else None
-
-
-def generation() -> str:
-    """The engine and instance commits a seat loads its files from, e.g. `tstack@1a2b3c4 agents@5d6e7f8`."""
-    return " ".join(f"{name}@{git(path, 'rev-parse', '--short=7', 'HEAD', check=False) or '?'}"
-                    for name, path in (("tstack", engine_home()), ("agents", instance_home())))
 
 
 def tstack_cli(*args: str) -> subprocess.CompletedProcess:
@@ -355,41 +420,40 @@ def rollback(moved: dict) -> list[str]:
     return notes
 
 
-def ask_restarts(changes: dict) -> list[str]:
-    """For each local seat: send a restart prompt a restart left owed; when this update changed a file the seat
-    loads, record the generation it should load; and while its loaded generation differs from that, or its omp
-    is over 1.5 GB, send it one message (out of band, never typed) asking it to run `tstack restart-self` at its
-    next safe point. Never restarts a seat."""
-    seats = local_seats()
-    touched = seats_touched(changes, [s for s, _ in seats])
-    wanted, results = generation(), []
-    for seat, board in seats:
+def ask_restarts() -> list[str]:
+    """For each local seat: send a restart prompt a restart left owed; then, unless a restart is in progress,
+    compare the files the seat loads as installed now with the generation its omp loaded, and while any differ
+    (or its omp is over 1.5 GB) send it one message (out of band) asking it to run `tstack restart-self` at its
+    next safe point. Every run compares afresh, so a run that skipped a seat (its record busy, easl down) loses
+    nothing. Never restarts a seat."""
+    now, results = installed(), []
+    for seat, board in local_seats():
         name = seat_name(seat)
-        with recovery(seat, RECOVERY_LOCK_WAIT) as (record, save):
+        with recovery(seat, lock_wait()) as (record, save):
             if record is None:
-                results.append(f"{name}:recovery record busy")
+                results.append(f"{name}:recovery record busy, next run compares again")
                 continue
             owed = send_owed_prompt(seat, board, record, save)
             if owed:
                 results.append(f"{name}:{owed[:80]}")
-            desired = record.get("desired") or {}
-            behind = bool(desired.get("generation")) and record.get("loaded") != desired["generation"]
-            if str(seat) in touched:
-                earlier = desired.get("reasons", []) if behind else []
-                desired = {"generation": wanted, "reasons": list(dict.fromkeys(earlier + touched[str(seat)])), "at": iso()}
-                record["desired"], behind = desired, record.get("loaded") != wanted
+            if record.get("pending"):
+                dropped = settle_pending(seat, record)
                 save()
+                if not dropped:
+                    results.append(f"{name}:restart at {record['pending']['at']} in progress")
+                    continue
+                results.append(f"{name}:{dropped}")
+            reasons = unloaded(seat, record.get("loaded"), now)
             try:
                 agent = easl.agent(board) or {}
             except Die as error:
                 results.append(f"{name}:easl agent.list failed ({str(error)[:80]})")
                 continue
-            reasons = list(desired["reasons"]) if behind else []
             mem = rss_mb(agent)
             if mem and mem > MAX_RSS_MB:
                 reasons.append(f"omp uses {mem:.0f} MB")
             if reasons:
-                results.append(f"{name}:{ask(board, agent, record, save, reasons, desired.get('generation') or wanted)}")
+                results.append(f"{name}:{ask(board, agent, record, save, reasons, label(now))}")
     return results
 
 
@@ -413,10 +477,10 @@ def ask(board: dict, agent: dict, record: dict, save, reasons: list[str], wanted
 
 def update() -> tuple[int, str]:
     """Fast-forward the repos, admit the result through the new bin/tstack, roll every moved repo back on any
-    failure, ask seats whose files changed to restart themselves. Always appends one status line to update.log."""
+    failure, ask seats whose loaded files differ from the installed ones to restart themselves. Always appends
+    one status line to update.log."""
     notes, moved, code = [], {}, 0
     try:
-        changes = {}
         for name, path in (("tstack", engine_home()), ("agents", instance_home()), ("dotfiles", HOME / "dotfiles")):
             if not (path / ".git").exists():
                 notes.append(f"{name}=absent")
@@ -432,16 +496,14 @@ def update() -> tuple[int, str]:
             notes.append(f"{name}={old[:7]}" + (f"..{new[:7]}" if new != old else ""))
             if new != old:
                 moved[name] = (path, old)
-                changes[name] = git(path, "diff", "--name-only", old, new).splitlines()
         problems = admit()
         if problems:
             code = 1
             notes.append(f"admission failed ({problems[0]}); rollback: {', '.join(rollback(moved)) or 'nothing moved'}")
-            moved, changes = {}, {}
         else:
             notes.append("setup=ok check=ok")
-            moved = {}
-        results = ask_restarts(changes)
+        moved = {}
+        results = ask_restarts()
         if results:
             notes.append("seats=" + ",".join(results))
     except Exception as error:  # the transaction boundary: whatever broke, roll back and log it
