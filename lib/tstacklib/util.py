@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -179,6 +180,33 @@ def run(argv: list[str], cwd: Path | None = None, timeout: float = 120, env: dic
         detail = (result.stderr or result.stdout).strip()[-400:]
         raise Die(f"{' '.join(argv[:3])} failed (exit {result.returncode}): {detail}")
     return result
+
+
+RUNTIME_ROOT = Path("/run/user")
+
+
+def user_bus_env() -> dict:
+    """The environment for `systemctl --user` and `systemd-run --user`. Seats run in terminals easld spawns from
+    a system unit, without XDG_RUNTIME_DIR or DBUS_SESSION_BUS_ADDRESS; fill them from /run/user/<uid>."""
+    env = dict(os.environ)
+    runtime = env.get("XDG_RUNTIME_DIR") or str(RUNTIME_ROOT / str(os.getuid()))
+    env["XDG_RUNTIME_DIR"] = runtime
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        bus = Path(runtime) / "bus"
+        try:
+            is_socket = stat.S_ISSOCK(bus.stat().st_mode)
+        except OSError:
+            is_socket = False
+        if not is_socket:
+            raise Die(f"no systemd user bus at {bus}: DBUS_SESSION_BUS_ADDRESS is unset and the user manager is not "
+                      "running (try `loginctl enable-linger`)")
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    return env
+
+
+def user_systemd(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run a `systemctl --user` or `systemd-run --user` command with the user bus reachable."""
+    return run(argv, env=user_bus_env(), **kwargs)
 
 
 def git(repo: Path, *args: str, check: bool = True, timeout: float = 120) -> str:

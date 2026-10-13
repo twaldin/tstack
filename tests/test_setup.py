@@ -182,6 +182,53 @@ class OmpConfig(Sandbox):
         self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home)
         self.assertIn("omp config: extension path /opt/other/ext.ts is outside tstack and easl", self.check())
 
+    def test_paths_that_resolve_outside_tstack_are_not_managed(self):
+        (self.root / "foreign-skills").mkdir()
+        (self.instance / "skills-link").symlink_to(self.root / "foreign-skills")
+        escapes = [f"{self.engine}/../foreign-skills", f"{self.instance}/skills-link"]
+        listed = "".join(f'    - "{p}"\n' for p in escapes)
+        self.config.write_text(self.original.replace(f'    - "{self.home}/.agents/skills"\n', listed)
+                               + "".join(f'"extensions":\n  - "{self.engine}/../foreign-skills/ext.ts"\n'))
+        self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home)
+        self.assertIn('"customDirectories": []', self.config.read_text())
+        self.assertIn(f"extension path {self.engine}/../foreign-skills/ext.ts is outside tstack and easl", self.check())
+
+    def setup_and_check(self, text: str):
+        self.config.write_text(text)
+        return self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home, check=False), self.check()
+
+    def test_unsafe_configs_are_left_for_a_manual_edit(self):
+        cases = [
+            ("{}\n", "(top level) (flow mapping, line 1)"),
+            ('"skills":\n  "enabled": &on false\n  "enablePiUser": true\n"advisor":\n  "enabled": *on\n',
+             "skills.enabled (anchor, line 2)"),
+            ('"disabledProviders": ["claude", "native"]\n', "disabledProviders (flow sequence, line 1)"),
+            ('"disabledProviders":\n  - "path": "/some/project"\n    "providers": "native"\n',
+             "disabledProviders[0] (path-scoped entry names native, line 2)"),
+            ('"disabledProviders": [{"path": "/some/project", "providers": ["native"]}]\n',
+             "disabledProviders[0] (path-scoped entry names native, line 1)"),
+            ('"theme": {"dark": x}\n"skills":\n  "enabled": false\n', "theme (flow mapping, line 1)"),
+            ('"skills":\n  "enabled": false\n  "enabled": false\n  "enablePiUser": true\n',
+             "skills.enabled (the edit does not read the same under Bun's YAML parser)"),
+        ]
+        for text, where in cases:
+            with self.subTest(where):
+                result, check = self.setup_and_check(text)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"config.yml needs a manual edit: {where}", result.stdout)
+                self.assertIn(f"config.yml needs a manual edit: {where}", check)
+                self.assertEqual(self.config.read_text(), text)
+
+    def test_config_errors_name_the_place_never_the_value(self):
+        fake = "FAKE_CREDENTIAL_123456"
+        cases = [(f'"provider": {{apiKey: {fake}}}\n', "provider (flow mapping, line 1)"),
+                 (f'"skills":\n  "enabled": true\n"token": "{fake}\\q"\n', "token (malformed quoted text, line 3)")]
+        for text, where in cases:
+            with self.subTest(where):
+                result, check = self.setup_and_check(text)
+                self.assertIn(where, result.stdout)
+                self.assertNotIn(fake, result.stdout + result.stderr + check)
+
     def test_quoted_disabled_providers_count(self):
         (self.home / ".claude").mkdir()
         (self.home / ".claude" / "CLAUDE.md").write_text("# claude rules\n")

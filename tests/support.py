@@ -16,6 +16,9 @@ from pathlib import Path
 CODE = Path(__file__).resolve().parents[1]
 LIB = CODE / "lib"
 sys.path.insert(0, str(LIB))
+# setup verifies omp config edits with Bun's YAML parser; the sandbox HOME has no ~/.bun
+BUN = shutil.which("bun") or next((str(p) for p in [Path.home() / ".bun" / "bin" / "bun"] if p.exists()), None)
+BUN_DIR = str(Path(BUN).parent) if BUN else ""
 
 STUB_OMP = r'''#!/usr/bin/env python3
 """Fake omp -p --mode json: a session event, one assistant message with a cost, an optional lane report."""
@@ -46,7 +49,9 @@ sys.exit(cfg.get("exit", 0))
 '''
 
 STUB_GH = r'''#!/usr/bin/env python3
-"""Fake gh: `pr view URL --json F` returns stubs/gh/pr.json; graphql threads return stubs/gh/threads.json; merge is logged."""
+"""Fake gh: `pr view URL --json F` returns stubs/gh/pr.json; graphql threads return stubs/gh/threads.json; merge is
+logged. `api PATH` prints stubs/gh/api/<PATH with / as _>.json, or fails with the text of a matching .err file,
+or with HTTP 404; `api user` defaults to the login shared-login."""
 import json, os, sys
 from pathlib import Path
 stubs = Path(os.environ["STUBS"])
@@ -58,6 +63,16 @@ if args[:2] == ["pr", "view"]:
 elif args[:2] == ["api", "graphql"]:
     nodes = json.loads((stubs / "gh" / "threads.json").read_text()) if (stubs / "gh" / "threads.json").exists() else []
     print(json.dumps([{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": nodes}}}}}]))
+elif args[0] == "api":
+    stem = str(stubs / "gh" / "api" / args[1].replace("/", "_"))
+    if os.path.exists(stem + ".json"):
+        print(Path(stem + ".json").read_text())
+    elif os.path.exists(stem + ".err"):
+        sys.exit("gh: " + Path(stem + ".err").read_text().strip())
+    elif args[1] == "user":
+        print(json.dumps({"login": "shared-login"}))
+    else:
+        sys.exit("gh: Not Found (HTTP 404)")
 elif args[:2] == ["pr", "merge"]:
     print("merged")
 else:
@@ -168,7 +183,7 @@ class Sandbox(unittest.TestCase):
         (self.stubs / "gh").mkdir()
         self.omp_config(report="done")
         self.env = {
-            "HOME": str(self.home), "PATH": f"{self.stubs / 'bin'}:{os.environ['PATH']}", "STUBS": str(self.stubs),
+            "HOME": str(self.home), "PATH": f"{self.stubs / 'bin'}:{os.environ['PATH']}:{BUN_DIR}", "STUBS": str(self.stubs),
             "TSTACK_HOME": str(self.engine), "TSTACK_INSTANCE": str(self.instance), "TSTACK_MACHINE": "testbox",
             "TSTACK_LAUNCHER": "process", "LANE_BIN": str(CODE / "bin" / "lane"), "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t",
@@ -236,15 +251,23 @@ class Sandbox(unittest.TestCase):
     def pr_stub(self, head: str = "a" * 40, state: str = "OPEN", checks=(("test", "SUCCESS"),), mergeable: str = "MERGEABLE",
                 merge_state: str = "CLEAN", comments=(), branch: str | None = None, review_decision: str = "",
                 created: str = "2026-10-13T00:00:00Z") -> None:
-        """`comments`: ids (the id is also the body), or (id, body) tuples. Every comment has the same author,
-        as the operator and the lanes share one gh login."""
+        """`comments`: ids (the id is also the body), (id, body) or (id, body, author). The default author is the
+        gh login the operator and the lanes share. `checks`: (name, conclusion) or (name, conclusion, completedAt)."""
         rows = [c if isinstance(c, tuple) else (c, c) for c in comments]
-        pr = {"headRefOid": head, "headRefName": branch, "state": state, "isDraft": False, "mergeable": mergeable,
-              "mergeStateStatus": merge_state, "latestReviews": [], "reviewRequests": [], "reviews": [],
-              "reviewDecision": review_decision,
-              "comments": [{"id": i, "body": b, "author": {"login": "shared-login"}, "createdAt": created} for i, b in rows],
-              "statusCheckRollup": [{"name": n, "conclusion": c} for n, c in checks]}
+        pr = {"headRefOid": head, "headRefName": branch, "baseRefName": "main", "state": state, "isDraft": False,
+              "mergeable": mergeable, "mergeStateStatus": merge_state, "latestReviews": [], "reviewRequests": [],
+              "reviews": [], "reviewDecision": review_decision,
+              "comments": [{"id": row[0], "body": row[1], "author": {"login": row[2] if len(row) > 2 else "shared-login"},
+                            "createdAt": created} for row in rows],
+              "statusCheckRollup": [{"name": c[0], "conclusion": c[1], "detailsUrl": f"https://ci.example/{c[0]}",
+                                     "completedAt": c[2] if len(c) > 2 else "2026-10-13T00:00:00Z"} for c in checks]}
         (self.stubs / "gh" / "pr.json").write_text(json.dumps(pr))
+
+    def gh_api(self, path: str, value=None, error: str | None = None) -> None:
+        """Answer `gh api <path>` with `value` as JSON, or fail with `error`."""
+        stem = str(self.stubs / "gh" / "api" / path.replace("/", "_"))
+        os.makedirs(os.path.dirname(stem), exist_ok=True)
+        Path(stem + (".json" if error is None else ".err")).write_text(error if error is not None else json.dumps(value))
 
 
 def dedent(text: str) -> str:

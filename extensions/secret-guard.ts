@@ -19,9 +19,21 @@ const HINT =
 
 const SAFE_ENV_SUFFIX = /^\.env\.(example|sample|template|dist)$/i;
 
+// The file a tool path names, without read-tool selectors: `?q=…&raw=true` queries, `#…`, and trailing
+// `:raw`, `:img`, `:conflicts`, `:N-M`, `:-N`, `:N+M`, `:A-B,C-D` in any order. Archive members
+// (`x.zip:dir/auth.json`) keep their member name as the base.
+function underlyingPath(p: string): string {
+  let clean = p.replace(/[?#].*$/s, "");
+  for (let prev = ""; prev !== clean; ) {
+    prev = clean;
+    clean = clean.replace(/:(?:raw|img|conflicts|-?\d[\d,+\-]*)$/i, "");
+  }
+  return clean.replace(/\/+$/, "");
+}
+
 function isSecretPath(p: string): boolean {
-  const clean = p.replace(/:(raw|img|conflicts|\d[\d,+\-:]*)+$/i, "").replace(/\/+$/, "");
-  const base = clean.split("/").pop() ?? "";
+  const clean = underlyingPath(p);
+  const base = clean.split(/[/:]/).pop() ?? "";
   if (/^\.env(\..+)?$/i.test(base) && !SAFE_ENV_SUFFIX.test(base)) return true;
   if (/\.(pem|p12|pfx|key)$/i.test(base) && !/\.pub$/i.test(base)) return true;
   if (/^id_(rsa|ecdsa|ed25519|dsa)$/.test(base)) return true;
@@ -33,11 +45,12 @@ function isSecretPath(p: string): boolean {
   return false;
 }
 
-// A `.env` path token inside free text (shell or code), e.g. `cat ~/app/.env`, `open('.env')`.
-const ENV_TOKEN = /(?:^|[\s'"`=/<(:])\.env(?:\.(?!example\b|sample\b|template\b|dist\b)[\w.-]+)?(?=$|[\s'"`;|&)>,])/i;
+// A `.env` path token inside free text (shell or code), e.g. `cat ~/app/.env`, `open('.env')`,
+// `read(".env:raw")`. A token may end at a read-tool selector (`?`, `#`, `:`).
+const ENV_TOKEN = /(?:^|[\s'"`=/<(:])\.env(?:\.(?!example\b|sample\b|template\b|dist\b)[\w.-]+)?(?=$|[\s'"`;|&)>,?#:])/i;
 // Credential stores named in free text: auth.json, relay.json, ~/.secrets, keychain files.
 const STORE_TOKEN =
-  /(?:^|[\s'"`=/<(:])(?:auth|relay)\.json(?=$|[\s'"`;|&)>,])|(?:^|[\s'"`=/<(:~])\.secrets(?=$|[\s/'"`;|&)>,])|\.keychain(?:-db)?\b|\bLibrary\/Keychains\b/i;
+  /(?:^|[\s'"`=/<(:])(?:auth|relay)\.json(?=$|[\s'"`;|&)>,?#:])|(?:^|[\s'"`=/<(:~])\.secrets(?=$|[\s/'"`;|&)>,?#:])|\.keychain(?:-db)?\b|\bLibrary\/Keychains\b/i;
 const SHELL_DENY: Array<[RegExp, string]> = [
   [/\bgcloud\s+secrets\s+versions\s+access\b/i, "gcloud secrets versions access"],
   [/\bkubectl\s+get\s+secrets?\b[^|;&]*\s-o\s*=?\s*(yaml|json|jsonpath|go-template)/i, "kubectl get secret -o"],

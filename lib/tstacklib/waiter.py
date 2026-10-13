@@ -1,9 +1,10 @@
 """tstack wait: poll a seat's sources, resume parked lanes on PR events, wake the seat with batches.
 
 State lives in one file, state/run/wait/state.json, replaced atomically: cursors per source, pending
-events, and delivered batches not yet acked. Each source works on a copy of its cursor and returns the
-new cursor with its events; a poll commits both together in one write, and a failing source commits
-neither. A batch stays until `--ack`, so a seat that dies before handling one gets it again.
+events, delivered batches not yet acked, and PR dispatches no lane run has accepted yet. Each source works
+on a copy of its cursor and returns the new cursor with its events; a poll commits both together in one
+write, and a failing source commits neither. A batch stays until `--ack`, so a seat that dies before
+handling one gets it again.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import hashlib
-import json
 import os
 import subprocess
 import time
@@ -75,31 +75,68 @@ class Waiter:
         return seen, events
 
     def prs(self, cursors):
-        """PR events for waiting lanes resume the lane directly, one resume per lane per poll. Each dispatch
-        carries an id derived from the PR snapshot, so replaying it after a crash is a no-op."""
+        """PR events for waiting lanes resume the lane directly, one dispatch per lane at a time. A dispatch's id
+        comes from the GitHub occurrences behind its events. The dispatch is saved before its launch and retried
+        each poll until a run that took its id is accepted by its supervisor, or the lane refuses it; then one
+        write drops it and moves the lane's PR cursor past it."""
         cursors = cursors or {}
-        for lane in lanes.lanes(self.seat):
-            record = lane.load()
-            if record["status"] != "waiting" or not record.get("pr"):
-                continue
-            snap = prwatch.snapshot(record["pr"])
-            happened = prwatch.actionable((cursors.get(lane.id) or {}).get("fp"), snap, lane.id)
-            if happened:
-                text = f"PR {record['pr']} at {snap['head'][:12]}: {'; '.join(happened)}."
-                red = snap["ci"] == "red" and snap["failing"] and any(h.startswith("checks-red") for h in happened)
-                dispatch = "pr-" + digest(lane.id, json.dumps(snap, sort_keys=True))
-                try:
-                    _, accepted = lanes.resume(lane, text, "check-failed" if red else "pr",
-                                               snap["failing"] if red else [], event_id=dispatch)
-                    if accepted:
-                        self.resumed.append(lane.id)
-                except Die as error:
-                    if error.code == lanes.EXIT_BUSY:
-                        continue
-                    if error.code not in (lanes.EXIT_REFUSED, lanes.EXIT_STUCK):
-                        raise
-            cursors[lane.id] = {"fp": snap}
+        dispatches = self.state.setdefault("dispatches", {})
+        me, failures = None, []
+        present = lanes.lanes(self.seat)
+        for gone in set(dispatches) - {lane.id for lane in present}:
+            del dispatches[gone]
+        for lane in present:
+            try:
+                if lane.id in dispatches and not self.dispatch(lane, dispatches[lane.id], cursors):
+                    continue
+                record = lane.load()
+                if record["status"] != "waiting" or not record.get("pr"):
+                    continue
+                me = me or prwatch.viewer()
+                pr = prwatch.view(record["pr"])
+                snap = prwatch.wait_snapshot(pr, prwatch.threads(record["pr"], me), me)
+                happened = prwatch.actionable((cursors.get(lane.id) or {}).get("fp"), snap, lane.id)
+                if not happened:
+                    cursors[lane.id] = {"fp": snap}
+                    continue
+                labels = [label for label, _ in happened]
+                red = snap["ci"] == "red" and snap["failing"] and any(label.startswith("checks-red") for label in labels)
+                dispatches[lane.id] = {
+                    "id": "pr-" + digest(lane.id, *sorted(o for _, ids in happened for o in ids)),
+                    "text": f"PR {record['pr']} at {snap['head'][:12]}: {'; '.join(labels)}.",
+                    "kind": "check-failed" if red else "pr", "checks": snap["failing"] if red else [], "fp": snap}
+                self.save()
+                self.dispatch(lane, dispatches[lane.id], cursors)
+            except SOURCE_ERRORS as error:
+                failures.append(f"{lane.id}: {error}")
+        if failures:
+            raise Die("; ".join(failures))
         return cursors, []
+
+    def dispatch(self, lane, pending: dict, cursors: dict) -> bool:
+        """Launch a saved dispatch unless a run already took it. Once it is settled (a run with its id was
+        accepted by its supervisor, or the lane refused it) drop it and advance the lane's cursor, committed
+        and staged, in one write. Returns whether it settled; held and busy lanes retry next poll."""
+        taken = lanes.dispatched(lane.load(), pending["id"])
+        settled = False
+        if taken is None:
+            try:
+                taken, launched = lanes.resume(lane, pending["text"], pending["kind"], pending["checks"],
+                                               event_id=pending["id"])
+                if launched:
+                    self.resumed.append(lane.id)
+            except Die as error:
+                if error.code not in (lanes.EXIT_BUSY, lanes.EXIT_REFUSED, lanes.EXIT_STUCK):
+                    raise
+                settled = error.code != lanes.EXIT_BUSY
+        if taken is not None:
+            settled = bool(next(r for r in lane.load()["runs"] if r["run"] == taken).get("accepted"))
+        if settled:
+            cursors[lane.id] = {"fp": pending["fp"]}
+            self.cursors.setdefault("prs", {})[lane.id] = {"fp": pending["fp"]}
+            del self.state["dispatches"][lane.id]
+            self.save()
+        return settled
 
     def gates(self, cursor):
         if cursor is None:

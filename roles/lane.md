@@ -29,7 +29,7 @@ A task whose deliverable is an answer rather than a PR (the investigate playbook
 - `stuck`: your seat must decide something: a question, two failed waves, a check that is red on the base too, the timebox.
 - `failed`: the task cannot be done as briefed; the summary says why.
 - `--proof "CHECK=RESULT"` repeats once per check, every one run on the `--head` you report.
-- End every PR comment, review and reply you write with `<!-- tstack-lane:<your lane id> -->` (`$TSTACK_LANE`). Your seat's wait ignores bodies with your marker and resumes you for everything else. An event that is only your own unmarked comment needs nothing beyond reporting `waiting` again.
+- End every PR comment, review and reply you write with `<!-- tstack-lane:<your lane id> -->` (`$TSTACK_LANE`) as its own last line, after a blank line. Your seat's wait ignores bodies with your marker there and resumes you for everything else. An event that is only your own unmarked comment needs nothing beyond reporting `waiting` again.
 - `lane` fills in the run's cost from omp's usage records; never estimate it.
 
 ## Decisions with nobody to ask

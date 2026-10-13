@@ -14,7 +14,7 @@ from pathlib import Path
 from . import prwatch
 from .seat import stop_reason
 from .util import (ENGINE, HOME, IS_MAC, Die, age, engine_home, flock, git, instance_home, iso, lock_is_held, machine, money,
-                   read_json, run, short_age, short_lock, worktrees_root, write_atomic, write_json)
+                   read_json, run, short_age, short_lock, user_systemd, worktrees_root, write_atomic, write_json)
 
 STATUSES = {"running", "waiting", "done", "stuck", "failed", "cancelled"}
 TERMINAL = {"done", "stuck", "failed", "cancelled"}
@@ -161,7 +161,7 @@ def spawn(lane: Lane, record: dict, number: int, kind: str) -> None:
         if cpus:
             argv += ["-p", f"CPUAffinity={cpus}"]
         argv += [f"--setenv={k}={v}" for k, v in env.items()]
-        run(argv + command, timeout=60)
+        user_systemd(argv + command, timeout=60)
     else:
         with open(lane.run_dir / "supervisor.log", "a") as log:
             subprocess.Popen(command, env={**os.environ, **env}, stdin=subprocess.DEVNULL, stdout=log,
@@ -383,8 +383,10 @@ def start(seat: Path, task: str, brief: Path, project: str | None, repo: str | N
 
 
 def dispatched(record: dict, event_id: str | None) -> int | None:
-    """The run that already took this dispatch, if any."""
-    return next((r["run"] for r in record.get("runs", []) if event_id and r.get("event_id") == event_id), None)
+    """The run that took this dispatch: accepted by its supervisor, or handed to the launcher and not ended.
+    A run that ended without starting does not count, so its dispatch can launch again."""
+    return next((r["run"] for r in record.get("runs", []) if event_id and r.get("event_id") == event_id
+                 and (r.get("accepted") or not r.get("end"))), None)
 
 
 def resume(lane: Lane, text: str, kind: str | None, checks: list[str], event_id: str | None = None) -> tuple[int, bool]:
@@ -469,6 +471,84 @@ def system_repo(slugs: list[str]) -> str | None:
     return None
 
 
+# Ruleset rule types a squash merge of a mergeable PR already meets. Every other type except the review
+# rule (pull_request) and required_status_checks, which lane merge checks itself, refuses --admin.
+RULES_MET = {"creation", "deletion", "non_fast_forward", "required_linear_history"}
+# Classic protection settings that do not bear on merging a mergeable PR with a squash commit.
+CLASSIC_MET = {"url", "allow_force_pushes", "allow_deletions", "block_creations", "allow_fork_syncing",
+               "required_linear_history"}
+
+
+def gh_api(path: str):
+    """(value, None) for `gh api <path>`, or (None, error text)."""
+    result = run(["gh", "api", path], check=False, timeout=60)
+    if result.returncode != 0:
+        return None, (result.stderr or result.stdout).strip()[-200:]
+    try:
+        return json.loads(result.stdout), None
+    except ValueError:
+        return None, "not JSON"
+
+
+def only_review_unmet(url: str, pr: dict, base: str) -> None:
+    """Refuse unless GitHub's branch rules prove a missing review is the only unmet requirement: the rules
+    API answers, every ruleset rule is of a type modeled here, classic protection (when the repo has any)
+    asks for nothing beyond reviews, checks and conversation resolution, every required status check has a
+    passing run on the head, a strict policy finds the head up to date, and required conversation
+    resolution finds no open thread. An unreadable or unmodeled rule refuses."""
+    owner, repo, _ = prwatch.parse_url(url)
+    head = pr["headRefOid"]
+
+    def refuse(why: str):
+        raise Die(f"lane merge --admin refused: {why}. Report waiting on review", EXIT_REFUSED)
+    rules, error = gh_api(f"repos/{owner}/{repo}/rules/branches/{base}")
+    if error or not isinstance(rules, list):
+        refuse(f"GitHub's rules for {base} are unreadable ({error or 'not a list'})")
+    review, required, strict, resolve = False, set(), False, False
+    for rule in rules:
+        kind, params = rule.get("type"), rule.get("parameters") or {}
+        if kind == "pull_request":
+            review = True
+            resolve |= bool(params.get("required_review_thread_resolution"))
+        elif kind == "required_status_checks":
+            required |= {c.get("context") for c in params.get("required_status_checks") or []}
+            strict |= bool(params.get("strict_required_status_checks_policy"))
+        elif kind not in RULES_MET:
+            refuse(f"branch rule `{kind}` is not one lane merge can check")
+    protection, error = gh_api(f"repos/{owner}/{repo}/branches/{base}/protection")
+    if error and not re.search(r"HTTP 40[34]", error):
+        refuse(f"classic branch protection for {base} is unreadable ({error})")
+    for key, value in (protection or {}).items():
+        if key == "required_pull_request_reviews":
+            review = True
+        elif key == "required_status_checks":
+            required |= set(value.get("contexts") or []) | {c.get("context") for c in value.get("checks") or []}
+            strict |= bool(value.get("strict"))
+        elif key == "required_conversation_resolution":
+            resolve |= bool(value.get("enabled"))
+        elif key not in CLASSIC_MET and not (isinstance(value, dict) and value.get("enabled") is False):
+            refuse(f"classic protection setting `{key}` is not one lane merge can check")
+    if not review:
+        refuse(f"no review rule on {base} explains the block")
+    states: dict[str, list[str]] = {}
+    for item in pr["statusCheckRollup"]:
+        states.setdefault(prwatch.check_name(item), []).append(prwatch.check_state(item))
+    unproven = sorted(c for c in required - {None} if not states.get(c) or any(s not in prwatch.GREEN for s in states[c]))
+    if unproven:
+        refuse(f"required checks without a passing run on {head[:12]}: {', '.join(unproven)}")
+    if strict:
+        compare, error = gh_api(f"repos/{owner}/{repo}/compare/{base}...{head}")
+        if error or (compare or {}).get("behind_by") != 0:
+            refuse(f"{base} requires an up-to-date branch and {head[:12]} is behind it ({error or 'behind'})")
+    if resolve:
+        try:
+            open_threads = [t for t in prwatch.threads(url) if not t["r"]]
+        except (subprocess.SubprocessError, ValueError, KeyError) as error:
+            refuse(f"review threads are unreadable ({type(error).__name__})")
+        if open_threads:
+            refuse(f"{base} requires resolved conversations and the PR has open threads")
+
+
 def merge(lane: Lane, admin: bool = False) -> str:
     """Hard merge guard (review F12): proof for the current head, open, mergeable, all checks passed.
     Never arms auto-merge: a later head would merge without proof."""
@@ -487,7 +567,8 @@ def merge(lane: Lane, admin: bool = False) -> str:
     if system:
         raise Die(f"lane merge never merges system PRs ({system}): report waiting on operator", EXIT_REFUSED)
     try:
-        pr = prwatch.view(url, "state,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,statusCheckRollup,reviewDecision")
+        pr = prwatch.view(url, "state,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,baseRefName,"
+                               "statusCheckRollup,reviewDecision")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as error:
         raise Die(f"gh pr view {url} failed: {error}")
     head = pr["headRefOid"]
@@ -523,6 +604,7 @@ def merge(lane: Lane, admin: bool = False) -> str:
                       "Run `lane merge --admin` to merge past the review rule, or report waiting on review", EXIT_REFUSED)
         if pipeline_says(record["project"], "admin-merge: no"):
             raise Die(f"{record['project']} pipeline says `admin-merge: no`: report waiting on review", EXIT_REFUSED)
+        only_review_unmet(url, pr, pr.get("baseRefName") or record["base"])
         bypass = True
     run(argv + (["--admin"] if bypass else []), timeout=120)
     lane.mutate(lambda rec: rec.update(merge={"head": head, "at": iso(), "admin": bypass}))
@@ -533,7 +615,7 @@ def kill(lane: Lane) -> None:
     """Signal whatever holds the run lock for this lane: its systemd unit, or the supervisor's process group."""
     last = (lane.load().get("runs") or [{}])[-1]
     if last.get("launcher") == "systemd":
-        run(["systemctl", "--user", "stop", unit_name(lane)], check=False, timeout=120)
+        user_systemd(["systemctl", "--user", "stop", unit_name(lane)], check=False, timeout=120)
         return
     pid_file = lane.run_dir / "pid"
     pid = pid_file.read_text().strip() if pid_file.exists() else ""

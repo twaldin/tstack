@@ -101,7 +101,11 @@ def local_seats() -> list[tuple[Path, dict]]:
 
 
 def send_text(message: str) -> tuple[bool, str]:
-    result = run([str(instance_home() / "bin" / "text"), "send", message], check=False, timeout=60)
+    """(sent, detail). A nonzero exit, a timeout or a text binary that cannot run is a failed send."""
+    try:
+        result = run([str(instance_home() / "bin" / "text"), "send", message], check=False, timeout=60)
+    except (Die, OSError) as error:
+        return False, f"text failed: {str(error)[:200]}"
     return result.returncode == 0, ("sent" if result.returncode == 0 else
                                     f"text failed (exit {result.returncode}): {result.stderr.strip()[-200:]}")
 
@@ -146,6 +150,7 @@ def liveness() -> list[str]:
             live.setdefault("incident", iso())
             if not (live.get("restarted") and live.get("prompted")):
                 out.append(f"{name}: stale since {at or 'never'}; {recover(board, live)}")
+                write_json(path, live)
             if (age(live["incident"]) or 0) > STALE and live.get("alerted") != live["incident"]:
                 state = (f"restarted at {live['restarted']}, still not polling" if live.get("prompted")
                          else f"recovery failing: {(live.get('attempt') or {}).get('error')}")

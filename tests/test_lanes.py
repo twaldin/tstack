@@ -1,6 +1,13 @@
 import datetime as dt
 import json
+import os
+import shutil
+import socket
 import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
 
 from support import Sandbox, git, write_exe
 
@@ -213,9 +220,20 @@ class MergeGuard(Sandbox):
         self.assertEqual(call[call.index("--match-head-commit") + 1], self.HEAD)
         self.assertIn("--squash", call)
 
-    def test_a_missing_review_needs_admin_and_auto_merge_is_never_armed(self):
+    RULES = "repos/acme/web/rules/branches/main"
+    CLASSIC = "repos/acme/web/branches/main/protection"
+    REVIEW_RULE = {"type": "pull_request", "parameters": {"required_approving_review_count": 1}}
+    TEST_REQUIRED = {"type": "required_status_checks",
+                     "parameters": {"required_status_checks": [{"context": "test"}], "strict_required_status_checks_policy": False}}
+
+    def blocked_on_review(self, checks=(("test", "SUCCESS"),)) -> None:
         self.report("pnpm test=pass")
-        self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1", merge_state="BLOCKED", review_decision="REVIEW_REQUIRED")
+        self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1", merge_state="BLOCKED", review_decision="REVIEW_REQUIRED",
+                     checks=checks)
+
+    def test_a_missing_review_needs_admin_and_auto_merge_is_never_armed(self):
+        self.gh_api(self.RULES, [self.REVIEW_RULE, self.TEST_REQUIRED, {"type": "deletion"}])
+        self.blocked_on_review()
         result = self.merge()
         self.assertEqual(result.returncode, 4)
         self.assertIn("lane merge --admin", result.stderr)
@@ -226,6 +244,62 @@ class MergeGuard(Sandbox):
         self.assertIn("--admin", call)
         self.assertNotIn("--auto", call)
         self.assertEqual(call[call.index("--match-head-commit") + 1], self.HEAD)
+
+    def test_admin_merge_passes_classic_review_protection_like_hones(self):
+        self.gh_api(self.RULES, [])
+        self.gh_api(self.CLASSIC, {
+            "required_pull_request_reviews": {"dismiss_stale_reviews": True, "required_approving_review_count": 1},
+            "required_signatures": {"enabled": False}, "enforce_admins": {"enabled": False},
+            "required_linear_history": {"enabled": False}, "allow_force_pushes": {"enabled": False},
+            "allow_deletions": {"enabled": False}, "block_creations": {"enabled": False},
+            "required_conversation_resolution": {"enabled": True}, "lock_branch": {"enabled": False},
+            "allow_fork_syncing": {"enabled": False}})
+        (self.stubs / "gh" / "threads.json").write_text(json.dumps([
+            {"id": "t1", "isResolved": True, "comments": {"nodes": [{"updatedAt": "x", "body": "b", "author": {"login": "r"}}]}}]))
+        self.blocked_on_review()
+        result = self.merge("--admin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.merged())
+
+    def test_admin_merge_needs_github_to_prove_review_is_the_only_unmet_rule(self):
+        open_thread = [{"id": "t1", "isResolved": False, "comments": {"nodes": [{"updatedAt": "x", "body": "b", "author": {"login": "r"}}]}}]
+        cases = [
+            ("rules unreadable", {"rules_error": "Upgrade to GitHub Pro or make this repository public (HTTP 403)"}, "unreadable"),
+            ("no check run yet", {"rules": [self.REVIEW_RULE, self.TEST_REQUIRED], "checks": ()}, "without a passing run on"),
+            ("required check missing", {"rules": [self.REVIEW_RULE, self.TEST_REQUIRED], "checks": (("lint", "SUCCESS"),)},
+             "without a passing run on"),
+            ("unmodeled rule", {"rules": [self.REVIEW_RULE, {"type": "merge_queue"}]}, "`merge_queue`"),
+            ("classic admins enforced", {"rules": [], "classic": {"required_pull_request_reviews": {},
+                                                                   "enforce_admins": {"enabled": True}}}, "`enforce_admins`"),
+            ("classic required check", {"rules": [], "classic": {"required_pull_request_reviews": {},
+                                                                  "required_status_checks": {"contexts": ["build"]}}}, "build"),
+            ("classic unreadable", {"rules": [self.REVIEW_RULE], "classic_error": "Server Error (HTTP 502)"}, "unreadable"),
+            ("no review rule", {"rules": []}, "no review rule"),
+            ("strict and behind", {"rules": [self.REVIEW_RULE, {**self.TEST_REQUIRED, "parameters": {
+                **self.TEST_REQUIRED["parameters"], "strict_required_status_checks_policy": True}}],
+                "compare": {"behind_by": 2}}, "up-to-date"),
+            ("open conversation", {"rules": [{"type": "pull_request", "parameters": {"required_review_thread_resolution": True}}],
+                                   "threads": open_thread}, "open threads"),
+        ]
+        for name, case, why in cases:
+            with self.subTest(name):
+                shutil.rmtree(self.stubs / "gh" / "api", ignore_errors=True)
+                (self.stubs / "gh" / "threads.json").write_text(json.dumps(case.get("threads", [])))
+                if "rules_error" in case:
+                    self.gh_api(self.RULES, error=case["rules_error"])
+                else:
+                    self.gh_api(self.RULES, case["rules"])
+                if "classic" in case:
+                    self.gh_api(self.CLASSIC, case["classic"])
+                if "classic_error" in case:
+                    self.gh_api(self.CLASSIC, error=case["classic_error"])
+                if "compare" in case:
+                    self.gh_api(f"repos/acme/web/compare/main...{self.HEAD}", case["compare"])
+                self.blocked_on_review(case.get("checks", (("test", "SUCCESS"),)))
+                result = self.merge("--admin")
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertIn(why, result.stderr)
+                self.assertFalse(self.merged())
 
     def test_admin_merge_refused_when_the_pipeline_forbids_it_or_something_else_blocks(self):
         pipeline = self.instance / "projects" / "demo" / "pipeline.md"
@@ -344,6 +418,41 @@ class QueuedLaunch(Sandbox):
         (self.seat / "state" / "lanes" / "demo-ci-1" / "lane.json").write_text(json.dumps(self.record))
         self.supervise()
         self.assertEqual(self.log_lines("omp.log"), [])
+
+
+class UserBus(unittest.TestCase):
+    """Seats run in terminals easld spawns from a system unit: no XDG_RUNTIME_DIR, no DBUS_SESSION_BUS_ADDRESS."""
+
+    def setUp(self):
+        from tstacklib import util
+        self.util = util
+        self.root = Path(tempfile.mkdtemp(prefix="bus-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        write_exe(self.root / "bin" / "systemctl",
+                  f'#!/bin/sh\necho "$XDG_RUNTIME_DIR|$DBUS_SESSION_BUS_ADDRESS" > {self.root}/seen\n')
+        patch = mock.patch.dict(os.environ, {"PATH": f"{self.root / 'bin'}:{os.environ['PATH']}"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            os.environ.pop(name, None)
+        root = mock.patch.object(util, "RUNTIME_ROOT", self.root / "run")
+        root.start()
+        self.addCleanup(root.stop)
+        self.runtime = self.root / "run" / str(os.getuid())
+        self.runtime.mkdir(parents=True)
+
+    def test_the_user_bus_is_found_without_session_variables(self):
+        bus = socket.socket(socket.AF_UNIX)
+        self.addCleanup(bus.close)
+        bus.bind(str(self.runtime / "bus"))
+        self.util.user_systemd(["systemctl", "--user", "daemon-reload"])
+        self.assertEqual((self.root / "seen").read_text().strip(), f"{self.runtime}|unix:path={self.runtime}/bus")
+
+    def test_no_user_bus_is_a_clear_failure(self):
+        with self.assertRaises(self.util.Die) as failure:
+            self.util.user_systemd(["systemctl", "--user", "daemon-reload"])
+        self.assertIn(f"no systemd user bus at {self.runtime}/bus", str(failure.exception))
+        self.assertFalse((self.root / "seen").exists())
 
 
 def ago(minutes: float) -> str:

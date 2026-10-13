@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-from support import CODE, Sandbox
+from support import CODE, Sandbox, write_exe
 
 PR = "https://github.com/acme/web/pull/7"
 
@@ -130,6 +130,7 @@ class LaneMarker(Sandbox):
         self.pr_stub(checks=(("test", "IN_PROGRESS"),))
 
     def poll_with(self, *comments, resumes: bool, created: str | None = None) -> dict:
+        runs = len(self.lane_record("demo-ci-1")["runs"])
         proc = subprocess.Popen([sys.executable, str(CODE / "bin" / "tstack"), "wait"], env=self.env, cwd=self.seat,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -137,7 +138,7 @@ class LaneMarker(Sandbox):
             time.sleep(0.4)
             self.pr_stub(checks=(("test", "IN_PROGRESS"),), comments=comments, created=created or ago(90))
             if resumes:
-                self.wait_for(lambda: len(self.lane_record("demo-ci-1")["runs"]) == 2, what="the resume")
+                self.wait_for(lambda: len(self.lane_record("demo-ci-1")["runs"]) == runs + 1, what="the resume")
                 self.settled("demo-ci-1", "waiting")
             else:
                 time.sleep(2.0)
@@ -158,6 +159,18 @@ class LaneMarker(Sandbox):
     def test_another_lanes_marked_comment_resumes(self):
         record = self.poll_with(("c-other", "Rebased on this.\n<!-- tstack-lane:demo-api-2 -->"), resumes=True)
         self.assertEqual(len(record["runs"]), 2)
+
+    def test_a_marker_counts_only_as_the_unquoted_last_line_by_the_gh_login(self):
+        own = "<!-- tstack-lane:demo-ci-1 -->"
+        cases = [
+            ("c-quote", f"This breaks the API:\n\n> Pushed the fix.\n> {own}"),
+            ("c-lazy", f"> Pushed the fix.\n{own}"),
+            ("c-early", f"{own}\nAlso rename the flag."),
+            ("c-bot", f"Pushed the fix.\n\n{own}", "review-bot"),
+        ]
+        for number, comment in enumerate(cases, start=2):
+            with self.subTest(comment[0]):
+                self.assertEqual(len(self.poll_with(comment, resumes=True)["runs"]), number)
 
 
 class Durability(Sandbox):
@@ -208,7 +221,7 @@ class Durability(Sandbox):
         (self.stubs / "asks.json").write_text(json.dumps(asks))
         self.assertEqual([e.split("\t", 1)[1] for e in self.wait_once()], ["gate-answered\tgate g-pick answered: a) left"])
 
-    def test_a_dispatch_replayed_after_a_crash_is_a_no_op(self):
+    def waiting_lane(self) -> str:
         self.project_clone()
         self.omp_config(report="waiting", pr=PR)
         lane_id = self.cli("lane", "start", "ci", "--brief", str(self.brief())).stdout.strip()
@@ -216,6 +229,10 @@ class Durability(Sandbox):
         self.pr_stub(checks=(("test", "IN_PROGRESS"),))
         self.until(lambda: self.state.exists() and lane_id in json.loads(self.state.read_text())["cursors"].get("prs", {}),
                    "the first PR snapshot")
+        return lane_id
+
+    def test_a_dispatch_replayed_after_a_crash_is_a_no_op(self):
+        lane_id = self.waiting_lane()
         before = self.state.read_text()
         self.pr_stub(checks=(("test", "FAILURE"),))
         self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 2, "the resume")
@@ -227,6 +244,49 @@ class Durability(Sandbox):
         proc.communicate()
         record = self.lane_record(lane_id)
         self.assertEqual((len(record["runs"]), record["waves"]), (2, {"test": 1}))
+
+    def test_the_lanes_own_comment_does_not_repeat_a_dispatch(self):
+        lane_id = self.waiting_lane()
+        before = self.state.read_text()
+        self.pr_stub(checks=(("test", "SUCCESS"),))
+        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 2, "the resume")
+        self.settled(lane_id, "waiting")
+        self.state.write_text(before)
+        self.pr_stub(checks=(("test", "SUCCESS"),), comments=(("c-lane", "Green.\n\n<!-- tstack-lane:demo-ci-1 -->"),))
+        proc = self.background()
+        time.sleep(1.5)
+        proc.kill()
+        proc.communicate()
+        self.assertEqual(len(self.lane_record(lane_id)["runs"]), 2)
+
+    def test_a_rerun_that_fails_the_same_way_is_a_new_fix_wave(self):
+        lane_id = self.waiting_lane()
+        self.pr_stub(checks=(("test", "FAILURE", "2026-10-13T01:00:00Z"),))
+        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 2, "the first resume")
+        self.settled(lane_id, "waiting")
+        self.pr_stub(checks=(("test", "IN_PROGRESS"),))
+
+        def rerun_seen():
+            state = json.loads(self.state.read_text())
+            return not state.get("dispatches") and state["cursors"]["prs"][lane_id]["fp"]["ci"] == "pending"
+        self.until(rerun_seen, "the rerun to start")
+        self.pr_stub(checks=(("test", "FAILURE", "2026-10-13T02:00:00Z"),))
+        self.until(lambda: len(self.lane_record(lane_id)["runs"]) == 3, "the second resume")
+        self.assertEqual(self.settled(lane_id, "waiting")["waves"], {"test": 2})
+
+    def test_a_dispatch_saved_before_a_failed_launch_is_retried(self):
+        lane_id = self.waiting_lane()
+        write_exe(self.stubs / "bin" / "systemd-run", "#!/bin/sh\necho 'Failed to start transient unit' >&2\nexit 1\n")
+        self.env["TSTACK_LAUNCHER"] = "systemd"
+        self.pr_stub(checks=(("test", "FAILURE"),))
+        self.until(lambda: "launch failed" in (self.lane_record(lane_id).get("reason") or ""), "the failed launch")
+        saved = json.loads(self.state.read_text())["dispatches"][lane_id]["id"]
+        self.assertEqual(len(self.lane_record(lane_id)["runs"]), 1)
+        self.env["TSTACK_LAUNCHER"] = "process"
+        self.until(lambda: not json.loads(self.state.read_text())["dispatches"], "the retried dispatch to settle")
+        record = self.settled(lane_id, "waiting")
+        self.assertEqual([r.get("event_id") for r in record["runs"]], [None, saved])
+        self.assertEqual(record["waves"], {"test": 1})
 
     def test_a_held_lock_is_a_source_failure_not_a_hang(self):
         lane = self.seat / "state" / "lanes" / "demo-ci-1"

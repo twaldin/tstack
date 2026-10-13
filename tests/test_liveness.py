@@ -107,3 +107,20 @@ class Liveness(Sandbox):
         self.liveness()
         self.assertEqual(len(self.texts()), 1)
         self.assertIn("wait source github has failed", self.texts()[0])
+
+    def test_a_text_that_cannot_run_keeps_recovery_progress_and_the_alert_pending(self):
+        self.heartbeat(40, {"github": {"ok": False, "error": "gh: auth", "failing_since": ago(61)}})
+        text = self.instance / "bin" / "text"
+        text.chmod(0o644)
+        for _ in range(2):
+            self.assertIn("text failed", self.cli("tstack", "check", "--liveness", check=False).stdout)
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt"])
+        live = json.loads((self.run_dir / "liveness.json").read_text())
+        self.assertTrue(live["restarted"] and live["prompted"])
+        self.assertEqual(live["source_alerts"], {})
+        text.chmod(0o755)
+        self.liveness()
+        self.liveness()
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn("wait source github has failed", self.texts()[0])
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt"])

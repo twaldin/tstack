@@ -8,9 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import CODE
+from support import BUN, CODE
 
-BUN = shutil.which("bun") or next((str(p) for p in [Path.home() / ".bun" / "bin" / "bun"] if p.exists()), None)
 HARNESS = """
 import guard from %s;
 const handlers = {};
@@ -51,10 +50,22 @@ class SecretGuard(unittest.TestCase):
             {"toolName": "bash", "input": {"command": "cat ~/.secrets/service-token"}},
             {"toolName": "bash", "input": {"command": "security dump-keychain"}},
             {"toolName": "eval", "input": {"code": "open('/srv/u/.secrets/token').read()"}},
+            {"toolName": "read", "input": {"path": "/fictional/auth.json?q=.apiKey&raw=true"}},
+            {"toolName": "read", "input": {"path": "/fictional/relay.json?q=.token&raw=true"}},
+            {"toolName": "read", "input": {"path": "/fictional/auth.json:raw"}},
+            {"toolName": "read", "input": {"path": "/fictional/auth.json:2-4:raw"}},
+            {"toolName": "read", "input": {"path": "/fictional/relay.json:raw:-5"}},
+            {"toolName": "read", "input": {"path": "/fictional/app/.env:1+3"}},
+            {"toolName": "read", "input": {"path": "~/.secrets/service-token:1-2,4-5"}},
+            {"toolName": "read", "input": {"path": "/fictional/backup.zip:home/auth.json"}},
+            {"toolName": "eval", "input": {"code": "print(read('/fictional/auth.json?q=.apiKey&raw=true'))"}},
+            {"toolName": "eval", "input": {"code": "print(read('/fictional/app/.env:raw'))"}},
         ]
         allowed = [
             {"toolName": "read", "input": {"path": "src/auth.ts"}},
             {"toolName": "bash", "input": {"command": "git log --oneline"}},
+            {"toolName": "read", "input": {"path": "package.json?q=.name&raw=true"}},
+            {"toolName": "read", "input": {"path": "src/auth.ts:10-20:raw"}},
             {"toolName": "bash", "input": {"command": "secret-check info file:~/.secrets/service-token"}},
         ]
         out = self.guard(calls=blocked + allowed)["calls"]

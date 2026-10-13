@@ -58,9 +58,10 @@ def parser() -> argparse.ArgumentParser:
 def main(argv) -> int:
     args = parser().parse_args(argv)
     if args.cmd == "setup":
-        for line in install.setup(args.machine, dry_run=args.dry_run, timers=args.timers):
+        actions, problems = install.setup(args.machine, dry_run=args.dry_run, timers=args.timers)
+        for line in actions + problems:
             print(line)
-        return 0
+        return 1 if problems else 0
     if args.cmd == "check":
         if args.liveness:
             for line in ops.liveness():
