@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 from . import easl
@@ -99,13 +100,36 @@ def local_seats() -> list[tuple[Path, dict]]:
     return seats
 
 
-def send_text(message: str) -> str:
+def send_text(message: str) -> tuple[bool, str]:
     result = run([str(instance_home() / "bin" / "text"), "send", message], check=False, timeout=60)
-    return "sent" if result.returncode == 0 else f"text failed (exit {result.returncode}): {result.stderr.strip()[-200:]}"
+    return result.returncode == 0, ("sent" if result.returncode == 0 else
+                                    f"text failed (exit {result.returncode}): {result.stderr.strip()[-200:]}")
+
+
+def recover(board: dict, progress: dict) -> str:
+    """One step of an in-place restart: resume the tile unless that already worked, then send the restart
+    prompt unless that already worked. `progress` keeps `restarted`/`prompted` times and the last attempt."""
+    progress["attempt"] = {"at": iso(), "error": None}
+    try:
+        if not progress.get("restarted"):
+            easl.restart(board)
+            progress["restarted"] = iso()
+        if not progress.get("prompted"):
+            easl.prompt(board, restart_prompt())
+            progress["prompted"] = iso()
+        return "restarted in place"
+    except easl.EaslConflict as error:
+        progress["attempt"]["error"] = f"busy: {error}"
+    except Die as error:
+        progress["attempt"]["error"] = str(error)
+    step = "restart prompt" if progress.get("restarted") else "restart"
+    return f"{step} failed: {progress['attempt']['error']}"
 
 
 def liveness() -> list[str]:
-    """Restart a seat whose wait heartbeat is over 30 min stale; text if still stale 30 min after, or a source fails for an hour."""
+    """For each local seat: a wait heartbeat over 30 min stale opens an incident and gets an in-place restart
+    (retried every run until the restart and its prompt both went through). An incident still open after
+    30 min, or a wait source failing for an hour, texts the operator; an alert counts only once sent."""
     out = []
     for seat, board in local_seats():
         name = seat_name(seat)
@@ -114,30 +138,30 @@ def liveness() -> list[str]:
         beat = read_json(seat / "state" / "run" / "heartbeat.json") or {}
         at = beat.get("at")
         stale_for = age(at)
-        if stale_for is None or stale_for > STALE:
-            restarted = live.get("restarted_at")
-            if not restarted or (at and parse_iso(restarted) < parse_iso(at)):
-                try:
-                    easl.restart_seat(board, restart_prompt())
-                    live["restarted_at"] = iso()
-                    out.append(f"{name}: stale since {at or 'never'}; restarted in place")
-                except easl.EaslConflict as error:
-                    out.append(f"{name}: stale since {at or 'never'}; restart refused (busy): {error}")
-                except Die as error:
-                    out.append(f"{name}: stale since {at or 'never'}; restart failed: {error}")
-            elif (age(restarted) or 0) > STALE and live.get("texted_for") != restarted:
-                result = send_text(f"tstack: seat {name} on {machine()} has not polled since {at or 'never'}; "
-                                   f"an in-place restart at {restarted} did not bring it back.")
-                live["texted_for"] = restarted
-                out.append(f"{name}: still stale after restart; {result}")
-        texted = live.setdefault("texted_sources", {})
+        if stale_for is not None and stale_for <= STALE:
+            if live.get("incident"):
+                out.append(f"{name}: polling again; incident from {live['incident']} closed")
+            live = {"source_alerts": live.get("source_alerts", {})}
+        else:
+            live.setdefault("incident", iso())
+            if not (live.get("restarted") and live.get("prompted")):
+                out.append(f"{name}: stale since {at or 'never'}; {recover(board, live)}")
+            if (age(live["incident"]) or 0) > STALE and live.get("alerted") != live["incident"]:
+                state = (f"restarted at {live['restarted']}, still not polling" if live.get("prompted")
+                         else f"recovery failing: {(live.get('attempt') or {}).get('error')}")
+                sent, detail = send_text(f"tstack: seat {name} on {machine()} has not polled since {at or 'never'}; {state}.")
+                if sent:
+                    live["alerted"] = live["incident"]
+                out.append(f"{name}: stale for over 30 min of recovery; {detail}")
+        alerts = live.setdefault("source_alerts", {})
         for source, info in (beat.get("sources") or {}).items():
             since = info.get("failing_since")
-            if since and (age(since) or 0) > SOURCE_FAILING and texted.get(source) != since:
-                result = send_text(f"tstack: seat {name} on {machine()}: wait source {source} has failed since {since}: "
-                                   f"{(info.get('error') or '')[:120]}")
-                texted[source] = since
-                out.append(f"{name}: source {source} failing since {since}; {result}")
+            if since and (age(since) or 0) > SOURCE_FAILING and alerts.get(source) != since:
+                sent, detail = send_text(f"tstack: seat {name} on {machine()}: wait source {source} has failed since {since}: "
+                                         f"{(info.get('error') or '')[:120]}")
+                if sent:
+                    alerts[source] = since
+                out.append(f"{name}: source {source} failing since {since}; {detail}")
         write_json(path, live)
     return out
 
@@ -175,67 +199,113 @@ def rss_mb(board: dict) -> float | None:
     return int(result.stdout.strip()) / 1024 if result.stdout.strip().isdigit() else None
 
 
-def update(setup_fn, check_fn) -> tuple[int, str]:
-    repos = [("tstack", engine_home()), ("agents", instance_home()), ("dotfiles", HOME / "dotfiles")]
-    notes, moved, changes = [], {}, {}
-    for name, path in repos:
-        if not (path / ".git").exists():
-            notes.append(f"{name}=absent")
-            continue
-        old = git(path, "rev-parse", "HEAD")
+def tstack_cli(*args: str) -> subprocess.CompletedProcess:
+    """The engine's own bin/tstack, as checked out now (not the code this process imported)."""
+    return subprocess.run([str(engine_home() / "bin" / "tstack"), *args], capture_output=True, text=True, timeout=900)
+
+
+def admit() -> list[str]:
+    """Setup, then check, through the checked-out CLI. Any failure is a refusal."""
+    for step in (("setup",), ("check",)):
         try:
-            git(path, "fetch", "--quiet", timeout=300)
-            git(path, "merge", "--ff-only", "--quiet", "@{u}")
-        except Die as error:
-            notes.append(f"{name}=skipped({str(error).splitlines()[0][:80]})")
-            continue
-        new = git(path, "rev-parse", "HEAD")
-        notes.append(f"{name}={old[:7]}" + (f"..{new[:7]}" if new != old else ""))
-        if new != old:
-            moved[name] = (path, old)
-            changes[name] = git(path, "diff", "--name-only", old, new).splitlines()
-    setup_fn()
-    problems = check_fn()
-    code = 0
-    if problems:
-        for name, (path, old) in moved.items():
+            result = tstack_cli(*step)
+        except (OSError, subprocess.SubprocessError) as error:
+            return [f"{step[0]}: {type(error).__name__}: {error}"]
+        if result.returncode:
+            lines = [line for line in (result.stdout + result.stderr).splitlines()
+                     if line.strip() and not line.startswith("tstack check:")]
+            return [f"{step[0]} exit {result.returncode}: {(lines or ['no output'])[0][:160]}"]
+    return []
+
+
+def rollback(moved: dict) -> list[str]:
+    notes = []
+    for name, (path, old) in moved.items():
+        try:
             git(path, "reset", "--quiet", "--keep", old)
-        setup_fn()
-        notes.append(f"check failed ({len(problems)}: {problems[0][:100]}); reset {','.join(moved) or 'nothing'}")
-        changes, code = {}, 1
-    else:
-        notes.append("setup=ok check=ok")
+            notes.append(f"{name}->{old[:7]}")
+        except Die as error:
+            notes.append(f"{name} rollback failed: {str(error).splitlines()[0][:100]}")
+    if moved:
+        try:
+            result = tstack_cli("setup")
+            if result.returncode:
+                notes.append(f"setup after rollback exit {result.returncode}")
+        except (OSError, subprocess.SubprocessError) as error:
+            notes.append(f"setup after rollback failed: {error}")
+    return notes
+
+
+def restart_changed(changes: dict) -> list[str]:
+    """Restart seats whose loaded files changed or whose omp is over 1.5 GB; a busy seat is retried next run."""
     pending_path = state_root() / "restarts.json"
-    pending = read_json(pending_path) or {}
+    pending = {seat: value if isinstance(value, dict) else {"reason": value}
+               for seat, value in (read_json(pending_path) or {}).items()}
     seats = local_seats()
-    pending.update(seats_touched(changes, [s for s, _ in seats]))
+    for seat, reason in seats_touched(changes, [s for s, _ in seats]).items():
+        pending.setdefault(seat, {"reason": reason})
     for seat, board in seats:
         try:
             mem = rss_mb(board)
         except Die:
             mem = None
         if mem and mem > MAX_RSS_MB:
-            pending.setdefault(str(seat), f"rss {mem:.0f} MB")
+            pending.setdefault(str(seat), {"reason": f"rss {mem:.0f} MB"})
     results = []
     for seat, board in seats:
-        reason = pending.get(str(seat))
-        if not reason:
+        progress = pending.get(str(seat))
+        if not progress:
             continue
-        try:
-            easl.restart_seat(board, restart_prompt())
+        outcome = recover(board, progress)
+        if progress.get("prompted"):
             pending.pop(str(seat))
-            results.append(f"{seat_name(seat)}:restarted({reason})")
-        except easl.EaslConflict:
-            results.append(f"{seat_name(seat)}:busy,retry")
-        except Die as error:
-            results.append(f"{seat_name(seat)}:failed({str(error)[:60]})")
+            results.append(f"{seat_name(seat)}:restarted({progress['reason']})")
+        else:
+            results.append(f"{seat_name(seat)}:{'busy,retry' if outcome.startswith('restart failed: busy') else outcome[:80]}")
     write_json(pending_path, pending)
-    if results:
-        notes.append("restarts=" + ",".join(results))
-    line = f"{iso()} {machine()} " + " ".join(notes)
-    log = state_root() / "update.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "a") as handle:
-        handle.write(line + "\n")
-    return code, line
+    return results
 
+
+def update() -> tuple[int, str]:
+    """Fast-forward the repos, admit the result through the new bin/tstack, roll every moved repo back on any
+    failure, restart seats whose files changed. Always appends one status line to update.log."""
+    notes, moved, code = [], {}, 0
+    try:
+        changes = {}
+        for name, path in (("tstack", engine_home()), ("agents", instance_home()), ("dotfiles", HOME / "dotfiles")):
+            if not (path / ".git").exists():
+                notes.append(f"{name}=absent")
+                continue
+            old = git(path, "rev-parse", "HEAD")
+            try:
+                git(path, "fetch", "--quiet", timeout=300)
+                git(path, "merge", "--ff-only", "--quiet", "@{u}")
+            except Die as error:
+                notes.append(f"{name}=skipped({str(error).splitlines()[0][:80]})")
+                continue
+            new = git(path, "rev-parse", "HEAD")
+            notes.append(f"{name}={old[:7]}" + (f"..{new[:7]}" if new != old else ""))
+            if new != old:
+                moved[name] = (path, old)
+                changes[name] = git(path, "diff", "--name-only", old, new).splitlines()
+        problems = admit()
+        if problems:
+            code = 1
+            notes.append(f"admission failed ({problems[0]}); rollback: {', '.join(rollback(moved)) or 'nothing moved'}")
+            moved, changes = {}, {}
+        else:
+            notes.append("setup=ok check=ok")
+            moved = {}
+        results = restart_changed(changes)
+        if results:
+            notes.append("restarts=" + ",".join(results))
+    except Exception as error:  # the transaction boundary: whatever broke, roll back and log it
+        code = 1
+        notes.append(f"error ({type(error).__name__}: {str(error)[:120]}); rollback: {', '.join(rollback(moved)) or 'nothing moved'}")
+    finally:
+        line = f"{iso()} {machine()} " + " ".join(notes)
+        log = state_root() / "update.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a") as handle:
+            handle.write(line + "\n")
+    return code, line

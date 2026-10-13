@@ -21,6 +21,7 @@ Project code never sits under `~/agents`, because omp loads every ancestor `AGEN
 - Lanes run `omp -p` in their worktree with `roles/lane.md`, a playbook from `playbooks/`, the project's `pipeline.md` and the brief appended to the system prompt.
 - Seats wake through `tstack wait`, a background job that exits when something needs them. A timer runs `tstack check --liveness` and restarts a seat whose wait went quiet, sending `roles/restart.md` as its first prompt.
 - `skills/` holds the six skills every agent may use; `agents/` holds the omp agent types that `task` subagents run as.
+- Guards in `lane` (a lane may act only on itself; `lane merge` checks proof and checks) prevent mistakes, not attacks: lanes run as the same Unix user with the same `gh` login and could write seat files or call `gh` directly.
 
 ## Install on a new host
 
@@ -42,6 +43,7 @@ Requirements: git, Python 3.9 or newer, `gh` logged in, omp, and easl (the Mac a
 | `TSTACK_WAIT_POLL` | `60` | seconds between `tstack wait` polls |
 | `TSTACK_WAIT_BATCH` | `180` | seconds `tstack wait` holds non-urgent events to batch them |
 | `TSTACK_SMOKE_MODEL` | `@tiny` | the model `tstack check --smoke` runs |
+| `TSTACK_LOCK_WAIT` | `30` | seconds a command waits for a lane record or gates lock before it reports the lock busy |
 
 ## Starting a seat
 

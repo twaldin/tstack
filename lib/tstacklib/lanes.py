@@ -14,7 +14,7 @@ from pathlib import Path
 from . import prwatch
 from .seat import stop_reason
 from .util import (ENGINE, HOME, IS_MAC, Die, age, engine_home, flock, git, instance_home, iso, lock_is_held, machine, money,
-                   read_json, run, short_age, worktrees_root, write_atomic, write_json)
+                   read_json, run, short_age, short_lock, worktrees_root, write_atomic, write_json)
 
 STATUSES = {"running", "waiting", "done", "stuck", "failed", "cancelled"}
 TERMINAL = {"done", "stuck", "failed", "cancelled"}
@@ -52,8 +52,8 @@ class Lane:
         write_json(self.record_path, record)
 
     def mutate(self, change) -> dict:
-        """Read-modify-write lane.json under the record lock (short; distinct from the run lock)."""
-        with flock(self.run_dir / "record.lock"):
+        """Read-modify-write lane.json under the record lock (short, bounded; distinct from the run lock)."""
+        with short_lock(self.run_dir / "record.lock"):
             record = self.load()
             change(record)
             self.save(record)
@@ -71,9 +71,11 @@ class Lane:
 
 
 def starting(record: dict) -> bool:
+    """A run was handed to the launcher moments ago and its supervisor has not accepted it yet."""
     last = (record.get("runs") or [{}])[-1]
     since = age(last.get("start"))
-    return record.get("status") == "running" and not last.get("end") and since is not None and since < SPAWN_GRACE
+    return (record.get("status") == "running" and not last.get("end") and not last.get("accepted")
+            and since is not None and since < SPAWN_GRACE)
 
 
 def lanes(seat: Path) -> list[Lane]:
@@ -166,15 +168,19 @@ def spawn(lane: Lane, record: dict, number: int, kind: str) -> None:
                              stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
 
 
-def begin_run(lane: Lane, event: str, text: str, change=None) -> int:
-    """Apply `change`, append a run, mark the lane running and launch it. Caller holds the run lock."""
+def begin_run(lane: Lane, event: str, text: str, event_id: str | None = None, checks: list[str] = ()) -> int:
+    """Append a run, mark the lane running and launch it. Caller holds the run lock. The run's fix-wave
+    `checks` count only once its supervisor accepts it."""
     kind, seen = launcher(), {}
 
     def apply(record):
-        if change:
-            change(record)
         seen.update(number=len(record["runs"]) + 1, status=record["status"], reason=record.get("reason"))
-        record["runs"].append({"run": seen["number"], "event": event, "start": iso(), "launcher": kind})
+        entry = {"run": seen["number"], "event": event, "start": iso(), "launcher": kind}
+        if event_id:
+            entry["event_id"] = event_id
+        if checks:
+            entry["checks"] = list(checks)
+        record["runs"].append(entry)
         record["status"], record["reason"] = "running", None
 
     record = lane.mutate(apply)
@@ -206,10 +212,24 @@ def supervise(lane: Lane, number: int) -> int:
         if not held:
             print(f"lane {lane.id}: run lock busy, run {number} not started", file=sys.stderr)
             return 1
-        record = lane.load()
-        last = record["runs"][-1]
-        if last["run"] != number or last.get("end"):
+        admitted = {}
+
+        def admit(rec):
+            last = rec["runs"][-1] if rec["runs"] else {}
+            if last.get("run") != number or last.get("end"):
+                return
+            if rec["status"] != "running":
+                last.update(end=iso(), exit="not started")
+                return
+            last["accepted"] = iso()
+            for check in last.get("checks", []):
+                rec["waves"][check] = rec["waves"].get(check, 0) + 1
+            admitted["record"] = rec
+        lane.mutate(admit)
+        if not admitted:
+            print(f"lane {lane.id}: run {number} is no longer wanted; omp not started", file=sys.stderr)
             return 0
+        record, last = admitted["record"], admitted["record"]["runs"][-1]
         write_atomic(lane.run_dir / "pid", f"{os.getpid()}\n")
         text = (lane.run_dir / f"run-{number}.event").read_text()
         prompt = compose_prompt(lane, record)
@@ -287,6 +307,11 @@ def reconcile(lane: Lane, locked: bool = False) -> dict:
     last = (record.get("runs") or [{}])[-1]
     if not last or last.get("end"):
         return lane.mutate(lambda rec: rec.update(status="failed", reason="run ended unrecorded"))
+    if not last.get("accepted"):
+        def never(rec):
+            rec["runs"][-1].update(end=iso(), exit="not started")
+            rec.update(status="failed", reason="run never started")
+        return lane.mutate(never)
     return finish_run(lane, last["run"], "lost")
 
 
@@ -357,12 +382,24 @@ def start(seat: Path, task: str, brief: Path, project: str | None, repo: str | N
     return lane.id
 
 
-def resume(lane: Lane, text: str, kind: str | None, checks: list[str]) -> int:
-    """Exit codes for callers: EXIT_BUSY retry later, EXIT_REFUSED drop the event, EXIT_STUCK lane is now stuck."""
+def dispatched(record: dict, event_id: str | None) -> int | None:
+    """The run that already took this dispatch, if any."""
+    return next((r["run"] for r in record.get("runs", []) if event_id and r.get("event_id") == event_id), None)
+
+
+def resume(lane: Lane, text: str, kind: str | None, checks: list[str], event_id: str | None = None) -> tuple[int, bool]:
+    """Returns (run number, newly accepted). A dispatch whose `event_id` a run already took is a no-op.
+    Exit codes for callers: EXIT_BUSY retry later, EXIT_REFUSED drop the event, EXIT_STUCK lane is now stuck."""
+    taken = dispatched(lane.load(), event_id)
+    if taken:
+        return taken, False
     with flock(lane.lock, blocking=False) as held:
         if not held:
             raise Die(f"lane {lane.id} is running", EXIT_BUSY)
         record = reconcile(lane, locked=True)
+        taken = dispatched(record, event_id)
+        if taken:
+            return taken, False
         if starting(record):
             raise Die(f"lane {lane.id} is starting", EXIT_BUSY)
         if record.get("held"):
@@ -381,11 +418,7 @@ def resume(lane: Lane, text: str, kind: str | None, checks: list[str]) -> int:
             why = f"{', '.join(exhausted)} failed after {MAX_WAVES} fix waves"
             lane.mutate(lambda rec: rec.update(status="stuck", reason=why))
             raise Die(f"lane {lane.id} is stuck: {why}", EXIT_STUCK)
-
-        def count_waves(rec):
-            for check in checks if kind == "check-failed" else []:
-                rec["waves"][check] = rec["waves"].get(check, 0) + 1
-        return begin_run(lane, kind or "resume", text, count_waves)
+        return begin_run(lane, kind or "resume", text, event_id, checks if kind == "check-failed" else ()), True
 
 
 def write_report(lane: Lane, status: str, summary: str, pr: str | None, head: str | None,
@@ -418,25 +451,43 @@ def write_report(lane: Lane, status: str, summary: str, pr: str | None, head: st
     return report
 
 
-def merge_reserved(project: str) -> bool:
+def pipeline_says(project: str, line: str) -> bool:
+    """The project's pipeline.md has a line `<line>` (e.g. `merge: operator`)."""
     pipeline = project_pipeline(project)
-    return pipeline.exists() and re.search(r"^merge:\s*operator\b", pipeline.read_text(), re.M | re.I) is not None
+    key, value = (part.strip() for part in line.split(":", 1))
+    pattern = rf"^{re.escape(key)}:\s*{re.escape(value)}\b"
+    return pipeline.exists() and re.search(pattern, pipeline.read_text(), re.M | re.I) is not None
 
 
-def merge(lane: Lane) -> str:
-    """Hard merge guard (review F12): proof for the current head, open, mergeable, all checks passed."""
+def system_repo(slugs: list[str]) -> str | None:
+    """The engine or instance repo among `slugs`: lanes never merge those, whatever a pipeline says."""
+    for name, path in (("TSTACK_HOME", engine_home()), ("TSTACK_INSTANCE", instance_home())):
+        if (path / ".git").exists():
+            own = origin_slug(path)
+            if own and own.lower() in {s.lower() for s in slugs if s}:
+                return f"{own} is the origin of {name}"
+    return None
+
+
+def merge(lane: Lane, admin: bool = False) -> str:
+    """Hard merge guard (review F12): proof for the current head, open, mergeable, all checks passed.
+    Never arms auto-merge: a later head would merge without proof."""
     record = lane.load()
     reason = stop_reason(lane.seat)
     if reason:
         raise Die(f"seat is stopped (orders.md: STOP: {reason})", EXIT_REFUSED)
-    if merge_reserved(record["project"]):
+    if pipeline_says(record["project"], "merge: operator"):
         raise Die(f"{record['project']} pipeline says `merge: operator`: the operator merges this PR, not the lane", EXIT_REFUSED)
     report = lane.report()
     if not isinstance(report, dict) or not report.get("pr"):
         raise Die("no report with a PR: run `lane report --pr URL --head SHA --proof CHECK=pass` first", EXIT_REFUSED)
     url = report["pr"]
+    owner, repo, _ = prwatch.parse_url(url)
+    system = system_repo([f"{owner}/{repo}", record.get("repo")])
+    if system:
+        raise Die(f"lane merge never merges system PRs ({system}): report waiting on operator", EXIT_REFUSED)
     try:
-        pr = prwatch.view(url, "state,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,statusCheckRollup")
+        pr = prwatch.view(url, "state,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,statusCheckRollup,reviewDecision")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as error:
         raise Die(f"gh pr view {url} failed: {error}")
     head = pr["headRefOid"]
@@ -462,43 +513,77 @@ def merge(lane: Lane) -> str:
     if pr["mergeStateStatus"] in ("BEHIND", "DIRTY"):
         raise Die(f"PR merge state is {pr['mergeStateStatus']}: rebase onto {record['base']} first", EXIT_REFUSED)
     argv = ["gh", "pr", "merge", url, "--squash", "--delete-branch", "--match-head-commit", head]
-    armed = pr["mergeStateStatus"] == "BLOCKED"
-    run(argv + (["--auto"] if armed else []), timeout=120)
-    lane.mutate(lambda rec: rec.update(merge={"head": head, "at": iso(), "auto": armed}))
-    return f"{'auto-merge armed' if armed else 'merged'}: {url} at {head[:12]}"
+    bypass = False
+    if pr["mergeStateStatus"] == "BLOCKED":
+        if pr.get("reviewDecision") != "REVIEW_REQUIRED":
+            raise Die(f"GitHub blocks the merge for a reason other than a missing review (review decision "
+                      f"{pr.get('reviewDecision') or 'none'}): report waiting with what blocks it", EXIT_REFUSED)
+        if not admin:
+            raise Die(f"checks on {head[:12]} passed and the proof holds, but GitHub requires a review. "
+                      "Run `lane merge --admin` to merge past the review rule, or report waiting on review", EXIT_REFUSED)
+        if pipeline_says(record["project"], "admin-merge: no"):
+            raise Die(f"{record['project']} pipeline says `admin-merge: no`: report waiting on review", EXIT_REFUSED)
+        bypass = True
+    run(argv + (["--admin"] if bypass else []), timeout=120)
+    lane.mutate(lambda rec: rec.update(merge={"head": head, "at": iso(), "admin": bypass}))
+    return f"merged{' with --admin' if bypass else ''}: {url} at {head[:12]}"
 
 
-def stop(lane: Lane, wait: float = 30) -> dict:
-    record = lane.load()
-    if not lane.running(record):
-        return reconcile(lane)
-    last = record["runs"][-1]
+def kill(lane: Lane) -> None:
+    """Signal whatever holds the run lock for this lane: its systemd unit, or the supervisor's process group."""
+    last = (lane.load().get("runs") or [{}])[-1]
     if last.get("launcher") == "systemd":
         run(["systemctl", "--user", "stop", unit_name(lane)], check=False, timeout=120)
-    else:
-        pid_text = (lane.run_dir / "pid").read_text().strip() if (lane.run_dir / "pid").exists() else ""
-        if pid_text:
-            try:
-                os.killpg(int(pid_text), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        return
+    pid_file = lane.run_dir / "pid"
+    pid = pid_file.read_text().strip() if pid_file.exists() else ""
+    if not pid.isdigit():
+        return
+    command = run(["ps", "-o", "command=", "-p", pid], check=False).stdout
+    if f"_run {lane.id} " in command + " ":
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def settle(lane: Lane, final=None) -> dict:
+    """Under the run lock: end a run its supervisor never accepted (a queued launch), record a lost one,
+    then apply `final`. A supervisor that takes the lock later sees the run ended and starts nothing."""
+    record = lane.load()
+    last = (record.get("runs") or [{}])[-1]
+    if record.get("status") == "running" and last and not last.get("end"):
+        if last.get("accepted"):
+            finish_run(lane, last["run"], "stopped", stopped=True)
+        else:
+            def unqueue(rec):
+                rec["runs"][-1].update(end=iso(), exit="not started")
+                rec.update(status="waiting" if rec.get("session") else "failed", reason="stopped before start")
+            lane.mutate(unqueue)
+    return lane.mutate(final) if final else lane.load()
+
+
+def stop(lane: Lane, wait: float = 30, final=None) -> dict:
+    """Kill the running process, keep state. Holds the run lock while it settles, so it serializes with
+    launch admission."""
     deadline = time.monotonic() + wait
-    while lock_is_held(lane.lock) and time.monotonic() < deadline:
+    while True:
+        with flock(lane.lock, blocking=False) as held:
+            if held:
+                return settle(lane, final)
+        kill(lane)
+        if time.monotonic() >= deadline:
+            raise Die(f"lane {lane.id} did not stop within {wait:g}s")
         time.sleep(0.2)
-    if lock_is_held(lane.lock):
-        raise Die(f"lane {lane.id} did not stop within {wait:g}s")
-    return reconcile(lane)
 
 
 def cancel(lane: Lane, reason: str | None, superseded_by: str | None = None) -> dict:
-    stop(lane)
-
     def change(record):
         record["status"] = "cancelled"
         record["reason"] = reason or (f"superseded by {superseded_by}" if superseded_by else "cancelled")
         if superseded_by:
             record["superseded_by"] = superseded_by
-    return lane.mutate(change)
+    return stop(lane, final=change)
 
 
 def clean(lane: Lane) -> str:
@@ -517,6 +602,11 @@ def clean(lane: Lane) -> str:
     dirty = git(worktree, "status", "--porcelain")
     if dirty:
         raise Die(f"{worktree} has uncommitted changes:\n{dirty}", EXIT_REFUSED)
+    if not record.get("pr"):
+        ahead = git(worktree, "rev-list", "--count", f"origin/{record['base']}..HEAD")
+        if ahead != "0":
+            raise Die(f"{record['branch']} has {ahead} commit(s) not on origin/{record['base']} and no PR: "
+                      "open a PR for them, or save them and remove the worktree by hand", EXIT_REFUSED)
     main = worktrees_root() / record["project"] / "main"
     git(main, "worktree", "remove", str(worktree))
     lane.mutate(lambda rec: rec.update(cleaned=iso()))

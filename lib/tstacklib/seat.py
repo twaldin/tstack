@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-from .util import Die, flock, read_json, write_atomic
+from .util import Die, parse_iso, read_json, short_lock, write_atomic
 
 TASK_HEADER = ["id", "effort", "title", "state", "lane", "pr", "updated"]
 TASK_STATES = {"todo", "running", "waiting", "merged", "deployed", "done", "stuck", "failed", "cancelled"}
@@ -50,6 +50,11 @@ def parse_gates(text: str) -> list[dict]:
             raise StateError(f"gates.md gate {gate_id}: Irreversible must be yes or no")
         if fields.get("Irreversible") == "yes" and fields["Default"] != "wait":
             raise StateError(f"gates.md gate {gate_id} is irreversible, so its Default must be wait")
+        if "Due" in fields:
+            try:
+                parse_iso(fields["Due"])
+            except ValueError:
+                raise StateError(f"gates.md gate {gate_id}: Due {fields['Due']!r} is not an ISO time like 2026-10-14T16:00Z")
         gates.append({"id": gate_id, **fields})
     ids = [g["id"] for g in gates]
     if len(set(ids)) != len(ids):
@@ -75,7 +80,7 @@ def read_gates(seat: Path) -> list[dict]:
 
 def update_gates(seat: Path, change) -> list[dict]:
     """Read, change and atomically rewrite gates.md under the seat's gates lock."""
-    with flock(seat / "state" / "run" / "gates.lock"):
+    with short_lock(seat / "state" / "run" / "gates.lock"):
         gates = read_gates(seat)
         change(gates)
         text = render_gates(gates)

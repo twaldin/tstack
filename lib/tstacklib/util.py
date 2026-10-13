@@ -155,6 +155,17 @@ def lock_is_held(path: Path) -> bool:
         return not held
 
 
+@contextlib.contextmanager
+def short_lock(path: Path):
+    """A lock held for one read-modify-write. Waits at most $TSTACK_LOCK_WAIT seconds (default 30), then
+    raises, so a stuck holder shows up as an error instead of a hang."""
+    wait = float(os.environ.get("TSTACK_LOCK_WAIT", 30))
+    with flock(path, timeout=wait) as held:
+        if not held:
+            raise Die(f"{path} is busy (held for over {wait:g}s)", 3)
+        yield
+
+
 def run(argv: list[str], cwd: Path | None = None, timeout: float = 120, env: dict | None = None,
         check: bool = True, input: str | None = None) -> subprocess.CompletedProcess:
     try:

@@ -3,10 +3,12 @@
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 busy (running, held or seat stopped: retry later),
 4 refused (terminal lane or a failed merge guard), 5 the lane is now stuck (two fix waves).
+Inside a lane ($TSTACK_LANE set) only report, merge, show and list run, for that lane and its seat.
 """
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -43,6 +45,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("text")
     p.add_argument("--kind", help="event kind; check-failed counts a fix wave per --check")
     p.add_argument("--check", action="append", default=[], help="failing check name (repeatable)")
+    p.add_argument("--event-id", help="stable id of this dispatch; a run that already took it makes this a no-op")
 
     p = add("report", "write report.json for the current run (called by the lane itself)")
     p.add_argument("--lane", help="default $TSTACK_LANE")
@@ -55,6 +58,8 @@ def parser() -> argparse.ArgumentParser:
 
     p = add("merge", "merge the lane's PR if proof, checks and mergeability hold for its current head")
     p.add_argument("id", nargs="?")
+    p.add_argument("--admin", action="store_true",
+                   help="merge past a missing required review (refused when pipeline.md says `admin-merge: no`)")
 
     p = add("list", "list lanes of the seat")
     p.add_argument("--all", action="store_true", help="include lanes that ended more than a day ago")
@@ -80,8 +85,29 @@ def parser() -> argparse.ArgumentParser:
     return top
 
 
+LANE_COMMANDS = {"report", "merge", "show", "list", "_run"}
+
+
+def confine(args) -> None:
+    """Inside a lane ($TSTACK_LANE set) only report, merge, show and list run, for that lane and its seat."""
+    own = os.environ.get("TSTACK_LANE")
+    if not own:
+        return
+    if args.cmd not in LANE_COMMANDS:
+        raise Die(f"lane {own} may run only `lane report`, `merge`, `show` and `list`", lanes.EXIT_REFUSED)
+    own_seat = os.environ.get("TSTACK_SEAT")
+    if not own_seat:
+        raise Die("TSTACK_LANE is set without TSTACK_SEAT", lanes.EXIT_REFUSED)
+    if args.seat and Path(args.seat).expanduser().resolve() != Path(own_seat).expanduser().resolve():
+        raise Die(f"lane {own} works in seat {own_seat}, not {args.seat}", lanes.EXIT_REFUSED)
+    other = getattr(args, "lane", None) or getattr(args, "id", None)
+    if other and other != own:
+        raise Die(f"lane {own} acts only on itself, not {other}", lanes.EXIT_REFUSED)
+
+
 def main(argv) -> int:
     args = parser().parse_args(argv)
+    confine(args)
     seat = find_seat(args.seat)
     if args.cmd == "start":
         print(lanes.start(seat, args.task, Path(args.brief), args.project, args.repo, args.playbook, args.model,
@@ -89,14 +115,14 @@ def main(argv) -> int:
     elif args.cmd == "_run":
         return lanes.supervise(lanes.Lane(seat, args.id), args.run)
     elif args.cmd == "resume":
-        number = lanes.resume(lanes.Lane(seat, args.id), args.text, args.kind, args.check)
-        print(f"{args.id} run {number}")
+        number, accepted = lanes.resume(lanes.Lane(seat, args.id), args.text, args.kind, args.check, args.event_id)
+        print(f"{args.id} run {number}" + ("" if accepted else f" already took event {args.event_id}"))
     elif args.cmd == "report":
         report = lanes.write_report(lanes.current_lane(seat, args.lane), args.status, args.summary, args.pr,
                                     args.head, args.waiting_on, args.proof)
         print(f"{report['lane']} {report['status']} (run {report['run']})")
     elif args.cmd == "merge":
-        print(lanes.merge(lanes.current_lane(seat, args.id)))
+        print(lanes.merge(lanes.current_lane(seat, args.id), admin=args.admin))
     elif args.cmd == "list":
         rows = [(lane, lanes.reconcile(lane)) for lane in lanes.lanes(seat)]
         rows = [(lane, rec) for lane, rec in rows if lanes.visible(rec, args.all)]

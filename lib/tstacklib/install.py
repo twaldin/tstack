@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import ompconfig
 from . import seat as seatlib
 from .util import HOME, IS_MAC, Die, all_seats, engine_home, git, instance_home, iso, machine, run, write_atomic
 
@@ -167,10 +168,16 @@ def agents_md(m: str) -> str:
     return header + "".join(f"\n<!-- source: {p} -->\n\n{p.read_text().strip()}\n" for p in present)
 
 
+def unit_path() -> str:
+    """PATH for the timer jobs: fixed, so the units do not depend on who ran setup."""
+    brew = "/opt/homebrew/bin:" if IS_MAC else ""
+    return f"{HOME}/.local/bin:{HOME}/.bun/bin:{brew}/usr/local/bin:/usr/bin:/bin"
+
+
 def unit_text(template: Path, m: str) -> str:
     text = template.read_text()
     for key, value in (("@TSTACK_HOME@", str(engine_home())), ("@TSTACK_INSTANCE@", str(instance_home())),
-                       ("@HOME@", str(HOME)), ("@PATH@", os.environ.get("PATH", "/usr/bin:/bin")), ("@MACHINE@", m)):
+                       ("@HOME@", str(HOME)), ("@PATH@", unit_path()), ("@MACHINE@", m)):
         text = text.replace(key, value)
     return text
 
@@ -203,8 +210,31 @@ def install_timers(s: Setup, m: str) -> None:
             run(["systemctl", "--user", "enable", "--now", timer])
 
 
+def managed_path(text: str) -> bool:
+    """An absolute path inside the engine or the instance."""
+    path = Path(os.path.expanduser(str(text)))
+    if not path.is_absolute():
+        return False
+    roots = {engine_home(), instance_home(), engine_home().resolve(), instance_home().resolve()}
+    return any(path == root or root in path.parents for root in roots)
+
+
+def reconcile_config(s: Setup) -> None:
+    """omp's config.yml must leave native discovery on: skills.enabled and skills.enablePiUser true, no
+    customDirectories outside tstack, no `native` in disabledProviders. Only those lines change."""
+    path = OMP / "config.yml"
+    if not path.is_file():
+        return
+    text = path.read_text()
+    new, changes = ompconfig.reconcile(text, managed_path)
+    if changes:
+        s.actions.append(f"reconcile {path}: {'; '.join(changes)}")
+        s.write(path, new)
+
+
 def plan(s: Setup, m: str, timers: bool) -> None:
     s.write(OMP / "AGENTS.md", agents_md(m))
+    reconcile_config(s)
     s.links_dir(OMP / "skills", entries("skills", m))
     s.links_dir(OMP / "agents", entries("agents", m, "*.md"))
     s.links_dir(OMP / "extensions", entries("extensions", m, "*.ts"), keep=KEEP_EXTENSIONS)
@@ -322,32 +352,41 @@ def check(machine_name: str | None) -> list[str]:
             lines = len(path.read_text().splitlines())
             if lines > cap:
                 problems.append(f"size cap: {path.relative_to(root)} has {lines} lines, cap {cap}")
-    problems += foreign_entries()
+    try:
+        problems += foreign_entries() + extension_roots()
+    except ompconfig.ConfigError as error:
+        problems.append(f"omp config: {OMP / 'config.yml'}: {error}")
     problems += personal_data()
     return problems
 
 
+def omp_config() -> dict:
+    path = OMP / "config.yml"
+    return ompconfig.load(path.read_text()) if path.is_file() else {}
+
+
 def disabled_providers() -> set[str]:
     """Global string entries of disabledProviders in omp's config.yml (path-scoped entries ignored)."""
-    path = OMP / "config.yml"
-    found, indent, inside = set(), None, False
-    for line in path.read_text().splitlines() if path.exists() else []:
-        inline = re.match(r"^disabledProviders:\s*\[(.*)\]\s*$", line)
-        if inline:
-            return {item.strip().strip("'\"") for item in inline.group(1).split(",") if item.strip()}
-        if re.match(r"^disabledProviders:\s*$", line):
-            inside = True
-            continue
-        if not inside or not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line.startswith((" ", "-")):
-            break
-        item = re.match(r"^(\s*)-\s*(.*?)\s*$", line)
-        if item and indent is None:
-            indent = item.group(1)
-        if item and item.group(1) == indent and re.fullmatch(r"['\"]?[\w-]+['\"]?", item.group(2)):
-            found.add(item.group(2).strip("'\""))
-    return found
+    return {item for item in omp_config().get("disabledProviders") or [] if isinstance(item, str)}
+
+
+def extension_roots() -> list[str]:
+    """Explicit extension paths (config.yml and settings.json `extensions`) outside tstack and easl."""
+    paths = list(omp_config().get("extensions") or [])
+    settings = OMP / "settings.json"
+    if settings.is_file():
+        try:
+            paths += json.loads(settings.read_text()).get("extensions") or []
+        except (ValueError, AttributeError):
+            return [f"omp settings: {settings} is not a JSON object"]
+    easl_roots = [Path("/Applications/easl.app"), HOME / ".local" / "share" / "easl", OMP / "extensions"]
+    problems = []
+    for item in paths:
+        path = Path(os.path.expanduser(str(item)))
+        inside = path.is_absolute() and (managed_path(str(path)) or any(r == path or r in path.parents for r in easl_roots))
+        if not inside:
+            problems.append(f"omp config: extension path {item} is outside tstack and easl")
+    return problems
 
 
 def foreign_entries() -> list[str]:

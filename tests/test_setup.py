@@ -115,3 +115,87 @@ class Setup(Sandbox):
             "theme: dark\ndisabledProviders:\n  - claude\n  - agents\n  - path: /somewhere\n    providers:\n      - agents-md\nskills:\n  enabled: true\n")
         out = self.cli("tstack", "check", "--machine", "testbox", cwd=self.home, check=False).stdout
         self.assertNotIn("foreign:", out)
+
+
+DECKBOX_CONFIG = '''"advisor":
+  "enabled": false
+"cycleOrder":
+  - "default"
+  - "fable"
+"defaultThinkingLevel": "auto"
+"disabledProviders":
+  - "claude"
+  - "native"
+  - "codex"
+  - "agents"
+"modelRoles":
+  "default": "anthropic/claude-opus-5-5:xhigh"
+  "tiny": "zai/glm-5.3-flash:high"
+"retry":
+  "fallbackChains":
+    "tiny":
+      - "openai-codex/gpt-6-luna"
+    "default": []
+"skills":
+  "enabled": true
+  "enableCodexUser": false
+  "enablePiUser": false
+  "enablePiProject": true
+  "customDirectories":
+    - "{home}/.agents/skills"
+"theme":
+  "dark": "dark-tokyo-night"
+'''
+
+
+class OmpConfig(Sandbox):
+    """omp's config.yml in the quoted style omp writes on deckbox."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.home / ".omp" / "agent" / "config.yml"
+        self.config.parent.mkdir(parents=True)
+        self.original = DECKBOX_CONFIG.format(home=self.home)
+        self.config.write_text(self.original)
+
+    def check(self) -> str:
+        return self.cli("tstack", "check", "--machine", "testbox", cwd=self.home, check=False).stdout
+
+    def test_setup_turns_native_discovery_back_on_and_changes_nothing_else(self):
+        out = self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home).stdout
+        self.assertIn("skills.enablePiUser set true", out)
+        expected = (self.original.replace('"enablePiUser": false', '"enablePiUser": true')
+                    .replace('  - "native"\n', "")
+                    .replace(f'"customDirectories":\n    - "{self.home}/.agents/skills"', '"customDirectories": []'))
+        self.assertEqual(self.config.read_text(), expected)
+        quarantined = self.home / ".cleanup-quarantine" / dt.date.today().isoformat() / ".omp" / "agent" / "config.yml"
+        self.assertEqual(quarantined.read_text(), self.original)
+        self.assertEqual(oct(self.config.stat().st_mode & 0o777), "0o600")
+        again = self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home).stdout
+        self.assertEqual(again.strip(), "tstack setup: testbox is current")
+        self.assertNotIn("config.yml", self.check())
+        self.config.write_text(expected.replace('"enablePiUser": true', '"enablePiUser": false'))
+        self.assertIn("reconcile " + str(self.config) + ": skills.enablePiUser set true", self.check())
+
+    def test_check_reports_extension_paths_outside_tstack_and_easl(self):
+        self.config.write_text(self.original + '"extensions":\n  - "/opt/other/ext.ts"\n')
+        self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home)
+        self.assertIn("omp config: extension path /opt/other/ext.ts is outside tstack and easl", self.check())
+
+    def test_quoted_disabled_providers_count(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude" / "CLAUDE.md").write_text("# claude rules\n")
+        (self.home / ".agents" / "skills" / "old").mkdir(parents=True)
+        self.cli("tstack", "setup", "--machine", "testbox", cwd=self.home)
+        self.assertNotIn("foreign:", self.check())
+
+    def test_unit_files_do_not_depend_on_who_ran_setup(self):
+        self.cli("tstack", "setup", "--machine", "testbox", "--timers", cwd=self.home)
+        self.env["PATH"] = f"{self.root / 'elsewhere'}:{self.env['PATH']}"
+        dry = self.cli("tstack", "setup", "--machine", "testbox", "--timers", "--dry-run", cwd=self.home).stdout
+        self.assertEqual(dry.strip(), "tstack setup: testbox is current")
+        units = list((self.home / ".config" / "systemd" / "user").glob("tstack-*.service"))
+        units += list((self.home / "Library" / "LaunchAgents").glob("com.tstack.*.plist"))
+        self.assertEqual(len(units), 2)
+        for unit in units:
+            self.assertIn(f"{self.home}/.local/bin:{self.home}/.bun/bin:", unit.read_text())

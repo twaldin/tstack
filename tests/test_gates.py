@@ -51,6 +51,7 @@ class GatesFormat(unittest.TestCase):
             "irreversible default": GATES.replace("- Default: wait", "- Default: b"),
             "unknown field": GATES.replace("- Due:", "- Deadline:"),
             "not a field line": GATES.replace("- Ask: obj_1@brd_1", "Ask obj_1"),
+            "due not a time": GATES.replace("- Due: 2026-10-14T16:00Z", "- Due: tomorrow"),
         }
         for name, text in bad.items():
             with self.subTest(name), self.assertRaises(StateError):

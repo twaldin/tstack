@@ -86,7 +86,10 @@ def upsert_note(board: dict, key: str, markdown: str) -> None:
          host=board["host"])
 
 
-def restart_seat(board: dict, prompt: str) -> None:
-    """Resume the seat's tile in place, then send it the restart prompt. Raises EaslConflict while it works."""
+def restart(board: dict) -> None:
+    """Resume the seat's tile in place. Raises EaslConflict while it works or the operator types."""
     call("agent.restart", "--target", board["tile"], "--mode", "resume", host=board["host"], timeout=120)
-    call("agent.prompt", "--target", board["tile"], "--text", prompt, "--from", "tstack", host=board["host"])
+
+
+def prompt(board: dict, text: str) -> None:
+    call("agent.prompt", "--target", board["tile"], "--text", text, "--from", "tstack", host=board["host"])

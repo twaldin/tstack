@@ -78,7 +78,7 @@ Write it to `state/digest/<date>.md`, show it on your board as the note keyed `d
 
 Any agent may open a PR on tstack or the instance; the operator decides each one. You own every open system PR:
 
-1. Keep it green and rebased through a lane in the `system` project, whose pipeline reserves the merge for the operator. At each digest, list the open PRs on the engine and instance repos (`gh pr list --repo <owner>/<repo>`, repos named in `~/agents/AGENTS.md`) and adopt any that no lane owns.
+1. Keep it green and rebased through a lane in the instance's project for that repo (`~/agents/AGENTS.md` maps each system repo to its project), whose pipeline reserves the merge for the operator. At each digest, list the open PRs on the engine and instance repos (`gh pr list --repo <owner>/<repo>`) and adopt any that no lane owns.
 2. When it is green and proven, bring it to the operator as a gate: why (the sessions or reports that prompted it), what it deletes or replaces, the line change, and your recommendation. Options: merge, close, change. Default: wait.
 3. On the operator's answer, merge it (`gh pr merge <n> --repo <owner>/<repo> --squash --delete-branch`) or close it (`gh pr close <n> --repo <owner>/<repo>`).
 

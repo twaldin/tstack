@@ -1,14 +1,17 @@
 """tstack wait: poll a seat's sources, resume parked lanes on PR events, wake the seat with batches.
 
 State lives in one file, state/run/wait/state.json, replaced atomically: cursors per source, pending
-events, and delivered batches not yet acked. A batch stays until `--ack`, so a seat that dies before
-handling one gets it again from its next `tstack wait`.
+events, and delivered batches not yet acked. Each source works on a copy of its cursor and returns the
+new cursor with its events; a poll commits both together in one write, and a failing source commits
+neither. A batch stays until `--ack`, so a seat that dies before handling one gets it again.
 """
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
+import json
 import os
 import subprocess
 import time
@@ -20,7 +23,7 @@ from .util import Die, age, flock, iso, money, parse_iso, read_json, say, write_
 
 URGENT_SOURCES = {"text", "operator"}
 FIRST_SIGHT_DAYS = 7
-RUN_GRACE = dt.timedelta(seconds=60)
+SOURCE_ERRORS = (Die, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError)
 
 
 def digest(*parts: str) -> str:
@@ -29,24 +32,6 @@ def digest(*parts: str) -> str:
 
 def event(kind: str, text: str, urgent: bool, key: str) -> dict:
     return {"id": f"ev-{digest(kind, key)}", "kind": kind, "text": " ".join(text.split()), "urgent": urgent, "at": iso()}
-
-
-def lane_authored(record: dict, me: str):
-    """Lanes and the operator share one gh login, so attribute by time: activity by that login inside one of
-    the lane's run windows (start .. end + 60 s, or start .. now while running) is the lane's own."""
-    current = dt.datetime.now(dt.timezone.utc)
-    windows = [(parse_iso(r["start"]), parse_iso(r["end"]) + RUN_GRACE if r.get("end") else current)
-               for r in record.get("runs", []) if r.get("start")]
-
-    def own(author: str | None, at: str | None) -> bool:
-        if author != me or not at:
-            return False
-        try:
-            when = parse_iso(at)
-        except ValueError:
-            return False
-        return any(start <= when <= end for start, end in windows)
-    return own
 
 
 class Waiter:
@@ -59,14 +44,15 @@ class Waiter:
             self.state.setdefault(key, empty)
         self.cursors = self.state["cursors"]
         self.board = None
+        self.resumed: list[str] = []
 
     def save(self) -> None:
         write_json(self.path, self.state)
 
-    # sources: each returns new events and advances its cursor
+    # sources: each takes a copy of its cursor (None on first sight) and returns (new cursor, events)
 
-    def lanes(self) -> list[dict]:
-        seen = self.cursors.setdefault("lanes", {})
+    def lanes(self, seen):
+        seen = seen or {}
         events = []
         for lane in lanes.lanes(self.seat):
             record = lanes.reconcile(lane)
@@ -86,77 +72,76 @@ class Waiter:
             elif status == "waiting" and not record.get("pr"):
                 events.append(event("lane-waiting", f"lane {lane.id} waiting on {report.get('waiting_on') or '?'}: {summary}",
                                     False, signature + lane.id))
-        return events
+        return seen, events
 
-    def prs(self) -> list[dict]:
-        """PR events for waiting lanes resume the lane directly, one resume per lane per poll."""
-        cursors = self.cursors.setdefault("prs", {})
-        me = None
+    def prs(self, cursors):
+        """PR events for waiting lanes resume the lane directly, one resume per lane per poll. Each dispatch
+        carries an id derived from the PR snapshot, so replaying it after a crash is a no-op."""
+        cursors = cursors or {}
         for lane in lanes.lanes(self.seat):
             record = lane.load()
             if record["status"] != "waiting" or not record.get("pr"):
                 continue
             snap = prwatch.snapshot(record["pr"])
-            old = (cursors.get(lane.id) or {}).get("fp")
-            me = me or prwatch.viewer()
-            happened = prwatch.actionable(old, snap, lane_authored(record, me))
-            if not happened:
-                cursors[lane.id] = {"fp": snap}
-                continue
-            text = f"PR {record['pr']} at {snap['head'][:12]}: {'; '.join(happened)}."
-            red = snap["ci"] == "red" and snap["failing"] and any(h.startswith("checks-red") for h in happened)
-            try:
-                lanes.resume(lane, text, "check-failed" if red else "pr", snap["failing"] if red else [])
-                self.resumed.append(lane.id)
-            except Die as error:
-                if error.code == lanes.EXIT_BUSY:
-                    continue
-                if error.code not in (lanes.EXIT_REFUSED, lanes.EXIT_STUCK):
-                    raise
+            happened = prwatch.actionable((cursors.get(lane.id) or {}).get("fp"), snap, lane.id)
+            if happened:
+                text = f"PR {record['pr']} at {snap['head'][:12]}: {'; '.join(happened)}."
+                red = snap["ci"] == "red" and snap["failing"] and any(h.startswith("checks-red") for h in happened)
+                dispatch = "pr-" + digest(lane.id, json.dumps(snap, sort_keys=True))
+                try:
+                    _, accepted = lanes.resume(lane, text, "check-failed" if red else "pr",
+                                               snap["failing"] if red else [], event_id=dispatch)
+                    if accepted:
+                        self.resumed.append(lane.id)
+                except Die as error:
+                    if error.code == lanes.EXIT_BUSY:
+                        continue
+                    if error.code not in (lanes.EXIT_REFUSED, lanes.EXIT_STUCK):
+                        raise
             cursors[lane.id] = {"fp": snap}
-            self.save()
-        return []
+        return cursors, []
 
-    def gates(self) -> list[dict]:
+    def gates(self, cursor):
+        if cursor is None:
+            # The baseline is gates.md as found, saved before any easl answer is applied, so an answer
+            # fetched now (first poll included) is an event.
+            resolved = sorted(g["id"] for g in read_gates(self.seat) if g.get("Status") == "resolved")
+            self.cursors["gates"] = {"resolved": resolved, "due": []}
+            self.save()
+            cursor = copy.deepcopy(self.cursors["gates"])
         gates = read_gates(self.seat)
-        board = self.board
-        if board:
+        if self.board:
             for gate in gates:
                 if gate.get("Status") == "open" and gate.get("Ask"):
-                    answer = easl.ask_answer({**board, "board": gate["Ask"].split("@")[-1]}, gate["Ask"].split("@")[0])
+                    ask_id, _, board_id = gate["Ask"].partition("@")
+                    answer = easl.ask_answer({**self.board, "board": board_id}, ask_id)
                     if answer:
                         def resolve(rows, gate_id=gate["id"], text=answer):
                             row = next(r for r in rows if r["id"] == gate_id)
                             row.update(Status="resolved", Answer=text)
                         gates = update_gates(self.seat, resolve)
-        cursor = self.cursors.get("gates")
         resolved = {g["id"]: g.get("Answer", "") for g in gates if g.get("Status") == "resolved"}
-        if cursor is None:
-            self.cursors["gates"] = {"resolved": sorted(resolved), "due": []}
-            return []
-        events = []
-        for gate_id, answer in resolved.items():
-            if gate_id not in cursor["resolved"]:
-                events.append(event("gate-answered", f"gate {gate_id} answered: {answer}", True, gate_id + answer))
+        events = [event("gate-answered", f"gate {gate_id} answered: {answer}", True, gate_id + answer)
+                  for gate_id, answer in resolved.items() if gate_id not in cursor["resolved"]]
+        now = dt.datetime.now(dt.timezone.utc)
         for gate in gates:
-            overdue = gate.get("Status") == "open" and gate.get("Due") and parse_iso(gate["Due"]) <= dt.datetime.now(dt.timezone.utc)
+            overdue = gate.get("Status") == "open" and gate.get("Due") and parse_iso(gate["Due"]) <= now
             if overdue and gate["id"] not in cursor["due"]:
                 cursor["due"].append(gate["id"])
                 events.append(event("gate-due", f"gate {gate['id']} is past due with no answer; default: {gate['Default']}",
                                     True, gate["id"] + "due"))
         cursor["resolved"] = sorted(resolved)
-        return events
+        return cursor, events
 
-    def intake(self) -> list[dict]:
-        seen = set(self.cursors.get("intake", []))
+    def intake(self, seen):
+        seen = set(seen or [])
         items = [i for i in read_intake(self.seat) if not i["done"]]
         events = [event("intake", f"{i['source']}: {i['text']}", i["source"].lower() in URGENT_SOURCES, i["line"])
                   for i in items if digest(i["line"]) not in seen]
-        self.cursors["intake"] = sorted(digest(i["line"]) for i in items)
-        return events
+        return sorted(digest(i["line"]) for i in items), events
 
-    def schedule(self) -> list[dict]:
-        fired = self.cursors.setdefault("schedule", {})
+    def schedule(self, fired):
+        fired = fired or {}
         local_now = dt.datetime.now().astimezone()
         events = []
         for entry in read_schedule(self.seat):
@@ -165,14 +150,14 @@ class Waiter:
                 events.append(event("schedule", f"{entry['name']} is due ({entry['when']})", False, entry["name"] + due.isoformat()))
             if entry["name"] not in fired or due > parse_iso(fired[entry["name"]]):
                 fired[entry["name"]] = local_now.isoformat(timespec="seconds")
-        return events
+        return fired, events
 
-    def wait_d(self, script: Path) -> list[dict]:
+    def wait_d(self, script: Path, seen):
         result = subprocess.run([str(script)], cwd=self.seat, capture_output=True, text=True, timeout=60,
                                 env={**os.environ, "TSTACK_SEAT": str(self.seat)})
         if result.returncode:
             raise Die(f"exit {result.returncode}: {result.stderr.strip()[-200:]}")
-        seen = self.cursors.setdefault("wait.d", {}).setdefault(script.name, [])
+        seen = seen or []
         events = []
         for line in result.stdout.splitlines():
             parts = line.split("\t", 2)
@@ -182,57 +167,79 @@ class Waiter:
                 continue
             seen.append(parts[0])
             events.append(event(parts[1], parts[2], parts[1] in URGENT_SOURCES, f"{script.name}:{parts[0]}"))
-        del seen[:-500]
-        return events
+        return seen[-500:], events
 
     # polling and delivery
 
-    def poll(self) -> bool:
-        """One pass over every source; returns whether anything changed."""
-        self.resumed: list[str] = []
-        before = dict(self.cursors.get("lanes", {}))
-        sources = [("lanes", self.lanes), ("github", self.prs), ("gates", self.gates), ("intake", self.intake),
-                   ("schedule", self.schedule)]
+    def sources(self) -> list[tuple[str, tuple[str, ...], object]]:
+        """(heartbeat name, cursor path in state.json, source function)."""
+        found = [("lanes", ("lanes",), self.lanes), ("github", ("prs",), self.prs), ("gates", ("gates",), self.gates),
+                 ("intake", ("intake",), self.intake), ("schedule", ("schedule",), self.schedule)]
         scripts = self.seat / "wait.d"
         if scripts.is_dir():
-            sources += [(f"wait.d/{p.name}", lambda p=p: self.wait_d(p)) for p in sorted(scripts.iterdir())
-                        if p.is_file() and os.access(p, os.X_OK)]
-        status, found = {}, []
+            found += [(f"wait.d/{p.name}", ("wait.d", p.name), lambda seen, p=p: self.wait_d(p, seen))
+                      for p in sorted(scripts.iterdir()) if p.is_file() and os.access(p, os.X_OK)]
+        return found
+
+    def cursor(self, path: tuple[str, ...]):
+        value = self.cursors
+        for key in path:
+            value = (value or {}).get(key)
+        return copy.deepcopy(value)
+
+    def poll(self) -> bool:
+        """One pass over every source; returns whether anything changed."""
+        self.heartbeat(None, polling=True)
+        self.resumed = []
+        status, staged, found = {}, [], []
         try:
             self.board = read_board(self.seat)
         except Die as error:
             status["board.json"] = str(error)
-        for name, source in sources:
+        for name, path, source in self.sources():
             try:
-                found += source()
-                status.setdefault(name, None)
-            except (Die, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                cursor, events = source(self.cursor(path))
+            except SOURCE_ERRORS as error:
                 status[name] = f"{type(error).__name__}: {error}"[:300]
+                continue
+            status[name] = None
+            staged.append((path, cursor))
+            found += events
+        changed = bool(self.resumed)
+        for path, cursor in staged:
+            holder = self.cursors
+            for key in path[:-1]:
+                holder = holder.setdefault(key, {})
+            changed |= path == ("lanes",) and holder.get(path[-1]) != cursor
+            holder[path[-1]] = cursor
         known = {e["id"] for e in self.state["pending"]} | {e["id"] for b in self.state["batches"].values() for e in b["events"]}
         fresh = [e for e in found if e["id"] not in known]
         self.state["pending"] += fresh
         self.save()
-        changed = bool(fresh or self.resumed or before != self.cursors.get("lanes", {}))
-        if changed:
+        if fresh or changed:
             from .board import draw
             try:
                 draw(self.seat)
             except Die as error:
                 status["board"] = str(error)
         self.heartbeat(status)
-        return changed
+        return bool(fresh or changed)
 
-    def heartbeat(self, status: dict) -> None:
-        """Write heartbeat.json: time, per-source result (failing_since kept across polls), oldest unacked event."""
+    def heartbeat(self, status: dict | None, polling: bool = False) -> None:
+        """Write heartbeat.json: time, per-source result (failing_since kept across polls), oldest unacked event.
+        `polling` marks a poll in progress; it is written before any source work so a slow source never
+        leaves the heartbeat stale."""
         path = self.seat / "state" / "run" / "heartbeat.json"
         previous = (read_json(path) or {}).get("sources", {})
-        sources = dict(previous) if not status else {}
-        for name, error in status.items():
-            old = previous.get(name, {})
-            sources[name] = {"ok": error is None, "error": error,
-                             "failing_since": None if error is None else (old.get("failing_since") or iso())}
+        sources = dict(previous)
+        if status:
+            sources = {}
+            for name, error in status.items():
+                old = previous.get(name, {})
+                sources[name] = {"ok": error is None, "error": error,
+                                 "failing_since": None if error is None else (old.get("failing_since") or iso())}
         unacked = [e["at"] for e in self.state["pending"]] + [e["at"] for b in self.state["batches"].values() for e in b["events"]]
-        write_json(path, {"at": iso(), "pid": os.getpid(), "sources": sources,
+        write_json(path, {"at": iso(), "pid": os.getpid(), "polling_since": iso() if polling else None, "sources": sources,
                           "oldest_unacked": min(unacked) if unacked else None, "pending": len(self.state["pending"])})
 
     def ready(self, window: float) -> bool:
@@ -268,7 +275,7 @@ def wait(seat: Path, ack: str | None = None) -> int:
         while True:
             if waiter.state["batches"]:
                 oldest = min(waiter.state["batches"], key=lambda b: waiter.state["batches"][b]["at"])
-                waiter.heartbeat({})
+                waiter.heartbeat(None)
                 waiter.print_batch(oldest)
                 return 0
             waiter.poll()

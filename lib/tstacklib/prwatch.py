@@ -14,12 +14,13 @@ EVENT_FIELDS = ("headRefOid,headRefName,state,isDraft,mergeable,mergeStateStatus
 THREADS_QUERY = """query($o:String!,$r:String!,$n:Int!,$endCursor:String){
   repository(owner:$o,name:$r){pullRequest(number:$n){
     reviewThreads(first:100,after:$endCursor){
-      nodes{id,isResolved,comments(last:1){nodes{updatedAt,createdAt,author{login}}}}
+      nodes{id,isResolved,comments(last:1){nodes{updatedAt,body}}}
       pageInfo{hasNextPage,endCursor}
     }
   }}
 }"""
 PR_URL = re.compile(r"https://github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)")
+LANE_MARKER = re.compile(r"<!-- tstack-lane:([a-z0-9][a-z0-9-]*) -->")
 
 
 def parse_url(url: str) -> tuple[str, str, str]:
@@ -57,6 +58,12 @@ def body_digest(item: dict) -> str:
     return hashlib.sha256((item.get("body") or "").encode()).hexdigest()
 
 
+def marker(item: dict) -> str | None:
+    """The lane id in a `<!-- tstack-lane:<id> -->` marker, which lanes put in every PR body they write."""
+    match = LANE_MARKER.search(item.get("body") or "")
+    return match.group(1) if match else None
+
+
 def fingerprint(pr: dict, threads) -> dict:
     return {
         "head": pr["headRefOid"],
@@ -71,13 +78,13 @@ def fingerprint(pr: dict, threads) -> dict:
         ], key=lambda item: item["a"]),
         "reviewCount": len(pr.get("reviews", [])),
         "reviewEvents": sorted([
-            {"i": item.get("id", "?"), "s": item["state"], "a": login(item),
-             "u": item.get("submittedAt", "?"), "b": body_digest(item)}
+            {"i": item.get("id", "?"), "s": item["state"],
+             "u": item.get("submittedAt", "?"), "b": body_digest(item), "m": marker(item)}
             for item in pr.get("reviews", [])
         ], key=lambda item: item["i"]),
         "comments": sorted([
-            {"i": item.get("id", "?"), "a": login(item), "c": item.get("createdAt", "?"),
-             "u": item.get("updatedAt") or item.get("createdAt", "?"), "b": body_digest(item)}
+            {"i": item.get("id", "?"), "u": item.get("updatedAt") or item.get("createdAt", "?"),
+             "b": body_digest(item), "m": marker(item)}
             for item in pr.get("comments", [])
         ], key=lambda item: item["i"]),
         "reviewRequests": sorted(item.get("login") or item.get("name", "?")
@@ -118,27 +125,17 @@ def threads(url: str) -> list[dict]:
     for page in pages:
         for item in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
             last = next(iter(item["comments"]["nodes"]), {})
-            rows.append({"i": item["id"], "r": item["isResolved"], "u": last.get("updatedAt", ""),
-                         "a": login(last), "c": last.get("createdAt", "")})
+            rows.append({"i": item["id"], "r": item["isResolved"], "u": last.get("updatedAt", ""), "m": marker(last)})
     return sorted(rows, key=lambda item: item["i"])
-
-
-def login(item: dict) -> str:
-    return (item.get("author") or {}).get("login", "?")
-
-
-def viewer() -> str:
-    """The login gh is authenticated as: lanes and the operator share it."""
-    return gh_json(["api", "user"])["login"]
 
 
 def snapshot(url: str) -> dict:
     return fingerprint(view(url), threads(url))
 
 
-def actionable(old: dict | None, new: dict, own=lambda author, at: False) -> list[str]:
+def actionable(old: dict | None, new: dict, lane_id: str | None = None) -> list[str]:
     """What a waiting lane must hear about, comparing the last handled snapshot with this one.
-    `own(author, at)` says a comment, review or thread reply is the lane's own; those never wake it."""
+    Comments, reviews and thread replies carrying this lane's marker are its own and never wake it."""
     if new["state"] == "MERGED":
         return ["merged"]
     if new["state"] == "CLOSED":
@@ -152,23 +149,15 @@ def actionable(old: dict | None, new: dict, own=lambda author, at: False) -> lis
         events.append("conflict")
     if old is None:
         return events
-    seen_reviews = {item["i"] for item in old.get("reviewEvents", [])}
-    if any(item["i"] not in seen_reviews and not own(item.get("a"), item.get("u"))
-           for item in new.get("reviewEvents", [])):
+
+    def fresh(key: str, version: str) -> bool:
+        seen = {item["i"]: item.get(version) for item in old.get(key) or []}
+        return any(item["i"] not in seen or seen[item["i"]] != item.get(version)
+                   for item in new.get(key) or [] if item.get("m") != lane_id and not item.get("r"))
+    if fresh("reviewEvents", "b"):
         events.append("review")
-    seen_comments = {item["i"]: item["b"] for item in old.get("comments", [])}
-    for item in new.get("comments", []):
-        if item["i"] not in seen_comments:
-            changed_at = item.get("c")
-        elif seen_comments[item["i"]] != item["b"]:
-            changed_at = item.get("u")
-        else:
-            continue
-        if not own(item.get("a"), changed_at):
-            events.append("comment")
-            break
-    seen_threads = {item["i"]: item.get("u") for item in old.get("threads") or []}
-    if any(not item["r"] and seen_threads.get(item["i"], "") != item.get("u") and not own(item.get("a"), item.get("c"))
-           for item in new.get("threads") or []):
+    if fresh("comments", "b"):
+        events.append("comment")
+    if fresh("threads", "u"):
         events.append("thread")
     return events

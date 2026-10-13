@@ -92,7 +92,7 @@ def main(argv) -> int:
             print(key)
         return 0
     if args.cmd == "update":
-        code, line = ops.update(lambda: install.setup(None), lambda: install.check(None))
+        code, line = ops.update()
         print(line)
         return code
     return 2

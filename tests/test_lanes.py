@@ -1,6 +1,8 @@
+import datetime as dt
 import json
+import subprocess
 
-from support import Sandbox, git
+from support import Sandbox, git, write_exe
 
 PR = "https://github.com/acme/web/pull/7"
 
@@ -93,6 +95,52 @@ class LaneRuns(Sandbox):
         self.assertEqual(json.loads(self.cli("lane", "list", "--json").stdout)[0]["id"], lane_id)
         self.assertIn('"status": "done"', self.cli("lane", "show", lane_id).stdout)
 
+    def test_a_dispatch_already_taken_is_not_run_again(self):
+        self.omp_config(report="waiting", pr=PR)
+        lane_id = self.start()
+        self.settled(lane_id, "waiting")
+        args = ("lane", "resume", lane_id, "test failed", "--kind", "check-failed", "--check", "test", "--event-id", "pr-1")
+        self.cli(*args)
+        self.settled(lane_id, "waiting")
+        again = self.cli(*args)
+        self.assertIn("already took event pr-1", again.stdout)
+        record = self.lane_record(lane_id)
+        self.assertEqual((len(record["runs"]), record["waves"]), (2, {"test": 1}))
+
+    def test_failed_launches_do_not_use_up_fix_waves(self):
+        self.omp_config(report="waiting", pr=PR)
+        lane_id = self.start()
+        self.settled(lane_id, "waiting")
+        write_exe(self.stubs / "bin" / "systemd-run", "#!/bin/sh\necho 'Failed to start transient service' >&2\nexit 1\n")
+        self.env["TSTACK_LAUNCHER"] = "systemd"
+        for _ in range(2):
+            failed = self.cli("lane", "resume", lane_id, "test failed", "--kind", "check-failed", "--check", "test", check=False)
+            self.assertEqual(failed.returncode, 1, failed.stderr)
+        record = self.lane_record(lane_id)
+        self.assertEqual((record["status"], len(record["runs"]), record["waves"]), ("waiting", 1, {}))
+        self.env["TSTACK_LAUNCHER"] = "process"
+        self.cli("lane", "resume", lane_id, "test failed", "--kind", "check-failed", "--check", "test")
+        self.assertEqual(self.settled(lane_id, "waiting")["waves"], {"test": 1})
+
+    def test_clean_keeps_a_lane_with_commits_but_no_pr(self):
+        lane_id = self.start()
+        self.settled(lane_id, "done")
+        worktree = self.home / "worktrees" / "demo" / lane_id
+        (worktree / "found.txt").write_text("a fix nobody pushed\n")
+        env = {k: v for k, v in self.env.items() if k.startswith("GIT_")}
+        for args in (["add", "found.txt"], ["commit", "--quiet", "-m", "unpushed"]):
+            subprocess.run(["git", "-C", str(worktree), *args], check=True, env={**self.env, **env})
+        result = self.cli("lane", "clean", lane_id, check=False)
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("1 commit(s) not on origin/main", result.stderr)
+        self.assertTrue(worktree.exists())
+
+    def test_clean_removes_a_finished_lane_without_commits(self):
+        lane_id = self.start()
+        self.settled(lane_id, "done")
+        self.cli("lane", "clean", lane_id)
+        self.assertFalse((self.home / "worktrees" / "demo" / lane_id).exists())
+
 
 class MergeGuard(Sandbox):
     HEAD = "b" * 40
@@ -104,7 +152,7 @@ class MergeGuard(Sandbox):
         (lane / "lane.json").write_text(json.dumps({
             "id": "demo-ci-1", "project": "demo", "branch": "lane/demo-ci-1", "base": "main", "status": "running",
             "runs": [{"run": 1, "event": "start", "start": "2026-10-13T00:00:00Z"}], "waves": {}, "pr": PR}))
-        self.env["TSTACK_LANE"] = "demo-ci-1"
+        self.env.update(TSTACK_LANE="demo-ci-1", TSTACK_SEAT=str(self.seat))
 
     def report(self, *proof: str, head: str = HEAD) -> None:
         args = ["report", "--status", "waiting", "--waiting-on", "merge", "--summary", "ready", "--pr", PR, "--head", head]
@@ -112,8 +160,8 @@ class MergeGuard(Sandbox):
             args += ["--proof", item]
         self.cli("lane", *args)
 
-    def merge(self):
-        return self.cli("lane", "merge", check=False)
+    def merge(self, *args: str):
+        return self.cli("lane", "merge", *args, check=False)
 
     def merged(self) -> bool:
         return any(call[:2] == ["pr", "merge"] for call in self.log_lines("gh.log"))
@@ -164,3 +212,139 @@ class MergeGuard(Sandbox):
         call = next(c for c in self.log_lines("gh.log") if c[:2] == ["pr", "merge"])
         self.assertEqual(call[call.index("--match-head-commit") + 1], self.HEAD)
         self.assertIn("--squash", call)
+
+    def test_a_missing_review_needs_admin_and_auto_merge_is_never_armed(self):
+        self.report("pnpm test=pass")
+        self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1", merge_state="BLOCKED", review_decision="REVIEW_REQUIRED")
+        result = self.merge()
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("lane merge --admin", result.stderr)
+        self.assertFalse(self.merged())
+        result = self.merge("--admin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call = next(c for c in self.log_lines("gh.log") if c[:2] == ["pr", "merge"])
+        self.assertIn("--admin", call)
+        self.assertNotIn("--auto", call)
+        self.assertEqual(call[call.index("--match-head-commit") + 1], self.HEAD)
+
+    def test_admin_merge_refused_when_the_pipeline_forbids_it_or_something_else_blocks(self):
+        pipeline = self.instance / "projects" / "demo" / "pipeline.md"
+        pipeline.write_text("# Pipeline\n\nadmin-merge: no\n")
+        self.report("pnpm test=pass")
+        self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1", merge_state="BLOCKED", review_decision="REVIEW_REQUIRED")
+        result = self.merge("--admin")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("admin-merge: no", result.stderr)
+        pipeline.unlink()
+        self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1", merge_state="BLOCKED", review_decision="APPROVED")
+        result = self.merge("--admin")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("other than a missing review", result.stderr)
+        self.assertFalse(self.merged())
+
+    def test_engine_and_instance_prs_are_never_merged(self):
+        self.report("pnpm test=pass")
+        self.pr_stub(head=self.HEAD, branch="lane/demo-ci-1")
+        for repo, other in ((self.engine, self.instance), (self.instance, self.engine)):
+            git_init(repo, "https://github.com/acme/web.git")
+            git_init(other, "https://github.com/acme/elsewhere.git")
+            result = self.merge()
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("system PRs", result.stderr)
+        self.assertFalse(self.merged())
+
+
+def git_init(repo, origin: str) -> None:
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"], capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", origin], check=True)
+
+
+class LaneContext(Sandbox):
+    """Inside a lane, `lane` runs only report, merge, show and list, for that lane and its seat."""
+
+    def setUp(self):
+        super().setUp()
+        self.other_seat = self.instance / "projects" / "other"
+        for seat, lane_id in ((self.seat, "demo-ci-1"), (self.seat, "demo-ci-2"), (self.other_seat, "demo-ci-1")):
+            lane = seat / "state" / "lanes" / lane_id
+            lane.mkdir(parents=True)
+            (lane / "lane.json").write_text(json.dumps({
+                "id": lane_id, "project": "demo", "branch": f"lane/{lane_id}", "base": "main", "status": "running",
+                "runs": [{"run": 1, "event": "start", "start": "2026-10-13T00:00:00Z", "accepted": "2026-10-13T00:00:00Z"}],
+                "waves": {}, "pr": None, "held": False}))
+        self.env.update(TSTACK_LANE="demo-ci-1", TSTACK_SEAT=str(self.seat))
+
+    def test_a_lane_cannot_act_on_other_lanes_or_seats(self):
+        refused = [
+            ("report", "--lane", "demo-ci-2", "--status", "done", "--summary", "not mine"),
+            ("report", "--seat", str(self.other_seat), "--status", "done", "--summary", "not my seat"),
+            ("show", "demo-ci-2"), ("merge", "demo-ci-2"), ("list", "--seat", str(self.other_seat)),
+            ("start", "more", "--brief", str(self.brief())), ("resume", "demo-ci-1", "again"),
+            ("stop", "demo-ci-1"), ("cancel", "demo-ci-2"), ("hold", "demo-ci-2"), ("clean", "demo-ci-1"),
+            ("supersede", "demo-ci-2", "--by", "demo-ci-3"),
+        ]
+        for args in refused:
+            with self.subTest(args[0]):
+                result = self.cli("lane", *args, check=False)
+                self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertFalse((self.seat / "state" / "lanes" / "demo-ci-2" / "report.json").exists())
+        self.assertFalse((self.other_seat / "state" / "lanes" / "demo-ci-1" / "report.json").exists())
+        self.assertEqual(self.lane_record("demo-ci-2")["status"], "running")
+
+    def test_a_lane_reports_on_itself_and_reads_its_seat(self):
+        self.cli("lane", "report", "--status", "done", "--summary", "mine", "--seat", str(self.seat))
+        self.assertTrue((self.seat / "state" / "lanes" / "demo-ci-1" / "report.json").exists())
+        self.assertIn('"id": "demo-ci-1"', self.cli("lane", "show", "demo-ci-1").stdout)
+        self.assertIn("demo-ci-2", self.cli("lane", "list").stdout)
+
+
+class QueuedLaunch(Sandbox):
+    """A launch handed to the launcher whose supervisor has not taken the run lock yet."""
+
+    def setUp(self):
+        super().setUp()
+        worktree = self.root / "worktree"
+        worktree.mkdir()
+        lane = self.seat / "state" / "lanes" / "demo-ci-1"
+        lane.mkdir(parents=True)
+        (lane / "brief.md").write_text("Fix CI.\nTIMEBOX: 1h\n")
+        self.record = {
+            "id": "demo-ci-1", "project": "demo", "task": "ci", "seat": str(self.seat), "repo": "acme/web",
+            "worktree": str(worktree), "branch": "lane/demo-ci-1", "base": "main", "playbook": "build-feature",
+            "model": "@tiny", "thinking": "low", "timebox": "1h", "memory": "1G",
+            "session": str(self.home / ".omp/agent/sessions/-fake/2026-10-13T00-00-00-000Z_abc.jsonl"),
+            "status": "running", "reason": None, "held": False, "pr": None, "waves": {}, "cost_usd": 0, "created": ago(60),
+            "runs": [{"run": 1, "event": "start", "start": ago(60), "accepted": ago(60), "end": ago(50), "exit": 0},
+                     {"run": 2, "event": "resume", "start": ago(0), "launcher": "process"}]}
+        (lane / "lane.json").write_text(json.dumps(self.record))
+        run_dir = self.seat / "state" / "run" / "lanes" / "demo-ci-1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run-2.event").write_text("CI finished")
+
+    def supervise(self):
+        self.cli("lane", "_run", "demo-ci-1", "--seat", str(self.seat), "--run", "2")
+
+    def test_a_cancelled_queued_run_never_starts_omp(self):
+        self.cli("lane", "cancel", "demo-ci-1", "--reason", "replaced")
+        self.supervise()
+        self.assertEqual(self.log_lines("omp.log"), [])
+        record = self.lane_record("demo-ci-1")
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["runs"][1]["exit"], "not started")
+
+    def test_stopping_a_queued_launch_cancels_it(self):
+        self.assertIn("waiting", self.cli("lane", "stop", "demo-ci-1").stdout)
+        self.supervise()
+        self.assertEqual(self.log_lines("omp.log"), [])
+        self.assertEqual(self.lane_record("demo-ci-1")["reason"], "stopped before start")
+
+    def test_the_supervisor_starts_nothing_for_a_lane_that_is_not_running(self):
+        self.record["status"] = "cancelled"
+        (self.seat / "state" / "lanes" / "demo-ci-1" / "lane.json").write_text(json.dumps(self.record))
+        self.supervise()
+        self.assertEqual(self.log_lines("omp.log"), [])
+
+
+def ago(minutes: float) -> str:
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")

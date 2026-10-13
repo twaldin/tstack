@@ -1,8 +1,10 @@
 // Keeps secret values out of agent transcripts on this machine.
 // - Blocks tool calls that would read a secret file or dump a secret store: `.env*` files (not
-//   .env.example/.sample/.template/.dist), private keys, gcloud credentials, `gcloud secrets
-//   versions access`, `kubectl get secret -o yaml/json`, bare `printenv`/`env`, keychain `-w`.
-// - Redacts `NAME=value` lines with secret-shaped names from every tool result, as a backstop.
+//   .env.example/.sample/.template/.dist), `auth.json`, `relay.json`, anything under `.secrets/`,
+//   keychain files, private keys, gcloud credentials, `gcloud secrets versions access`,
+//   `kubectl get secret -o yaml/json`, bare `printenv`/`env`, keychain `-w` and dumps.
+// - Redacts secret-shaped `NAME=value` lines (also numbered, as read and grep print them) and JSON
+//   credential fields from every tool result, as a backstop.
 // Agents check secrets with `secret-check` (existence, length, hash prefix, compare, HTTP probe),
 // which never prints a value. This is a guard against accidents, not a sandbox: an agent that
 // sets out to evade it (encoding, renamed copies, custom programs) can.
@@ -23,6 +25,9 @@ function isSecretPath(p: string): boolean {
   if (/^\.env(\..+)?$/i.test(base) && !SAFE_ENV_SUFFIX.test(base)) return true;
   if (/\.(pem|p12|pfx|key)$/i.test(base) && !/\.pub$/i.test(base)) return true;
   if (/^id_(rsa|ecdsa|ed25519|dsa)$/.test(base)) return true;
+  if (/^(auth|relay)\.json$/i.test(base)) return true;
+  if (/(^|\/)\.secrets(\/|$)/.test(clean)) return true;
+  if (/\.keychain(-db)?$/i.test(base) || /(^|\/)Library\/Keychains(\/|$)/.test(clean)) return true;
   if (/\/\.config\/gcloud\/.*(credentials|access_tokens|legacy_credentials)/i.test(clean)) return true;
   if (/\/\.config\/gcloud\/(credentials\.db|access_tokens\.db|application_default_credentials\.json)$/i.test(clean)) return true;
   return false;
@@ -30,6 +35,9 @@ function isSecretPath(p: string): boolean {
 
 // A `.env` path token inside free text (shell or code), e.g. `cat ~/app/.env`, `open('.env')`.
 const ENV_TOKEN = /(?:^|[\s'"`=/<(:])\.env(?:\.(?!example\b|sample\b|template\b|dist\b)[\w.-]+)?(?=$|[\s'"`;|&)>,])/i;
+// Credential stores named in free text: auth.json, relay.json, ~/.secrets, keychain files.
+const STORE_TOKEN =
+  /(?:^|[\s'"`=/<(:])(?:auth|relay)\.json(?=$|[\s'"`;|&)>,])|(?:^|[\s'"`=/<(:~])\.secrets(?=$|[\s/'"`;|&)>,])|\.keychain(?:-db)?\b|\bLibrary\/Keychains\b/i;
 const SHELL_DENY: Array<[RegExp, string]> = [
   [/\bgcloud\s+secrets\s+versions\s+access\b/i, "gcloud secrets versions access"],
   [/\bkubectl\s+get\s+secrets?\b[^|;&]*\s-o\s*=?\s*(yaml|json|jsonpath|go-template)/i, "kubectl get secret -o"],
@@ -38,6 +46,7 @@ const SHELL_DENY: Array<[RegExp, string]> = [
   [/\bprintenv\s+[A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|OAUTH)/i, "printenv of a secret variable"],
   [/\b(?:echo|printf)\b[^|;&]*\$\{?[A-Z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|OAUTH)[A-Z0-9_]*/, "echo of a secret variable"],
   [/\bsecurity\s+find-(generic|internet)-password\b[^|;&]*\s-w\b/, "keychain password -w"],
+  [/\bsecurity\s+dump-keychain\b/, "keychain dump"],
   [/\/\.config\/gcloud\/[^\s'"]*(credentials|access_tokens)/i, "gcloud credential files"],
   [/\b(?:cat|less|more|head|tail|bat|xxd|od|strings|base64)\b[^|;&]*\.(?:pem|p12|pfx)\b/i, "private key file"],
   [/\b(?:cat|less|more|head|tail|bat|xxd|od|strings|base64)\b[^|;&]*\bid_(?:rsa|ecdsa|ed25519|dsa)\b(?!\.pub)/, "private key file"],
@@ -49,6 +58,7 @@ const CHECKER_ONLY = new RegExp(`^\\s*(?:\\S*/)?${CHECKER}(?:\\s[^;&|\`$()<>]*)?
 function shellReason(cmd: string): string | undefined {
   if (CHECKER_ONLY.test(cmd)) return undefined;
   if (ENV_TOKEN.test(cmd)) return "reads a .env file";
+  if (STORE_TOKEN.test(cmd)) return "reads a credential store";
   for (const [re, what] of SHELL_DENY) if (re.test(cmd)) return what;
   return undefined;
 }
@@ -63,12 +73,18 @@ function pathsOf(input: Record<string, unknown>): string[] {
   return out;
 }
 
-// `NAME=value` / `export NAME=value` / `NAME: value` lines whose name looks like a secret.
+// `NAME=value` / `export NAME=value` / `NAME: value` lines whose name looks like a secret, also behind a
+// line-number prefix (`12:`, `*12:`, `path:12:`, `12#AB:`) as read and grep print them.
 const SECRET_LINE =
-  /^(\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|CREDENTIALS?|PRIVATE|OAUTH|DSN|WEBHOOK)[A-Z0-9_]*\s*[=:]\s*)(["']?)([^\s"']{8,})\2\s*$/gm;
+  /^(\s*(?:(?:[^\s:=]+:)?\s*\*?\d+(?:#[0-9A-Za-z]{2,8})?[:|-]\s?)?(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|CREDENTIALS?|PRIVATE|OAUTH|DSN|WEBHOOK)[A-Z0-9_]*\s*[=:]\s*)(["']?)([^\s"']{8,})\2\s*$/gm;
+// `"apiKey": "value"` and the like in JSON.
+const SECRET_FIELD =
+  /("[A-Za-z0-9_.-]*?(?:key|secret|token|password|passwd|credential|auth(?!or)|private|dsn|webhook)[A-Za-z0-9_.-]*"\s*:\s*")([^"\\\s]{8,})(")/gi;
 
 function redact(text: string): string {
-  return text.replace(SECRET_LINE, (_m, head, q) => `${head}${q}[REDACTED by secret-guard]${q}`);
+  return text
+    .replace(SECRET_LINE, (_m, head, q) => `${head}${q}[REDACTED by secret-guard]${q}`)
+    .replace(SECRET_FIELD, (_m, head, _v, tail) => `${head}[REDACTED by secret-guard]${tail}`);
 }
 
 export default function secretGuard(pi) {
@@ -82,7 +98,7 @@ export default function secretGuard(pi) {
     }
     if (name === "eval") {
       const code = String(input.code ?? "");
-      if (ENV_TOKEN.test(code) || /\bgcloud\s+secrets\s+versions\s+access\b/i.test(code))
+      if (ENV_TOKEN.test(code) || STORE_TOKEN.test(code) || /\bgcloud\s+secrets\s+versions\s+access\b/i.test(code))
         return { block: true, reason: `secret-guard blocked this cell (reads a .env file or secret store). ${HINT}` };
       return;
     }

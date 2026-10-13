@@ -55,8 +55,6 @@ with open(stubs / "gh.log", "a") as log:
     log.write(json.dumps(args) + "\n")
 if args[:2] == ["pr", "view"]:
     print((stubs / "gh" / "pr.json").read_text())
-elif args[:2] == ["api", "user"]:
-    print(json.dumps({"login": "shared-login"}))
 elif args[:2] == ["api", "graphql"]:
     nodes = json.loads((stubs / "gh" / "threads.json").read_text()) if (stubs / "gh" / "threads.json").exists() else []
     print(json.dumps([{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": nodes}}}}}]))
@@ -67,7 +65,8 @@ else:
 '''
 
 STUB_EASL = r'''#!/usr/bin/env python3
-"""Fake easl: logs argv; asks live in stubs/asks.json; agent.restart refuses when stubs/easl-busy exists."""
+"""Fake easl: logs argv; asks live in stubs/asks.json. agent.restart refuses (conflict) when stubs/easl-busy
+exists and fails when stubs/easl-fail exists; agent.prompt fails when stubs/easl-prompt-fail exists."""
 import json, os, sys
 from pathlib import Path
 stubs = Path(os.environ["STUBS"])
@@ -93,6 +92,12 @@ elif args[:2] == ["ask", "cancel"]:
 elif args[0] == "agent.restart" and (stubs / "easl-busy").exists():
     print("conflict: the agent is working", file=sys.stderr)
     sys.exit(1)
+elif args[0] == "agent.restart" and (stubs / "easl-fail").exists():
+    print("not_found: no such tile", file=sys.stderr)
+    sys.exit(1)
+elif args[0] == "agent.prompt" and (stubs / "easl-prompt-fail").exists():
+    print("unavailable: host not connected", file=sys.stderr)
+    sys.exit(1)
 elif args[0] == "agent.list":
     out({"agents": []})
 else:
@@ -110,6 +115,12 @@ fi
 
 STUB_LOG = r'''#!/bin/sh
 printf '%s\n' "$*" >> "$STUBS/$(basename "$0").log"
+'''
+
+STUB_TEXT = r'''#!/bin/sh
+# Fake bin/text: fails while stubs/text-fail exists; a delivered message is logged to text.log.
+if [ -e "$STUBS/text-fail" ]; then echo "sendblue: 503" >&2; exit 1; fi
+printf '%s\n' "$*" >> "$STUBS/text.log"
 '''
 
 
@@ -146,7 +157,7 @@ class Sandbox(unittest.TestCase):
         (self.instance / "global.md").parent.mkdir(parents=True)
         (self.instance / "global.md").write_text("# Instance rules\n")
         (self.instance / "machines" / "testbox").mkdir(parents=True)
-        write_exe(self.instance / "bin" / "text", STUB_LOG)
+        write_exe(self.instance / "bin" / "text", STUB_TEXT)
         self.seat = self.instance / "projects" / "demo"
         (self.seat / "state").mkdir(parents=True)
         write_exe(self.stubs / "bin" / "omp", STUB_OMP)
@@ -223,12 +234,15 @@ class Sandbox(unittest.TestCase):
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def pr_stub(self, head: str = "a" * 40, state: str = "OPEN", checks=(("test", "SUCCESS"),), mergeable: str = "MERGEABLE",
-                merge_state: str = "CLEAN", comments=(), branch: str | None = None) -> None:
-        """`comments`: ids (by a reviewer), or (id, login, createdAt) tuples. gh's own login is `shared-login`."""
-        rows = [c if isinstance(c, tuple) else (c, "reviewer", "2026-10-13T00:00:00Z") for c in comments]
+                merge_state: str = "CLEAN", comments=(), branch: str | None = None, review_decision: str = "",
+                created: str = "2026-10-13T00:00:00Z") -> None:
+        """`comments`: ids (the id is also the body), or (id, body) tuples. Every comment has the same author,
+        as the operator and the lanes share one gh login."""
+        rows = [c if isinstance(c, tuple) else (c, c) for c in comments]
         pr = {"headRefOid": head, "headRefName": branch, "state": state, "isDraft": False, "mergeable": mergeable,
               "mergeStateStatus": merge_state, "latestReviews": [], "reviewRequests": [], "reviews": [],
-              "comments": [{"id": i, "body": i, "author": {"login": a}, "createdAt": at} for i, a, at in rows],
+              "reviewDecision": review_decision,
+              "comments": [{"id": i, "body": b, "author": {"login": "shared-login"}, "createdAt": created} for i, b in rows],
               "statusCheckRollup": [{"name": n, "conclusion": c} for n, c in checks]}
         (self.stubs / "gh" / "pr.json").write_text(json.dumps(pr))
 
