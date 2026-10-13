@@ -323,9 +323,12 @@ class Sandbox(unittest.TestCase):
 
     # running the CLIs
 
-    def cli(self, tool: str, *args: str, check: bool = True, timeout: float = 60, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    def cli(self, tool: str, *args: str, check: bool = True, timeout: float = 60, cwd: Path | None = None,
+            own_session: bool = False) -> subprocess.CompletedProcess:
+        """Run `tool <args>` to the end. With own_session, the command runs in a session of its own under this
+        test process, as a seat's omp runs its bash tool commands: this process is its session_owner()."""
         result = subprocess.run([sys.executable, str(CODE / "bin" / tool), *args], env=self.env, cwd=cwd or self.seat,
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, timeout=timeout, start_new_session=own_session)
         if check and result.returncode != 0:
             self.fail(f"{tool} {' '.join(args)} exit {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}")
         return result

@@ -67,8 +67,9 @@ class Update(Sandbox):
         (self.run_dir / "heartbeat.json").write_text(json.dumps({"at": at.strftime("%Y-%m-%dT%H:%M:%SZ")}))
 
     def restart_self(self, check=True):
+        """The seat's omp runs `tstack restart-self`; this test process plays that omp."""
         self.env["EASL_TILE_ID"] = "obj_seat"
-        return self.cli("tstack", "restart-self", check=check)
+        return self.cli("tstack", "restart-self", check=check, own_session=True)
 
     def poll_under(self, omp: FakeOmp) -> None:
         """Have `omp` start the seat's wait; return once a poll under it has finished, with the wait ended."""
@@ -218,9 +219,11 @@ class Update(Sandbox):
         self.assertEqual(self.log_lines("easl.log"), [])
 
     def test_restart_self_refuses_when_it_cannot_tell_which_omp_runs_it(self):
+        """Without a session of its own, the command's parent shares its session, so telling its owner needs ps."""
         write_exe(self.root / "no-ps" / "ps", "#!/bin/sh\nexit 1\n")
         self.env["PATH"] = f"{self.root / 'no-ps'}:{self.env['PATH']}"
-        result = self.restart_self(check=False)
+        self.env["EASL_TILE_ID"] = "obj_seat"
+        result = self.cli("tstack", "restart-self", check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot tell which omp runs this command", result.stderr)
         self.assertFalse((self.run_dir / "recovery.json").exists())

@@ -111,7 +111,7 @@ class Liveness(Sandbox):
     def test_a_restart_by_the_seat_itself_suppresses_another_and_liveness_sends_its_prompt(self):
         self.heartbeat(40)
         self.env["EASL_TILE_ID"] = "obj_seat"
-        self.cli("tstack", "restart-self")
+        self.cli("tstack", "restart-self", own_session=True)
         self.liveness()
         self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
         self.assertIn("--force", self.log_lines("easl.log")[0])
@@ -119,7 +119,7 @@ class Liveness(Sandbox):
 
     def test_a_seat_that_never_polled_is_restarted_once_whoever_restarted_it(self):
         self.env["EASL_TILE_ID"] = "obj_seat"
-        self.cli("tstack", "restart-self")
+        self.cli("tstack", "restart-self", own_session=True)
         self.liveness()
         self.liveness()
         self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
@@ -130,7 +130,7 @@ class Liveness(Sandbox):
         self.heartbeat(70)
         self.env["EASL_TILE_ID"] = "obj_seat"
         (self.stubs / "easl-kill-caller").touch()
-        self.assertEqual(self.cli("tstack", "restart-self", check=False).returncode, -9)
+        self.assertEqual(self.cli("tstack", "restart-self", check=False, own_session=True).returncode, -9)
         (self.stubs / "easl-kill-caller").unlink()
         record = self.record()
         for key in ("pending", "restart"):
