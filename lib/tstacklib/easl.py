@@ -80,8 +80,8 @@ def ask_answer(board: dict, ask_id: str) -> str | None:
     return "; ".join(parts) or "answered"
 
 
-def upsert_note(board: dict, key: str, markdown: str) -> None:
-    props = json.dumps({"props": {"markdown": markdown}})
+def upsert_note(board: dict, key: str, markdown: str, width: int = 640) -> None:
+    props = json.dumps({"props": {"markdown": markdown}, "frame": {"w": width}, "size": "fit"})
     call("object.upsert", "--board", board["board"], "--key", key, "--type", "note", "--json", props,
          host=board["host"])
 
