@@ -10,8 +10,8 @@ from pathlib import Path
 
 from . import easl
 from .seat import parse_options, read_board, read_gates, update_gates
-from .util import (HOME, Die, age, all_seats, engine_home, git, instance_home, iso, machine, parse_iso, read_json,
-                   run, seat_name, state_root, write_json)
+from .util import (HOME, Die, age, all_seats, engine_home, flock, git, instance_home, iso, machine, parse_iso,
+                   read_json, run, seat_name, state_root, write_json)
 
 STALE = 30 * 60
 SOURCE_FAILING = 60 * 60
@@ -173,12 +173,13 @@ def turn_over(seat: Path, board: dict, wait_running: bool) -> bool:
     return ended is not None and ended > TURN_OVER
 
 
-def recover(seat: Path, board: dict, progress: dict, wait_running: bool) -> str:
+def recover(seat: Path, board: dict, progress: dict, wait_running: bool, save) -> str:
     """One step of an in-place restart: resume the tile unless that already worked, then send the restart
-    prompt unless that already worked. `progress` keeps `restarted`/`prompted` times and the last attempt.
-    A seat easl calls busy is restarted with force only when `turn_over` says its turn has ended."""
+    prompt unless that already worked. `progress` keeps `restarted`/`prompted` times, `forced` and the last
+    attempt; `save()` persists it once the restart went through. A seat easl calls busy is restarted with
+    force only when `turn_over` says its turn has ended. The prompt waits until the tile reports idle (omp's
+    easl integration back), and is skipped when the seat's wait has polled since the restart."""
     progress["attempt"] = {"at": iso(), "error": None}
-    forced = False
     try:
         if not progress.get("restarted"):
             try:
@@ -187,12 +188,18 @@ def recover(seat: Path, board: dict, progress: dict, wait_running: bool) -> str:
                 if not turn_over(seat, board, wait_running):
                     raise
                 easl.restart(board, force=True)
-                forced = True
+                progress["forced"] = True
             progress["restarted"] = iso()
+            save()
         if not progress.get("prompted"):
+            beat = (read_json(seat / "state" / "run" / "heartbeat.json") or {}).get("at")
+            if beat and age(beat) is not None and age(beat) < age(progress["restarted"]):
+                progress["prompted"] = beat
+                return f"polling again since {beat}; no restart prompt needed"
+            easl.wait_idle(board)
             easl.prompt(board, restart_prompt())
             progress["prompted"] = iso()
-        return "restarted in place" + (" (forced: its turn had ended, only its wait job ran)" if forced else "")
+        return "restarted in place" + (" (forced: its turn had ended, only its wait job ran)" if progress.get("forced") else "")
     except easl.EaslConflict as error:
         progress["attempt"]["error"] = f"busy: {error}"
     except Die as error:
@@ -203,25 +210,34 @@ def recover(seat: Path, board: dict, progress: dict, wait_running: bool) -> str:
 
 def liveness() -> list[str]:
     """For each local seat: a wait heartbeat over 30 min stale opens an incident and gets an in-place restart
-    (retried every run until the restart and its prompt both went through; forced only when `turn_over` says
-    the seat's turn has ended). An incident still open after 30 min, or a wait source failing for an hour,
-    texts the operator; an alert counts only once sent."""
+    (forced only when `turn_over` says the seat's turn has ended). A restart whose prompt has not gone through,
+    liveness's own or update's, gets the prompt again on every run whatever the heartbeat says. An incident
+    still open after 30 min, or a wait source failing for an hour, texts the operator; an alert counts only
+    once sent."""
     out = []
-    for seat, board in local_seats():
+    seats = local_seats()
+    with flock(state_root() / "restarts.lock", blocking=False) as held:
+        if held:
+            pending = load_restarts()
+            if any(p.get("restarted") and not p.get("prompted") for p in pending.values()):
+                out += [f"update restart {line}" for line in work_restarts(pending, seats, prompts_only=True)]
+    for seat, board in seats:
         name = seat_name(seat)
         path = seat / "state" / "run" / "liveness.json"
         live = read_json(path) or {}
         beat = read_json(seat / "state" / "run" / "heartbeat.json") or {}
         at = beat.get("at")
         stale_for = age(at)
-        if stale_for is not None and stale_for <= STALE:
+        owed = live.get("restarted") and not live.get("prompted")
+        if stale_for is not None and stale_for <= STALE and not owed:
             if live.get("incident"):
                 out.append(f"{name}: polling again; incident from {live['incident']} closed")
             live = {"source_alerts": live.get("source_alerts", {})}
         else:
             live.setdefault("incident", iso())
             if not (live.get("restarted") and live.get("prompted")):
-                out.append(f"{name}: stale since {at or 'never'}; {recover(seat, board, live, wait_running=False)}")
+                why = "restart prompt still owed" if owed else f"stale since {at or 'never'}"
+                out.append(f"{name}: {why}; {recover(seat, board, live, False, lambda: write_json(path, live))}")
                 write_json(path, live)
             if (age(live["incident"]) or 0) > STALE and live.get("alerted") != live["incident"]:
                 state = (f"restarted at {live['restarted']}, still not polling" if live.get("prompted")
@@ -312,35 +328,56 @@ def rollback(moved: dict) -> list[str]:
     return notes
 
 
-def restart_changed(changes: dict) -> list[str]:
-    """Restart seats whose loaded files changed or whose omp is over 1.5 GB. A seat busy only with its wait
-    (`turn_over`, heartbeat fresh) is restarted with force; any other busy seat is retried next run."""
-    pending_path = state_root() / "restarts.json"
-    pending = {seat: value if isinstance(value, dict) else {"reason": value}
-               for seat, value in (read_json(pending_path) or {}).items()}
-    seats = local_seats()
-    for seat, reason in seats_touched(changes, [s for s, _ in seats]).items():
-        pending.setdefault(seat, {"reason": reason})
-    for seat, board in seats:
-        try:
-            mem = rss_mb(board)
-        except Die:
-            mem = None
-        if mem and mem > MAX_RSS_MB:
-            pending.setdefault(str(seat), {"reason": f"rss {mem:.0f} MB"})
+RESTART_LOCK_WAIT = 900
+
+
+def restarts_path() -> Path:
+    return state_root() / "restarts.json"
+
+
+def load_restarts() -> dict:
+    """restarts.json: seat path -> progress (older files hold just the reason)."""
+    return {seat: value if isinstance(value, dict) else {"reason": value}
+            for seat, value in (read_json(restarts_path()) or {}).items()}
+
+
+def work_restarts(pending: dict, seats: list[tuple[Path, dict]], prompts_only: bool) -> list[str]:
+    """One step for each seat in `pending` (update's restarts.json, keyed by seat path); `prompts_only`
+    touches only seats already restarted whose restart prompt is still owed. Caller holds the restarts lock."""
     results = []
     for seat, board in seats:
         progress = pending.get(str(seat))
-        if not progress:
+        if not progress or prompts_only and not progress.get("restarted"):
             continue
-        outcome = recover(seat, board, progress, wait_running=True)
+        outcome = recover(seat, board, progress, True, lambda: write_json(restarts_path(), pending))
         if progress.get("prompted"):
             pending.pop(str(seat))
-            results.append(f"{seat_name(seat)}:restarted({progress['reason']}{', forced' if '(forced' in outcome else ''})")
+            results.append(f"{seat_name(seat)}:restarted({progress['reason']}{', forced' if progress.get('forced') else ''})")
         else:
             results.append(f"{seat_name(seat)}:{'busy,retry' if outcome.startswith('restart failed: busy') else outcome[:80]}")
-    write_json(pending_path, pending)
+    write_json(restarts_path(), pending)
     return results
+
+
+def restart_changed(changes: dict) -> list[str]:
+    """Restart seats whose loaded files changed or whose omp is over 1.5 GB. A seat busy only with its wait
+    (`turn_over`, heartbeat fresh) is restarted with force; any other busy seat is retried next run, and a
+    restart whose prompt failed gets the prompt again here and on every liveness run."""
+    with flock(state_root() / "restarts.lock", timeout=RESTART_LOCK_WAIT) as held:
+        if not held:
+            raise Die(f"restarts.lock held for over {RESTART_LOCK_WAIT}s")
+        pending = load_restarts()
+        seats = local_seats()
+        for seat, reason in seats_touched(changes, [s for s, _ in seats]).items():
+            pending.setdefault(seat, {"reason": reason})
+        for seat, board in seats:
+            try:
+                mem = rss_mb(board)
+            except Die:
+                mem = None
+            if mem and mem > MAX_RSS_MB:
+                pending.setdefault(str(seat), {"reason": f"rss {mem:.0f} MB"})
+        return work_restarts(pending, seats, prompts_only=False)
 
 
 def update() -> tuple[int, str]:

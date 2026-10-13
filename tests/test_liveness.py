@@ -1,6 +1,7 @@
 import datetime as dt
 import json
 import re
+import time
 
 from support import Sandbox, assistant_entry
 
@@ -46,18 +47,19 @@ class Liveness(Sandbox):
     def test_stale_seat_is_restarted_once_then_texted_after_30_minutes(self):
         self.heartbeat(40)
         self.assertIn("restarted in place", self.liveness())
-        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt"])
-        prompt = self.log_lines("easl.log")[1]
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
+        wait, prompt = self.log_lines("easl.log")[1:3]
+        self.assertEqual(wait[wait.index("--until") + 1], "idle")
         self.assertEqual(prompt[prompt.index("--target") + 1], "obj_seat")
         self.assertEqual(prompt[prompt.index("--text") + 1], "You were restarted in place.\n")
         self.liveness()
-        self.assertEqual((len(self.easl_calls()), self.texts()), (2, []))
+        self.assertEqual((len(self.easl_calls()), self.texts()), (3, []))
         self.let_time_pass(31)
         self.liveness()
         self.assertEqual(len(self.texts()), 1)
         self.assertRegex(self.texts()[0], r"^send tstack: seat demo on testbox has not polled since .*; restarted at .*, still not polling\.$")
         self.liveness()
-        self.assertEqual((len(self.texts()), len(self.easl_calls())), (1, 2))
+        self.assertEqual((len(self.texts()), len(self.easl_calls())), (1, 3))
 
     def test_a_restart_that_keeps_failing_is_retried_and_escalated(self):
         self.heartbeat(40)
@@ -75,7 +77,26 @@ class Liveness(Sandbox):
         self.assertIn("restart prompt failed", self.liveness())
         (self.stubs / "easl-prompt-fail").unlink()
         self.assertIn("restarted in place", self.liveness())
-        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt", "agent.prompt"])
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt", "agent.wait", "agent.prompt"])
+
+    def test_no_prompt_until_the_restarted_seat_reports_idle(self):
+        self.heartbeat(40)
+        (self.stubs / "easl-wait-fail").touch()
+        self.assertIn("restart prompt failed: easl agent.wait: unavailable", self.liveness())
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait"])
+        (self.stubs / "easl-wait-fail").unlink()
+        self.assertIn("restarted in place", self.liveness())
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.wait", "agent.prompt"])
+
+    def test_a_seat_polling_again_since_its_restart_gets_no_restart_prompt(self):
+        self.heartbeat(40)
+        (self.stubs / "easl-prompt-fail").touch()
+        self.assertIn("restart prompt failed", self.liveness())
+        time.sleep(1.1)
+        self.heartbeat(0)
+        self.assertIn("polling again since", self.liveness())
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
+        self.assertIn("incident from", self.liveness())
 
     def test_an_alert_counts_only_once_it_is_sent(self):
         self.heartbeat(40)
@@ -95,7 +116,7 @@ class Liveness(Sandbox):
         self.assertIn("restart failed: busy", self.liveness())
         (self.stubs / "easl-busy").unlink()
         self.assertIn("restarted in place", self.liveness())
-        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.list", "agent.restart", "agent.prompt"])
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.list", "agent.restart", "agent.wait", "agent.prompt"])
 
     def test_source_failing_an_hour_texts_once_sent(self):
         self.heartbeat(1, {"github": {"ok": False, "error": "gh: auth", "failing_since": ago(61)},
@@ -114,7 +135,7 @@ class Liveness(Sandbox):
         text.chmod(0o644)
         for _ in range(2):
             self.assertIn("text failed", self.cli("tstack", "check", "--liveness", check=False).stdout)
-        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt"])
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
         live = json.loads((self.run_dir / "liveness.json").read_text())
         self.assertTrue(live["restarted"] and live["prompted"])
         self.assertEqual(live["source_alerts"], {})
@@ -123,7 +144,7 @@ class Liveness(Sandbox):
         self.liveness()
         self.assertEqual(len(self.texts()), 1)
         self.assertIn("wait source github has failed", self.texts()[0])
-        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt"])
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.wait", "agent.prompt"])
 
     def test_a_seat_busy_only_with_its_wait_is_restarted_with_force(self):
         self.heartbeat(40)

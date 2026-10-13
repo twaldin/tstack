@@ -82,8 +82,8 @@ else:
 
 STUB_EASL = r'''#!/usr/bin/env python3
 """Fake easl: logs argv; asks live in stubs/asks.json. agent.restart refuses (conflict) when stubs/easl-busy
-exists unless --force, and fails when stubs/easl-fail exists; agent.prompt fails when stubs/easl-prompt-fail
-exists; agent.list returns stubs/agents.json."""
+exists unless --force, and fails when stubs/easl-fail exists; agent.wait fails when stubs/easl-wait-fail exists;
+agent.prompt fails when stubs/easl-prompt-fail exists; agent.list returns stubs/agents.json."""
 import json, os, sys
 from pathlib import Path
 stubs = Path(os.environ["STUBS"])
@@ -114,6 +114,9 @@ elif args[0] == "agent.restart" and (stubs / "easl-fail").exists():
     sys.exit(1)
 elif args[0] == "agent.prompt" and (stubs / "easl-prompt-fail").exists():
     print("unavailable: host not connected", file=sys.stderr)
+    sys.exit(1)
+elif args[0] == "agent.wait" and (stubs / "easl-wait-fail").exists():
+    print("unavailable: no first report within 15 s", file=sys.stderr)
     sys.exit(1)
 elif args[0] == "agent.list":
     print((stubs / "agents.json").read_text() if (stubs / "agents.json").exists() else json.dumps({"agents": []}))

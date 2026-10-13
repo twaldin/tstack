@@ -48,7 +48,7 @@ class Update(Sandbox):
         self.assertIn("setup=ok check=ok", line)
         self.assertIn("restarts=demo:restarted(tstack/global.md changed)", line)
         self.assertIn("New rule.", (self.home / ".omp" / "agent" / "AGENTS.md").read_text())
-        self.assertEqual([c[0] for c in self.log_lines("easl.log")], ["agent.list", "agent.restart", "agent.prompt"])
+        self.assertEqual([c[0] for c in self.log_lines("easl.log")], ["agent.list", "agent.restart", "agent.wait", "agent.prompt"])
         log = (self.home / ".local" / "state" / "tstack" / "update.log").read_text().splitlines()
         self.assertEqual(log, [line.strip()])
 
@@ -81,6 +81,29 @@ class Update(Sandbox):
         self.seat_tile(assistant_entry(120), by_session_id=False)
         self.assertIn("demo:busy,retry", self.update().stdout)
         self.assertFalse(any("--force" in c for c in self.log_lines("easl.log")))
+
+    def restart_steps(self) -> list[str]:
+        return [c[0] for c in self.log_lines("easl.log") if c[0] != "agent.list"]
+
+    def test_a_failed_restart_prompt_is_sent_by_the_next_liveness_run_without_a_second_restart(self):
+        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
+        self.heartbeat(1)
+        (self.stubs / "easl-prompt-fail").touch()
+        self.assertIn("demo:restart prompt failed: easl agent.prompt: unavailable", self.update().stdout)
+        (self.stubs / "easl-prompt-fail").unlink()
+        live = self.cli("tstack", "check", "--liveness").stdout
+        self.assertIn("update restart demo:restarted(agents/projects/demo/AGENTS.md changed)", live)
+        self.assertEqual(self.restart_steps(), ["agent.restart", "agent.wait", "agent.prompt", "agent.wait", "agent.prompt"])
+        self.assertEqual(json.loads((self.home / ".local" / "state" / "tstack" / "restarts.json").read_text()), {})
+
+    def test_a_failed_restart_prompt_is_retried_by_the_next_update_without_a_second_restart(self):
+        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
+        self.heartbeat(1)
+        (self.stubs / "easl-prompt-fail").touch()
+        self.assertIn("demo:restart prompt failed", self.update().stdout)
+        (self.stubs / "easl-prompt-fail").unlink()
+        self.assertIn("demo:restarted(agents/projects/demo/AGENTS.md changed)", self.update().stdout)
+        self.assertEqual(self.restart_steps(), ["agent.restart", "agent.wait", "agent.prompt", "agent.wait", "agent.prompt"])
 
     def test_a_setup_failure_rolls_back_every_moved_repo_and_logs_it(self):
         engine_before, instance_before = git(self.engine, "rev-parse", "HEAD"), git(self.instance, "rev-parse", "HEAD")

@@ -99,5 +99,12 @@ def restart(board: dict, force: bool = False) -> None:
          host=board["host"], timeout=120)
 
 
+def wait_idle(board: dict, seconds: float = 90) -> None:
+    """Block until the seat's tile reports `idle`: after a restart, omp's easl integration has reconnected,
+    so a prompt goes to the agent instead of a surface no app shows. Raises when it does not get there."""
+    call("agent.wait", "--target", board["tile"], "--until", "idle", "--timeoutMs", str(int(seconds * 1000)),
+         host=board["host"], timeout=seconds + 30)
+
+
 def prompt(board: dict, text: str) -> None:
     call("agent.prompt", "--target", board["tile"], "--text", text, "--from", "tstack", host=board["host"])
