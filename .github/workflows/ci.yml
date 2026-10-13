@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Unit tests and static check
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+      - name: Static check
+        if: ${{ !cancelled() }}
+        run: |
+          HOME="$(mktemp -d)"
+          export HOME
+          trap 'rm -rf "$HOME"' EXIT
+          python3 bin/tstack setup --machine ci
+          python3 bin/tstack check --machine ci
