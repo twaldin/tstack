@@ -55,7 +55,7 @@ class GuardCheck(unittest.TestCase):
         return problems, len((self.root / "bin" / "calls.log").read_text().splitlines())
 
     def test_a_secret_check_call_is_not_taken_for_an_unblocked_read(self):
-        """Deckbox, 2026-10-13: the model checked the fixture with secret-check, which the guard allows and which
+        """A live smoke run, 2026-10-13: the model checked the fixture with secret-check, which the guard allows and which
         prints no value; the next run's `cat .env` was blocked."""
         checked = call("secret-check info file:.env", '{"spec": "file:.env", "exists": true, "length": 37}')
         blocked = call("cat .env", BLOCK, error=True)

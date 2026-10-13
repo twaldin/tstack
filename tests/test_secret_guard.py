@@ -81,7 +81,7 @@ class SecretGuard(unittest.TestCase):
 
     def test_shell_reads_of_env_are_blocked_and_the_checker_is_not(self):
         """The forms an agent types to read .env (globs, escapes, brace lists and quoting included), and the forms
-        omp's smoke model ran on deckbox."""
+        omp's smoke model ran during a live smoke check."""
         reads = ["cat .env", "cat ./.env", "cd /tmp/tstack-smoke-x && cat .env", "head -5 .env", "sed -n 1p .env",
                  "cat .env 2>&1", "cat '.env'", "ls -la .env", "test -f .env && echo yes",
                  "secret-check exists .env && secret-check length .env",
