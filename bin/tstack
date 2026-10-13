@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""tstack: set up a host for omp agents, check it, and run the seats' wait, gates, board and liveness."""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from tstacklib import board, install, ops, waiter  # noqa: E402
+from tstacklib.util import Die, find_seat, say  # noqa: E402
+
+COMMANDS = "setup,check,wait,gate,board,update"
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(prog="tstack", description=__doc__)
+    sub = top.add_subparsers(dest="cmd", required=True, metavar="{" + COMMANDS + "}")
+
+    p = sub.add_parser("setup", help="install this host's omp config from the engine and instance (idempotent)")
+    p.add_argument("--machine", help="machine name (default $TSTACK_MACHINE, else derived from hostname)")
+    p.add_argument("--dry-run", action="store_true", help="print what would change")
+    p.add_argument("--timers", action="store_true", help="macOS: also install the launchd timers")
+
+    p = sub.add_parser("check", help="static checks; --smoke runs headless omp; --liveness restarts stale seats")
+    p.add_argument("--smoke", action="store_true", help="headless omp: markers, skills, secret guard, --resume")
+    p.add_argument("--liveness", action="store_true", help="restart seats whose wait heartbeat is stale, then text")
+    p.add_argument("--machine")
+
+    p = sub.add_parser("wait", help="block until something needs the seat; print a batch of events")
+    p.add_argument("--seat")
+    p.add_argument("--ack", metavar="BATCH", help="mark BATCH handled, then wait again")
+
+    p = sub.add_parser("gate", help="gates.md: add, answer, list")
+    gates = p.add_subparsers(dest="gate_cmd", required=True, metavar="{add,answer,list}")
+    g = gates.add_parser("add", help="write an open gate and post a non-blocking easl ask")
+    g.add_argument("--id", required=True)
+    g.add_argument("--question", required=True)
+    g.add_argument("--options", required=True, help="e.g. 'a) ship now b) wait for review'")
+    g.add_argument("--default", required=True)
+    g.add_argument("--irreversible", action="store_true", help="the default must then be wait")
+    g.add_argument("--due", help="ISO time when the default applies")
+    g.add_argument("--seat")
+    g = gates.add_parser("answer", help="resolve a gate")
+    g.add_argument("id")
+    g.add_argument("text")
+    g.add_argument("--seat")
+    g = gates.add_parser("list", help="list gates")
+    g.add_argument("--open", action="store_true")
+    g.add_argument("--seat")
+
+    p = sub.add_parser("board", help="redraw the seat's keyed status tiles from state")
+    p.add_argument("--seat")
+
+    sub.add_parser("update", help="fast-forward the repos, rerun setup and check, restart seats whose files changed")
+    return top
+
+
+def main(argv) -> int:
+    args = parser().parse_args(argv)
+    if args.cmd == "setup":
+        for line in install.setup(args.machine, dry_run=args.dry_run, timers=args.timers):
+            print(line)
+        return 0
+    if args.cmd == "check":
+        if args.liveness:
+            for line in ops.liveness():
+                print(line)
+            return 0
+        problems = install.check(args.machine)
+        if args.smoke and not problems:
+            problems = install.smoke()
+        for line in problems:
+            print(line)
+        print(f"tstack check: {len(problems)} problem(s)" if problems else "tstack check: ok")
+        return 1 if problems else 0
+    if args.cmd == "wait":
+        return waiter.wait(find_seat(args.seat), args.ack)
+    if args.cmd == "gate":
+        seat = find_seat(args.seat)
+        if args.gate_cmd == "add":
+            gate = ops.gate_add(seat, args.id, args.question, args.options, args.default, args.irreversible, args.due)
+            print(f"{gate['id']} open" + (f", asked as {gate['Ask']}" if gate.get("Ask") else ", no board to ask on"))
+        elif args.gate_cmd == "answer":
+            ops.gate_answer(seat, args.id, args.text)
+            print(f"{args.id} resolved")
+        else:
+            for line in ops.gate_lines(seat, args.open):
+                print(line)
+        return 0
+    if args.cmd == "board":
+        for key in board.draw(find_seat(args.seat)):
+            print(key)
+        return 0
+    if args.cmd == "update":
+        code, line = ops.update(lambda: install.setup(None), lambda: install.check(None))
+        print(line)
+        return code
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Die as error:
+        say(f"tstack: {error}")
+        sys.exit(error.code)

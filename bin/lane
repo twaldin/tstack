@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""lane: run one task as a headless omp session that owns its PR until merge.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 busy (running, held or seat stopped: retry later),
+4 refused (terminal lane or a failed merge guard), 5 the lane is now stuck (two fix waves).
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from tstacklib import lanes  # noqa: E402
+from tstacklib.util import Die, find_seat, say  # noqa: E402
+
+COMMANDS = "start,resume,report,merge,list,show,hold,release,stop,cancel,supersede,clean"
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(prog="lane", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = top.add_subparsers(dest="cmd", required=True, metavar="{" + COMMANDS + "}")
+
+    def add(name, help_text):
+        p = sub.add_parser(name, help=help_text, description=help_text)
+        p.add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/)")
+        return p
+
+    p = add("start", "create the worktree and lane record, start the run detached, print the lane id")
+    p.add_argument("task")
+    p.add_argument("--brief", required=True, help="brief file; needs a TIMEBOX line unless --timebox")
+    p.add_argument("--project")
+    p.add_argument("--repo", help="OWNER/REPO (default: the project clone's origin)")
+    p.add_argument("--base", help="base branch (default: origin's default branch)")
+    p.add_argument("--playbook", default="build-feature")
+    p.add_argument("--model", default="@sol")
+    p.add_argument("--thinking", default="high")
+    p.add_argument("--timebox")
+    p.add_argument("--memory", default="8G", help="MemoryMax for the run's systemd unit (Linux)")
+
+    p = add("resume", "start a new turn of a parked lane with an event")
+    p.add_argument("id")
+    p.add_argument("text")
+    p.add_argument("--kind", help="event kind; check-failed counts a fix wave per --check")
+    p.add_argument("--check", action="append", default=[], help="failing check name (repeatable)")
+
+    p = add("report", "write report.json for the current run (called by the lane itself)")
+    p.add_argument("--lane", help="default $TSTACK_LANE")
+    p.add_argument("--status", default="waiting", choices=lanes.REPORT_STATUSES)
+    p.add_argument("--summary", required=True)
+    p.add_argument("--pr")
+    p.add_argument("--head")
+    p.add_argument("--waiting-on")
+    p.add_argument("--proof", action="append", default=[], metavar="CHECK=RESULT")
+
+    p = add("merge", "merge the lane's PR if proof, checks and mergeability hold for its current head")
+    p.add_argument("id", nargs="?")
+
+    p = add("list", "list lanes of the seat")
+    p.add_argument("--all", action="store_true", help="include lanes that ended more than a day ago")
+    p.add_argument("--json", action="store_true")
+
+    for name, help_text in (("show", "print lane.json and report.json"), ("hold", "pause resumes"),
+                            ("release", "allow resumes again"), ("stop", "kill the running process, keep state"),
+                            ("clean", "remove the worktree once the PR merged or closed and the tree is clean")):
+        add(name, help_text).add_argument("id")
+
+    p = add("cancel", "stop the lane and mark it cancelled (closes nothing on GitHub)")
+    p.add_argument("id")
+    p.add_argument("--reason")
+
+    p = add("supersede", "cancel the lane with a pointer to its replacement")
+    p.add_argument("id")
+    p.add_argument("--by", required=True)
+
+    p = sub.add_parser("_run")
+    p.add_argument("id")
+    p.add_argument("--seat", required=True)
+    p.add_argument("--run", type=int, required=True)
+    return top
+
+
+def main(argv) -> int:
+    args = parser().parse_args(argv)
+    seat = find_seat(args.seat)
+    if args.cmd == "start":
+        print(lanes.start(seat, args.task, Path(args.brief), args.project, args.repo, args.playbook, args.model,
+                          args.thinking, args.timebox, args.memory, args.base))
+    elif args.cmd == "_run":
+        return lanes.supervise(lanes.Lane(seat, args.id), args.run)
+    elif args.cmd == "resume":
+        number = lanes.resume(lanes.Lane(seat, args.id), args.text, args.kind, args.check)
+        print(f"{args.id} run {number}")
+    elif args.cmd == "report":
+        report = lanes.write_report(lanes.current_lane(seat, args.lane), args.status, args.summary, args.pr,
+                                    args.head, args.waiting_on, args.proof)
+        print(f"{report['lane']} {report['status']} (run {report['run']})")
+    elif args.cmd == "merge":
+        print(lanes.merge(lanes.current_lane(seat, args.id)))
+    elif args.cmd == "list":
+        rows = [(lane, lanes.reconcile(lane)) for lane in lanes.lanes(seat)]
+        rows = [(lane, rec) for lane, rec in rows if lanes.visible(rec, args.all)]
+        if args.json:
+            print(json.dumps([rec for _, rec in rows], indent=1))
+        else:
+            for lane, rec in rows:
+                print(lanes.summary_row(lane, rec))
+    elif args.cmd == "show":
+        print(lanes.describe(lanes.Lane(seat, args.id)))
+    elif args.cmd in ("hold", "release"):
+        lane = lanes.Lane(seat, args.id)
+        lane.mutate(lambda rec: rec.update(held=args.cmd == "hold"))
+        print(f"{args.id} {'held' if args.cmd == 'hold' else 'released'}")
+    elif args.cmd == "stop":
+        record = lanes.stop(lanes.Lane(seat, args.id))
+        print(f"{args.id} {record['status']}")
+    elif args.cmd == "cancel":
+        lanes.cancel(lanes.Lane(seat, args.id), args.reason)
+        print(f"{args.id} cancelled")
+    elif args.cmd == "supersede":
+        lanes.cancel(lanes.Lane(seat, args.id), None, superseded_by=args.by)
+        print(f"{args.id} cancelled, superseded by {args.by}")
+    elif args.cmd == "clean":
+        print(lanes.clean(lanes.Lane(seat, args.id)))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Die as error:
+        say(f"lane: {error}")
+        sys.exit(error.code)

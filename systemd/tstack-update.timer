@@ -1,0 +1,11 @@
+# Installed by tstack setup from @TSTACK_HOME@/systemd/. Edit the template, not this file.
+[Unit]
+Description=Run tstack update at boot and hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

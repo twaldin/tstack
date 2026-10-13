@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Installed by tstack setup from @TSTACK_HOME@/launchd/. Edit the template, not this file. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tstack.liveness</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@TSTACK_HOME@/bin/tstack</string>
+    <string>check</string>
+    <string>--liveness</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+    <key>TSTACK_HOME</key>
+    <string>@TSTACK_HOME@</string>
+    <key>TSTACK_INSTANCE</key>
+    <string>@TSTACK_INSTANCE@</string>
+    <key>TSTACK_MACHINE</key>
+    <string>@MACHINE@</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>@HOME@/.local/state/tstack/liveness.out</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/.local/state/tstack/liveness.out</string>
+</dict>
+</plist>

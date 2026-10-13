@@ -1,0 +1,112 @@
+// Keeps secret values out of agent transcripts on this machine.
+// - Blocks tool calls that would read a secret file or dump a secret store: `.env*` files (not
+//   .env.example/.sample/.template/.dist), private keys, gcloud credentials, `gcloud secrets
+//   versions access`, `kubectl get secret -o yaml/json`, bare `printenv`/`env`, keychain `-w`.
+// - Redacts `NAME=value` lines with secret-shaped names from every tool result, as a backstop.
+// Agents check secrets with `secret-check` (existence, length, hash prefix, compare, HTTP probe),
+// which never prints a value. This is a guard against accidents, not a sandbox: an agent that
+// sets out to evade it (encoding, renamed copies, custom programs) can.
+// @ts-nocheck
+
+const CHECKER = "secret-check";
+const HINT =
+  "Secret values must not enter the transcript. Use `secret-check` instead: " +
+  "`secret-check info env:<file>:<KEY>` / `gsm:<project>/<secret>[@version]` / `envvar:<NAME>` " +
+  "(exists, length, sha256 prefix), `secret-check compare <spec> <spec>`, " +
+  "`secret-check probe <spec> --url <url> --header 'Authorization: Bearer {}'` (HTTP status only).";
+
+const SAFE_ENV_SUFFIX = /^\.env\.(example|sample|template|dist)$/i;
+
+function isSecretPath(p: string): boolean {
+  const clean = p.replace(/:(raw|img|conflicts|\d[\d,+\-:]*)+$/i, "").replace(/\/+$/, "");
+  const base = clean.split("/").pop() ?? "";
+  if (/^\.env(\..+)?$/i.test(base) && !SAFE_ENV_SUFFIX.test(base)) return true;
+  if (/\.(pem|p12|pfx|key)$/i.test(base) && !/\.pub$/i.test(base)) return true;
+  if (/^id_(rsa|ecdsa|ed25519|dsa)$/.test(base)) return true;
+  if (/\/\.config\/gcloud\/.*(credentials|access_tokens|legacy_credentials)/i.test(clean)) return true;
+  if (/\/\.config\/gcloud\/(credentials\.db|access_tokens\.db|application_default_credentials\.json)$/i.test(clean)) return true;
+  return false;
+}
+
+// A `.env` path token inside free text (shell or code), e.g. `cat ~/app/.env`, `open('.env')`.
+const ENV_TOKEN = /(?:^|[\s'"`=/<(:])\.env(?:\.(?!example\b|sample\b|template\b|dist\b)[\w.-]+)?(?=$|[\s'"`;|&)>,])/i;
+const SHELL_DENY: Array<[RegExp, string]> = [
+  [/\bgcloud\s+secrets\s+versions\s+access\b/i, "gcloud secrets versions access"],
+  [/\bkubectl\s+get\s+secrets?\b[^|;&]*\s-o\s*=?\s*(yaml|json|jsonpath|go-template)/i, "kubectl get secret -o"],
+  [/(^|[;&|(]\s*|\bthen\s+|\bdo\s+)printenv\s*($|[;&|)])/, "bare printenv"],
+  [/(^|[;&|(]\s*)env\s*($|[;&|)])/, "bare env dump"],
+  [/\bprintenv\s+[A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|OAUTH)/i, "printenv of a secret variable"],
+  [/\b(?:echo|printf)\b[^|;&]*\$\{?[A-Z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|OAUTH)[A-Z0-9_]*/, "echo of a secret variable"],
+  [/\bsecurity\s+find-(generic|internet)-password\b[^|;&]*\s-w\b/, "keychain password -w"],
+  [/\/\.config\/gcloud\/[^\s'"]*(credentials|access_tokens)/i, "gcloud credential files"],
+  [/\b(?:cat|less|more|head|tail|bat|xxd|od|strings|base64)\b[^|;&]*\.(?:pem|p12|pfx)\b/i, "private key file"],
+  [/\b(?:cat|less|more|head|tail|bat|xxd|od|strings|base64)\b[^|;&]*\bid_(?:rsa|ecdsa|ed25519|dsa)\b(?!\.pub)/, "private key file"],
+];
+
+// The checker alone, with no chaining, redirection or subshell.
+const CHECKER_ONLY = new RegExp(`^\\s*(?:\\S*/)?${CHECKER}(?:\\s[^;&|\`$()<>]*)?$`);
+
+function shellReason(cmd: string): string | undefined {
+  if (CHECKER_ONLY.test(cmd)) return undefined;
+  if (ENV_TOKEN.test(cmd)) return "reads a .env file";
+  for (const [re, what] of SHELL_DENY) if (re.test(cmd)) return what;
+  return undefined;
+}
+
+function pathsOf(input: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const k of ["path", "file", "file_path", "paths"]) {
+    const v = input?.[k];
+    if (typeof v === "string") out.push(...v.split(";").map((s) => s.trim()).filter(Boolean));
+    else if (Array.isArray(v)) out.push(...v.filter((s) => typeof s === "string"));
+  }
+  return out;
+}
+
+// `NAME=value` / `export NAME=value` / `NAME: value` lines whose name looks like a secret.
+const SECRET_LINE =
+  /^(\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|CREDENTIALS?|PRIVATE|OAUTH|DSN|WEBHOOK)[A-Z0-9_]*\s*[=:]\s*)(["']?)([^\s"']{8,})\2\s*$/gm;
+
+function redact(text: string): string {
+  return text.replace(SECRET_LINE, (_m, head, q) => `${head}${q}[REDACTED by secret-guard]${q}`);
+}
+
+export default function secretGuard(pi) {
+  pi.on("tool_call", async (event) => {
+    const name = String(event.toolName ?? "");
+    const input = event.input ?? {};
+    if (name === "bash") {
+      const why = shellReason(String(input.command ?? ""));
+      if (why) return { block: true, reason: `secret-guard blocked this command (${why}). ${HINT}` };
+      return;
+    }
+    if (name === "eval") {
+      const code = String(input.code ?? "");
+      if (ENV_TOKEN.test(code) || /\bgcloud\s+secrets\s+versions\s+access\b/i.test(code))
+        return { block: true, reason: `secret-guard blocked this cell (reads a .env file or secret store). ${HINT}` };
+      return;
+    }
+    const hit = pathsOf(input).find(isSecretPath);
+    if (hit) return { block: true, reason: `secret-guard blocked ${name} on ${hit} (secret file). ${HINT}` };
+    if ((name === "grep" || name === "find") && input.gitignore === false)
+      return {
+        block: true,
+        reason: "secret-guard blocked a search with gitignore:false (it can reach .env files). Search without it, or name the files.",
+      };
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (!Array.isArray(event.content)) return;
+    let changed = false;
+    const content = event.content.map((chunk) => {
+      if (chunk?.type !== "text" || typeof chunk.text !== "string") return chunk;
+      const text = redact(chunk.text);
+      if (text === chunk.text) return chunk;
+      changed = true;
+      return { ...chunk, text };
+    });
+    if (changed) return { content };
+  });
+}
+
+export const _test = { isSecretPath, shellReason, redact };

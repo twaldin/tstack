@@ -1,0 +1,548 @@
+"""Lanes: headless omp runs of one task each, their records, reports, merge guard and supervisor."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from . import prwatch
+from .seat import stop_reason
+from .util import (ENGINE, HOME, IS_MAC, Die, age, engine_home, flock, git, instance_home, iso, lock_is_held, machine, money,
+                   read_json, run, short_age, worktrees_root, write_atomic, write_json)
+
+STATUSES = {"running", "waiting", "done", "stuck", "failed", "cancelled"}
+TERMINAL = {"done", "stuck", "failed", "cancelled"}
+REPORT_STATUSES = ("waiting", "done", "stuck", "failed")
+NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+SPAWN_GRACE = 60
+MAX_WAVES = 2
+EXIT_BUSY, EXIT_REFUSED, EXIT_STUCK = 3, 4, 5
+PASS_ENV = ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SSH_AUTH_SOCK", "EASL_SOCKET",
+            "TSTACK_HOME", "TSTACK_INSTANCE", "TSTACK_WORKTREES", "TSTACK_MACHINE")
+
+
+class Lane:
+    def __init__(self, seat: Path, lane_id: str):
+        if not NAME.fullmatch(lane_id or ""):
+            raise Die(f"bad lane id {lane_id!r}")
+        self.seat, self.id = seat, lane_id
+        self.dir = seat / "state" / "lanes" / lane_id
+        self.run_dir = seat / "state" / "run" / "lanes" / lane_id
+        self.record_path = self.dir / "lane.json"
+        self.report_path = self.dir / "report.json"
+        self.lock = self.run_dir / "lock"
+
+    def exists(self) -> bool:
+        return self.record_path.exists()
+
+    def load(self) -> dict:
+        record = read_json(self.record_path)
+        if not isinstance(record, dict):
+            raise Die(f"no lane {self.id} in {self.seat}")
+        return record
+
+    def save(self, record: dict) -> None:
+        record["updated"] = iso()
+        write_json(self.record_path, record)
+
+    def mutate(self, change) -> dict:
+        """Read-modify-write lane.json under the record lock (short; distinct from the run lock)."""
+        with flock(self.run_dir / "record.lock"):
+            record = self.load()
+            change(record)
+            self.save(record)
+            return record
+
+    def report(self) -> dict | None:
+        return read_json(self.report_path)
+
+    def run_log(self, number: int) -> Path:
+        return self.run_dir / f"run-{number}.jsonl"
+
+    def running(self, record: dict) -> bool:
+        """The run lock is held, or a run was handed to the launcher moments ago and has not taken it yet."""
+        return lock_is_held(self.lock) or starting(record)
+
+
+def starting(record: dict) -> bool:
+    last = (record.get("runs") or [{}])[-1]
+    since = age(last.get("start"))
+    return record.get("status") == "running" and not last.get("end") and since is not None and since < SPAWN_GRACE
+
+
+def lanes(seat: Path) -> list[Lane]:
+    root = seat / "state" / "lanes"
+    return [Lane(seat, p.name) for p in sorted(root.iterdir()) if (p / "lane.json").exists()] if root.is_dir() else []
+
+
+def current_lane(seat: Path, explicit: str | None) -> Lane:
+    lane_id = explicit or os.environ.get("TSTACK_LANE")
+    if not lane_id:
+        raise Die("no lane: pass an id or --lane, or run inside a lane (TSTACK_LANE)")
+    return Lane(seat, lane_id)
+
+
+# omp json stream
+
+def parse_log(path: Path) -> tuple[str | None, float]:
+    """Session id and the summed usage.cost.total of assistant messages in an omp --mode json stream."""
+    session, cost = None, 0.0
+    if not path.exists():
+        return session, cost
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "session" and not session:
+            session = event.get("id")
+        message = event.get("message") or {}
+        if event.get("type") == "message_end" and message.get("role") == "assistant":
+            cost += float(((message.get("usage") or {}).get("cost") or {}).get("total") or 0)
+    return session, round(cost, 6)
+
+
+def session_path(session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    hits = sorted((HOME / ".omp" / "agent" / "sessions").glob(f"*/*_{session_id}.jsonl"))
+    return str(hits[-1]) if hits else None
+
+
+# composing and launching runs
+
+def project_pipeline(project: str) -> Path:
+    return instance_home() / "projects" / project / "pipeline.md"
+
+
+def compose_prompt(lane: Lane, record: dict) -> Path:
+    parts = [engine_home() / "roles" / "lane.md", engine_home() / "playbooks" / f"{record['playbook']}.md"]
+    for part in parts:
+        if not part.exists():
+            raise Die(f"missing {part}")
+    pipeline = project_pipeline(record["project"])
+    if pipeline.exists():
+        parts.append(pipeline)
+    parts.append(lane.dir / "brief.md")
+    header = (f"# Lane {lane.id}\n\nWorktree: {record['worktree']}\nBranch: {record['branch']} (base {record['base']})\n"
+              f"Repo: {record.get('repo') or 'see the brief'}\n")
+    text = header + "".join(f"\n<!-- {part} -->\n\n{part.read_text().strip()}\n" for part in parts)
+    path = lane.run_dir / "prompt.md"
+    write_atomic(path, text)
+    return path
+
+
+def launcher() -> str:
+    return os.environ.get("TSTACK_LAUNCHER") or ("process" if IS_MAC else "systemd")
+
+
+def unit_name(lane: Lane) -> str:
+    return f"tstack-lane-{lane.id}"
+
+
+def spawn(lane: Lane, record: dict, number: int, kind: str) -> None:
+    """Start the supervisor for run `number` detached."""
+    env = {k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}
+    env.update(TSTACK_LANE=lane.id, TSTACK_SEAT=str(lane.seat), TSTACK_HOME=str(engine_home()))
+    command = [sys.executable, str(ENGINE / "bin" / "lane"), "_run", lane.id, "--seat", str(lane.seat), "--run", str(number)]
+    lane.run_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "systemd":
+        argv = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit_name(lane)}",
+                "-p", f"MemoryMax={record['memory']}"]
+        cpus = run(["systemctl", "show", "agents.slice", "-p", "AllowedCPUs", "--value"], check=False).stdout.strip()
+        if cpus:
+            argv += ["-p", f"CPUAffinity={cpus}"]
+        argv += [f"--setenv={k}={v}" for k, v in env.items()]
+        run(argv + command, timeout=60)
+    else:
+        with open(lane.run_dir / "supervisor.log", "a") as log:
+            subprocess.Popen(command, env={**os.environ, **env}, stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+
+
+def begin_run(lane: Lane, event: str, text: str, change=None) -> int:
+    """Apply `change`, append a run, mark the lane running and launch it. Caller holds the run lock."""
+    kind, seen = launcher(), {}
+
+    def apply(record):
+        if change:
+            change(record)
+        seen.update(number=len(record["runs"]) + 1, status=record["status"], reason=record.get("reason"))
+        record["runs"].append({"run": seen["number"], "event": event, "start": iso(), "launcher": kind})
+        record["status"], record["reason"] = "running", None
+
+    record = lane.mutate(apply)
+    write_atomic(lane.run_dir / f"run-{seen['number']}.event", text)
+    try:
+        spawn(lane, record, seen["number"], kind)
+    except Die as error:
+        why = f"launch failed: {error}"
+
+        def undo(rec):
+            rec["runs"].pop()
+            rec["status"], rec["reason"] = seen["status"], why
+        lane.mutate(undo)
+        raise
+    return seen["number"]
+
+
+def omp_argv(record: dict, prompt: Path, text: str, resume: bool) -> list[str]:
+    argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
+            "--append-system-prompt", str(prompt)]
+    if resume:
+        argv += ["--resume", record["session"]]
+    return argv + [text]
+
+
+def supervise(lane: Lane, number: int) -> int:
+    """`lane _run`: hold the run lock, run omp, record exit, cost, session and the report outcome."""
+    with flock(lane.lock, timeout=SPAWN_GRACE) as held:
+        if not held:
+            print(f"lane {lane.id}: run lock busy, run {number} not started", file=sys.stderr)
+            return 1
+        record = lane.load()
+        last = record["runs"][-1]
+        if last["run"] != number or last.get("end"):
+            return 0
+        write_atomic(lane.run_dir / "pid", f"{os.getpid()}\n")
+        text = (lane.run_dir / f"run-{number}.event").read_text()
+        prompt = compose_prompt(lane, record)
+        argv = omp_argv(record, prompt, text, resume=last["event"] != "start")
+        env = {**os.environ, "TSTACK_LANE": lane.id, "TSTACK_SEAT": str(lane.seat)}
+        stopped = []
+        with open(lane.run_log(number), "w") as log, open(lane.run_dir / f"run-{number}.err", "w") as err:
+            try:
+                proc = subprocess.Popen(argv, cwd=record["worktree"], env=env, stdout=subprocess.PIPE,
+                                        stderr=err, stdin=subprocess.DEVNULL, text=True)
+            except OSError as error:
+                err.write(f"could not start omp: {error}\n")
+                proc = None
+
+            def stop(signum, _frame):
+                stopped.append(signum)
+                if proc and proc.poll() is None:
+                    proc.terminate()
+
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, stop)
+            if proc:
+                for line in iter(proc.stdout.readline, ""):
+                    log.write(line)
+                    log.flush()
+                    if not record.get("session") and '"session"' in line[:30]:
+                        session = session_path(json.loads(line).get("id"))
+                        if session:
+                            record = lane.mutate(lambda rec: rec.update(session=session))
+                code = proc.wait()
+            else:
+                code = 127
+        finish_run(lane, number, code, stopped=bool(stopped))
+        (lane.run_dir / "pid").unlink(missing_ok=True)
+    return 0
+
+
+def finish_run(lane: Lane, number: int, code, stopped: bool = False) -> dict:
+    session_id, cost = parse_log(lane.run_log(number))
+    session = session_path(session_id)
+    report = lane.report()
+    reported = isinstance(report, dict) and report.get("run") == number
+
+    def change(record):
+        entry = next(r for r in record["runs"] if r["run"] == number)
+        entry.update(end=iso(), exit=code, cost_usd=cost)
+        record["session"] = session or record.get("session")
+        record["cost_usd"] = round(sum(r.get("cost_usd") or 0 for r in record["runs"]), 6)
+        if record["status"] != "running":
+            return
+        if reported:
+            record["status"], record["reason"] = report["status"], None
+            record["pr"] = report.get("pr") or record.get("pr")
+        elif stopped:
+            record["status"], record["reason"] = "waiting", "stopped"
+        else:
+            record["status"], record["reason"] = "failed", "exited without report"
+
+    record = lane.mutate(change)
+    if reported:
+        report["cost_usd"] = cost
+        write_json(lane.report_path, report)
+    return record
+
+
+def reconcile(lane: Lane, locked: bool = False) -> dict:
+    """A record says running but nothing holds the run lock past the spawn grace: the run died unrecorded.
+    `locked`: the caller holds the run lock already."""
+    record = lane.load()
+    if record.get("status") != "running" or starting(record):
+        return record
+    if not locked:
+        with flock(lane.lock, blocking=False) as held:
+            return reconcile(lane, locked=True) if held else lane.load()
+    last = (record.get("runs") or [{}])[-1]
+    if not last or last.get("end"):
+        return lane.mutate(lambda rec: rec.update(status="failed", reason="run ended unrecorded"))
+    return finish_run(lane, last["run"], "lost")
+
+
+# commands
+
+def seat_project(seat: Path) -> str | None:
+    projects = (instance_home() / "projects").resolve()
+    try:
+        return seat.resolve().relative_to(projects).parts[0]
+    except (ValueError, IndexError):
+        return None
+
+
+def origin_slug(repo: Path) -> str | None:
+    url = git(repo, "remote", "get-url", "origin", check=False)
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    return match.group(1) if match else None
+
+
+def default_base(repo: Path) -> str:
+    ref = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    return ref.split("/", 1)[1] if ref.startswith("origin/") else "main"
+
+
+def start(seat: Path, task: str, brief: Path, project: str | None, repo: str | None, playbook: str,
+          model: str, thinking: str, timebox: str | None, memory: str, base: str | None) -> str:
+    reason = stop_reason(seat)
+    if reason:
+        raise Die(f"seat is stopped (orders.md: STOP: {reason})", EXIT_BUSY)
+    if not NAME.fullmatch(task):
+        raise Die(f"task id {task!r} must be lowercase letters, digits and dashes")
+    project = project or seat_project(seat)
+    if not project:
+        raise Die("--project is required outside a project seat")
+    if not (engine_home() / "playbooks" / f"{playbook}.md").exists():
+        raise Die(f"no playbook {playbook}")
+    main = worktrees_root() / project / "main"
+    if not (main / ".git").exists():
+        raise Die(f"no project clone at {main}")
+    text = Path(brief).read_text()
+    match = re.search(r"^TIMEBOX:\s*(\S.*?)\s*$", text, re.M)
+    if not match and not timebox:
+        raise Die("the brief needs a `TIMEBOX: <duration>` line (or pass --timebox)")
+    if not match:
+        text = text.rstrip("\n") + f"\n\nTIMEBOX: {timebox}\n"
+    base = base or default_base(main)
+    prefix = f"{project}-{task}-"
+    taken = [int(p.name[len(prefix):]) for p in (seat / "state" / "lanes").glob(prefix + "*")
+             if p.name[len(prefix):].isdigit()]
+    lane = Lane(seat, f"{prefix}{max(taken, default=0) + 1}")
+    worktree = worktrees_root() / project / lane.id
+    git(main, "fetch", "--quiet", "origin", base, timeout=300)
+    git(main, "worktree", "add", "--quiet", "-b", f"lane/{lane.id}", str(worktree), f"origin/{base}")
+    write_atomic(lane.dir / "brief.md", text)
+    record = {"id": lane.id, "project": project, "task": task, "seat": str(seat), "host": machine(),
+              "repo": repo or origin_slug(main), "worktree": str(worktree), "branch": f"lane/{lane.id}", "base": base,
+              "playbook": playbook, "model": model, "thinking": thinking, "timebox": timebox or match.group(1),
+              "memory": memory, "session": None, "status": "failed", "reason": "not started", "held": False, "pr": None,
+              "waves": {}, "runs": [], "cost_usd": 0, "created": iso()}
+    kickoff = (f"You are lane {lane.id}. Your brief and the lane protocol are in your system prompt; the brief is also at "
+               f"{lane.dir / 'brief.md'}. Work in {worktree} on branch lane/{lane.id}. Start now.")
+    with flock(lane.lock, blocking=False) as held:
+        if not held:
+            raise Die(f"lane {lane.id} is locked", EXIT_BUSY)
+        lane.save(record)
+        compose_prompt(lane, record)
+        begin_run(lane, "start", kickoff)
+    return lane.id
+
+
+def resume(lane: Lane, text: str, kind: str | None, checks: list[str]) -> int:
+    """Exit codes for callers: EXIT_BUSY retry later, EXIT_REFUSED drop the event, EXIT_STUCK lane is now stuck."""
+    with flock(lane.lock, blocking=False) as held:
+        if not held:
+            raise Die(f"lane {lane.id} is running", EXIT_BUSY)
+        record = reconcile(lane, locked=True)
+        if starting(record):
+            raise Die(f"lane {lane.id} is starting", EXIT_BUSY)
+        if record.get("held"):
+            raise Die(f"lane {lane.id} is held", EXIT_BUSY)
+        reason = stop_reason(lane.seat)
+        if reason:
+            raise Die(f"seat is stopped (orders.md: STOP: {reason})", EXIT_BUSY)
+        if record["status"] in TERMINAL:
+            raise Die(f"lane {lane.id} is {record['status']}", EXIT_REFUSED)
+        if not record.get("session"):
+            raise Die(f"lane {lane.id} has no session to resume", EXIT_REFUSED)
+        if kind == "check-failed" and not checks:
+            raise Die("--kind check-failed needs --check NAME")
+        exhausted = [c for c in checks if record["waves"].get(c, 0) >= MAX_WAVES] if kind == "check-failed" else []
+        if exhausted:
+            why = f"{', '.join(exhausted)} failed after {MAX_WAVES} fix waves"
+            lane.mutate(lambda rec: rec.update(status="stuck", reason=why))
+            raise Die(f"lane {lane.id} is stuck: {why}", EXIT_STUCK)
+
+        def count_waves(rec):
+            for check in checks if kind == "check-failed" else []:
+                rec["waves"][check] = rec["waves"].get(check, 0) + 1
+        return begin_run(lane, kind or "resume", text, count_waves)
+
+
+def write_report(lane: Lane, status: str, summary: str, pr: str | None, head: str | None,
+                 waiting_on: str | None, proofs: list[str]) -> dict:
+    record = lane.load()
+    if status not in REPORT_STATUSES:
+        raise Die(f"--status must be one of {', '.join(REPORT_STATUSES)}")
+    if not summary.strip():
+        raise Die("--summary is required")
+    if status == "waiting" and not waiting_on:
+        raise Die("--status waiting needs --waiting-on")
+    if pr:
+        prwatch.parse_url(pr)
+    if head and not re.fullmatch(r"[0-9a-f]{7,40}", head):
+        raise Die("--head must be a commit SHA")
+    proof = []
+    for item in proofs:
+        check, sep, result = item.partition("=")
+        if not sep or not check.strip() or not result.strip():
+            raise Die(f"--proof {item!r} must be CHECK=RESULT")
+        if not head:
+            raise Die("--proof needs --head: proof is for one commit")
+        proof.append({"check": check.strip(), "result": result.strip(), "head": head})
+    report = {"lane": lane.id, "status": status, "summary": summary.strip(), "waiting_on": waiting_on,
+              "pr": pr or record.get("pr"), "head": head, "proof": proof, "cost_usd": None, "at": iso(),
+              "run": (record.get("runs") or [{"run": 0}])[-1]["run"]}
+    write_json(lane.report_path, report)
+    if pr:
+        lane.mutate(lambda rec: rec.update(pr=pr))
+    return report
+
+
+def merge_reserved(project: str) -> bool:
+    pipeline = project_pipeline(project)
+    return pipeline.exists() and re.search(r"^merge:\s*operator\b", pipeline.read_text(), re.M | re.I) is not None
+
+
+def merge(lane: Lane) -> str:
+    """Hard merge guard (review F12): proof for the current head, open, mergeable, all checks passed."""
+    record = lane.load()
+    reason = stop_reason(lane.seat)
+    if reason:
+        raise Die(f"seat is stopped (orders.md: STOP: {reason})", EXIT_REFUSED)
+    if merge_reserved(record["project"]):
+        raise Die(f"{record['project']} pipeline says `merge: operator`: the operator merges this PR, not the lane", EXIT_REFUSED)
+    report = lane.report()
+    if not isinstance(report, dict) or not report.get("pr"):
+        raise Die("no report with a PR: run `lane report --pr URL --head SHA --proof CHECK=pass` first", EXIT_REFUSED)
+    url = report["pr"]
+    try:
+        pr = prwatch.view(url, "state,isDraft,mergeable,mergeStateStatus,headRefOid,headRefName,statusCheckRollup")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as error:
+        raise Die(f"gh pr view {url} failed: {error}")
+    head = pr["headRefOid"]
+    if pr["state"] != "OPEN":
+        raise Die(f"PR is {pr['state'].lower()}, not open", EXIT_REFUSED)
+    if pr.get("isDraft"):
+        raise Die("PR is a draft", EXIT_REFUSED)
+    if pr.get("headRefName") and pr["headRefName"] != record["branch"]:
+        raise Die(f"PR head branch {pr['headRefName']} is not this lane's branch {record['branch']}", EXIT_REFUSED)
+    proofs = [p for p in report.get("proof", []) if p.get("head") == head]
+    if not proofs:
+        raise Die(f"no proof for the PR's current head {head[:12]}: prove it, then "
+                  f"`lane report --head {head[:12]} --proof CHECK=pass`", EXIT_REFUSED)
+    failed = [p["check"] for p in proofs if p["result"].lower() != "pass"]
+    if failed:
+        raise Die(f"proof for {head[:12]} did not pass: {', '.join(failed)}", EXIT_REFUSED)
+    if pr["mergeable"] != "MERGEABLE":
+        raise Die(f"PR is not mergeable ({pr['mergeable']}, {pr['mergeStateStatus']})", EXIT_REFUSED)
+    verdict = prwatch.classify(pr)
+    if verdict != "green":
+        detail = ", ".join(prwatch.failing_checks(pr)) or "checks still running"
+        raise Die(f"checks on {head[:12]} are {verdict}: {detail}", EXIT_REFUSED)
+    if pr["mergeStateStatus"] in ("BEHIND", "DIRTY"):
+        raise Die(f"PR merge state is {pr['mergeStateStatus']}: rebase onto {record['base']} first", EXIT_REFUSED)
+    argv = ["gh", "pr", "merge", url, "--squash", "--delete-branch", "--match-head-commit", head]
+    armed = pr["mergeStateStatus"] == "BLOCKED"
+    run(argv + (["--auto"] if armed else []), timeout=120)
+    lane.mutate(lambda rec: rec.update(merge={"head": head, "at": iso(), "auto": armed}))
+    return f"{'auto-merge armed' if armed else 'merged'}: {url} at {head[:12]}"
+
+
+def stop(lane: Lane, wait: float = 30) -> dict:
+    record = lane.load()
+    if not lane.running(record):
+        return reconcile(lane)
+    last = record["runs"][-1]
+    if last.get("launcher") == "systemd":
+        run(["systemctl", "--user", "stop", unit_name(lane)], check=False, timeout=120)
+    else:
+        pid_text = (lane.run_dir / "pid").read_text().strip() if (lane.run_dir / "pid").exists() else ""
+        if pid_text:
+            try:
+                os.killpg(int(pid_text), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + wait
+    while lock_is_held(lane.lock) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if lock_is_held(lane.lock):
+        raise Die(f"lane {lane.id} did not stop within {wait:g}s")
+    return reconcile(lane)
+
+
+def cancel(lane: Lane, reason: str | None, superseded_by: str | None = None) -> dict:
+    stop(lane)
+
+    def change(record):
+        record["status"] = "cancelled"
+        record["reason"] = reason or (f"superseded by {superseded_by}" if superseded_by else "cancelled")
+        if superseded_by:
+            record["superseded_by"] = superseded_by
+    return lane.mutate(change)
+
+
+def clean(lane: Lane) -> str:
+    record = reconcile(lane)
+    if lane.running(record):
+        raise Die(f"lane {lane.id} is running", EXIT_BUSY)
+    worktree = Path(record["worktree"])
+    if not worktree.exists():
+        raise Die(f"{worktree} is already gone")
+    if record.get("pr"):
+        state = prwatch.view(record["pr"], "state")["state"]
+        if state not in ("MERGED", "CLOSED"):
+            raise Die(f"PR is {state.lower()}; clean waits for merged or closed", EXIT_REFUSED)
+    elif record["status"] not in ("done", "failed", "cancelled"):
+        raise Die(f"lane is {record['status']} with no PR", EXIT_REFUSED)
+    dirty = git(worktree, "status", "--porcelain")
+    if dirty:
+        raise Die(f"{worktree} has uncommitted changes:\n{dirty}", EXIT_REFUSED)
+    main = worktrees_root() / record["project"] / "main"
+    git(main, "worktree", "remove", str(worktree))
+    lane.mutate(lambda rec: rec.update(cleaned=iso()))
+    return f"removed {worktree} (branch {record['branch']} kept)"
+
+
+def summary_row(lane: Lane, record: dict) -> str:
+    runs = record.get("runs") or []
+    since = runs[-1].get("end") or runs[-1].get("start") if runs else record.get("created")
+    flags = " held" if record.get("held") else ""
+    reason = f"  ({record['reason']})" if record.get("reason") else ""
+    return (f"{lane.id}\t{record['status']}{flags}\trun {len(runs)}\t{money(record.get('cost_usd'))}\t"
+            f"{short_age(since)}\t{record.get('pr') or '-'}{reason}")
+
+
+def visible(record: dict, show_all: bool) -> bool:
+    if show_all or record["status"] not in TERMINAL:
+        return True
+    return (age(record.get("updated")) or 0) < 86400
+
+
+def describe(lane: Lane) -> str:
+    record = reconcile(lane)
+    report = lane.report()
+    out = json.dumps(record, indent=1)
+    if report:
+        out += "\n\nreport.json:\n" + json.dumps(report, indent=1)
+    return out
+

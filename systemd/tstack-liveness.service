@@ -1,0 +1,11 @@
+# Installed by tstack setup from @TSTACK_HOME@/systemd/. Edit the template, not this file.
+[Unit]
+Description=tstack liveness: restart seats whose wait stopped polling
+
+[Service]
+Type=oneshot
+Environment=PATH=@PATH@
+Environment=TSTACK_HOME=@TSTACK_HOME@
+Environment=TSTACK_INSTANCE=@TSTACK_INSTANCE@
+Environment=TSTACK_MACHINE=@MACHINE@
+ExecStart=@TSTACK_HOME@/bin/tstack check --liveness
