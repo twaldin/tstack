@@ -30,7 +30,18 @@ Requirements: git, Python 3.9 or newer, `gh` logged in, omp, and easl (the Mac a
 2. Preview, then apply: `~/tstack/bin/tstack setup --dry-run`, then `~/tstack/bin/tstack setup`. Pass `--machine <name>` when `hostname -s` is not the machine's name in the instance, and `--timers` on macOS to install the launchd timers. Setup moves anything it replaces into `~/.cleanup-quarantine/<date>/` and never deletes.
 3. Check: `tstack check --smoke`. It runs a headless omp session and asserts that the global rules, a role, an appended playbook, the skills and the secret guard all load.
 
-Paths are overridable with `TSTACK_HOME`, `TSTACK_INSTANCE` and `TSTACK_MACHINE`.
+| Environment variable | Default | Overrides |
+|---|---|---|
+| `TSTACK_HOME` | the checkout the CLIs run from, normally `~/tstack` | where roles, playbooks and `global.md` are read |
+| `TSTACK_INSTANCE` | `~/agents` | the instance repo |
+| `TSTACK_MACHINE` | `hostname -s`, matched to a directory in the instance's `machines/` | the machine name; `--machine` sets it too |
+| `TSTACK_WORKTREES` | `~/worktrees` | where project clones and lane worktrees live |
+| `TSTACK_SEAT` | the nearest ancestor of the cwd that has `state/` | the seat; `--seat` wins; `lane` sets it for each run |
+| `TSTACK_LANE` | none; `lane` sets it for each run | the lane `lane report` and `lane merge` act on |
+| `TSTACK_LAUNCHER` | `systemd` on Linux, `process` on macOS | how `lane` starts a run: `systemd-run --user` or a detached process |
+| `TSTACK_WAIT_POLL` | `60` | seconds between `tstack wait` polls |
+| `TSTACK_WAIT_BATCH` | `180` | seconds `tstack wait` holds non-urgent events to batch them |
+| `TSTACK_SMOKE_MODEL` | `@tiny` | the model `tstack check --smoke` runs |
 
 ## Starting a seat
 

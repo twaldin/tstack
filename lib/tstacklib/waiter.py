@@ -20,6 +20,7 @@ from .util import Die, age, flock, iso, money, parse_iso, read_json, say, write_
 
 URGENT_SOURCES = {"text", "operator"}
 FIRST_SIGHT_DAYS = 7
+RUN_GRACE = dt.timedelta(seconds=60)
 
 
 def digest(*parts: str) -> str:
@@ -28,6 +29,24 @@ def digest(*parts: str) -> str:
 
 def event(kind: str, text: str, urgent: bool, key: str) -> dict:
     return {"id": f"ev-{digest(kind, key)}", "kind": kind, "text": " ".join(text.split()), "urgent": urgent, "at": iso()}
+
+
+def lane_authored(record: dict, me: str):
+    """Lanes and the operator share one gh login, so attribute by time: activity by that login inside one of
+    the lane's run windows (start .. end + 60 s, or start .. now while running) is the lane's own."""
+    current = dt.datetime.now(dt.timezone.utc)
+    windows = [(parse_iso(r["start"]), parse_iso(r["end"]) + RUN_GRACE if r.get("end") else current)
+               for r in record.get("runs", []) if r.get("start")]
+
+    def own(author: str | None, at: str | None) -> bool:
+        if author != me or not at:
+            return False
+        try:
+            when = parse_iso(at)
+        except ValueError:
+            return False
+        return any(start <= when <= end for start, end in windows)
+    return own
 
 
 class Waiter:
@@ -72,13 +91,15 @@ class Waiter:
     def prs(self) -> list[dict]:
         """PR events for waiting lanes resume the lane directly, one resume per lane per poll."""
         cursors = self.cursors.setdefault("prs", {})
+        me = None
         for lane in lanes.lanes(self.seat):
             record = lane.load()
             if record["status"] != "waiting" or not record.get("pr"):
                 continue
             snap = prwatch.snapshot(record["pr"])
             old = (cursors.get(lane.id) or {}).get("fp")
-            happened = prwatch.actionable(old, snap)
+            me = me or prwatch.viewer()
+            happened = prwatch.actionable(old, snap, lane_authored(record, me))
             if not happened:
                 cursors[lane.id] = {"fp": snap}
                 continue

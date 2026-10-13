@@ -14,7 +14,7 @@ EVENT_FIELDS = ("headRefOid,headRefName,state,isDraft,mergeable,mergeStateStatus
 THREADS_QUERY = """query($o:String!,$r:String!,$n:Int!,$endCursor:String){
   repository(owner:$o,name:$r){pullRequest(number:$n){
     reviewThreads(first:100,after:$endCursor){
-      nodes{id,isResolved,comments(last:1){nodes{updatedAt}}}
+      nodes{id,isResolved,comments(last:1){nodes{updatedAt,createdAt,author{login}}}}
       pageInfo{hasNextPage,endCursor}
     }
   }}
@@ -71,13 +71,13 @@ def fingerprint(pr: dict, threads) -> dict:
         ], key=lambda item: item["a"]),
         "reviewCount": len(pr.get("reviews", [])),
         "reviewEvents": sorted([
-            {"i": item.get("id", "?"), "s": item["state"],
+            {"i": item.get("id", "?"), "s": item["state"], "a": login(item),
              "u": item.get("submittedAt", "?"), "b": body_digest(item)}
             for item in pr.get("reviews", [])
         ], key=lambda item: item["i"]),
         "comments": sorted([
-            {"i": item.get("id", "?"), "u": item.get("updatedAt") or item.get("createdAt", "?"),
-             "b": body_digest(item)}
+            {"i": item.get("id", "?"), "a": login(item), "c": item.get("createdAt", "?"),
+             "u": item.get("updatedAt") or item.get("createdAt", "?"), "b": body_digest(item)}
             for item in pr.get("comments", [])
         ], key=lambda item: item["i"]),
         "reviewRequests": sorted(item.get("login") or item.get("name", "?")
@@ -114,20 +114,31 @@ def threads(url: str) -> list[dict]:
     owner, repo, number = parse_url(url)
     pages = gh_json(["api", "graphql", "--paginate", "--slurp", "-f", f"query={THREADS_QUERY}",
                      "-f", f"o={owner}", "-f", f"r={repo}", "-F", f"n={number}"])
-    return sorted([
-        {"i": item["id"], "r": item["isResolved"],
-         "u": next(iter(item["comments"]["nodes"]), {}).get("updatedAt", "")}
-        for page in pages
-        for item in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-    ], key=lambda item: item["i"])
+    rows = []
+    for page in pages:
+        for item in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+            last = next(iter(item["comments"]["nodes"]), {})
+            rows.append({"i": item["id"], "r": item["isResolved"], "u": last.get("updatedAt", ""),
+                         "a": login(last), "c": last.get("createdAt", "")})
+    return sorted(rows, key=lambda item: item["i"])
+
+
+def login(item: dict) -> str:
+    return (item.get("author") or {}).get("login", "?")
+
+
+def viewer() -> str:
+    """The login gh is authenticated as: lanes and the operator share it."""
+    return gh_json(["api", "user"])["login"]
 
 
 def snapshot(url: str) -> dict:
     return fingerprint(view(url), threads(url))
 
 
-def actionable(old: dict | None, new: dict) -> list[str]:
-    """What a waiting lane must hear about, comparing the last handled snapshot with this one."""
+def actionable(old: dict | None, new: dict, own=lambda author, at: False) -> list[str]:
+    """What a waiting lane must hear about, comparing the last handled snapshot with this one.
+    `own(author, at)` says a comment, review or thread reply is the lane's own; those never wake it."""
     if new["state"] == "MERGED":
         return ["merged"]
     if new["state"] == "CLOSED":
@@ -139,13 +150,25 @@ def actionable(old: dict | None, new: dict) -> list[str]:
     conflict = new["mergeable"] == "CONFLICTING" or new["mergeState"] == "DIRTY"
     if conflict and (old is None or not (old["mergeable"] == "CONFLICTING" or old["mergeState"] == "DIRTY")):
         events.append("conflict")
-    if old is not None:
-        seen_reviews = {item["i"] for item in old.get("reviewEvents", [])}
-        if any(item["i"] not in seen_reviews for item in new.get("reviewEvents", [])):
-            events.append("review")
-        seen_comments = {(item["i"], item["b"]) for item in old.get("comments", [])}
-        if any((item["i"], item["b"]) not in seen_comments for item in new.get("comments", [])):
+    if old is None:
+        return events
+    seen_reviews = {item["i"] for item in old.get("reviewEvents", [])}
+    if any(item["i"] not in seen_reviews and not own(item.get("a"), item.get("u"))
+           for item in new.get("reviewEvents", [])):
+        events.append("review")
+    seen_comments = {item["i"]: item["b"] for item in old.get("comments", [])}
+    for item in new.get("comments", []):
+        if item["i"] not in seen_comments:
+            changed_at = item.get("c")
+        elif seen_comments[item["i"]] != item["b"]:
+            changed_at = item.get("u")
+        else:
+            continue
+        if not own(item.get("a"), changed_at):
             events.append("comment")
-        if (new.get("unresolved") or 0) > (old.get("unresolved") or 0):
-            events.append("thread")
+            break
+    seen_threads = {item["i"]: item.get("u") for item in old.get("threads") or []}
+    if any(not item["r"] and seen_threads.get(item["i"], "") != item.get("u") and not own(item.get("a"), item.get("c"))
+           for item in new.get("threads") or []):
+        events.append("thread")
     return events

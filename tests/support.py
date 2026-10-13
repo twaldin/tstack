@@ -55,6 +55,8 @@ with open(stubs / "gh.log", "a") as log:
     log.write(json.dumps(args) + "\n")
 if args[:2] == ["pr", "view"]:
     print((stubs / "gh" / "pr.json").read_text())
+elif args[:2] == ["api", "user"]:
+    print(json.dumps({"login": "shared-login"}))
 elif args[:2] == ["api", "graphql"]:
     nodes = json.loads((stubs / "gh" / "threads.json").read_text()) if (stubs / "gh" / "threads.json").exists() else []
     print(json.dumps([{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": nodes}}}}}]))
@@ -222,9 +224,11 @@ class Sandbox(unittest.TestCase):
 
     def pr_stub(self, head: str = "a" * 40, state: str = "OPEN", checks=(("test", "SUCCESS"),), mergeable: str = "MERGEABLE",
                 merge_state: str = "CLEAN", comments=(), branch: str | None = None) -> None:
+        """`comments`: ids (by a reviewer), or (id, login, createdAt) tuples. gh's own login is `shared-login`."""
+        rows = [c if isinstance(c, tuple) else (c, "reviewer", "2026-10-13T00:00:00Z") for c in comments]
         pr = {"headRefOid": head, "headRefName": branch, "state": state, "isDraft": False, "mergeable": mergeable,
               "mergeStateStatus": merge_state, "latestReviews": [], "reviewRequests": [], "reviews": [],
-              "comments": [{"id": c, "body": c, "createdAt": "2026-10-13T00:00:00Z"} for c in comments],
+              "comments": [{"id": i, "body": i, "author": {"login": a}, "createdAt": at} for i, a, at in rows],
               "statusCheckRollup": [{"name": n, "conclusion": c} for n, c in checks]}
         (self.stubs / "gh" / "pr.json").write_text(json.dumps(pr))
 
