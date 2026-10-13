@@ -1,7 +1,9 @@
+import datetime as dt
+import json
 import shutil
 import subprocess
 
-from support import CODE, Sandbox, git
+from support import CODE, Sandbox, assistant_entry, git
 
 
 class Update(Sandbox):
@@ -56,6 +58,29 @@ class Update(Sandbox):
         self.assertIn("demo:busy,retry", self.update().stdout)
         (self.stubs / "easl-busy").unlink()
         self.assertIn("demo:restarted(agents/projects/demo/AGENTS.md changed)", self.update().stdout)
+
+    def heartbeat(self, minutes: int) -> None:
+        run_dir = self.seat / "state" / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+        (run_dir / "heartbeat.json").write_text(json.dumps({"at": at.strftime("%Y-%m-%dT%H:%M:%SZ")}))
+
+    def test_a_seat_busy_only_with_its_wait_is_restarted_with_force(self):
+        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
+        (self.stubs / "easl-busy").touch()
+        self.heartbeat(1)
+        self.seat_tile(assistant_entry(120), by_session_id=False)
+        self.assertIn("demo:restarted(agents/projects/demo/AGENTS.md changed, forced)", self.update().stdout)
+        restarts = [c for c in self.log_lines("easl.log") if c[0] == "agent.restart"]
+        self.assertEqual([("--force" in c) for c in restarts], [False, True])
+
+    def test_a_busy_seat_whose_wait_is_not_polling_is_not_forced(self):
+        self.push(self.instance_upstream, "projects/demo/AGENTS.md", "# Demo project\n")
+        (self.stubs / "easl-busy").touch()
+        self.heartbeat(40)
+        self.seat_tile(assistant_entry(120), by_session_id=False)
+        self.assertIn("demo:busy,retry", self.update().stdout)
+        self.assertFalse(any("--force" in c for c in self.log_lines("easl.log")))
 
     def test_a_setup_failure_rolls_back_every_moved_repo_and_logs_it(self):
         engine_before, instance_before = git(self.engine, "rev-parse", "HEAD"), git(self.instance, "rev-parse", "HEAD")

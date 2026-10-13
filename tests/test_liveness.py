@@ -2,7 +2,7 @@ import datetime as dt
 import json
 import re
 
-from support import Sandbox
+from support import Sandbox, assistant_entry
 
 
 def ago(minutes: int) -> str:
@@ -95,7 +95,7 @@ class Liveness(Sandbox):
         self.assertIn("restart failed: busy", self.liveness())
         (self.stubs / "easl-busy").unlink()
         self.assertIn("restarted in place", self.liveness())
-        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.restart", "agent.prompt"])
+        self.assertEqual(self.easl_calls(), ["agent.restart", "agent.list", "agent.restart", "agent.prompt"])
 
     def test_source_failing_an_hour_texts_once_sent(self):
         self.heartbeat(1, {"github": {"ok": False, "error": "gh: auth", "failing_since": ago(61)},
@@ -124,3 +124,31 @@ class Liveness(Sandbox):
         self.assertEqual(len(self.texts()), 1)
         self.assertIn("wait source github has failed", self.texts()[0])
         self.assertEqual(self.easl_calls(), ["agent.restart", "agent.prompt"])
+
+    def test_a_seat_busy_only_with_its_wait_is_restarted_with_force(self):
+        self.heartbeat(40)
+        (self.stubs / "easl-busy").touch()
+        self.seat_tile(assistant_entry(120))
+        self.assertIn("restarted in place (forced", self.liveness())
+        calls = self.log_lines("easl.log")
+        self.assertEqual([("--force" in c) for c in calls if c[0] == "agent.restart"], [False, True])
+        self.assertEqual(calls[-1][0], "agent.prompt")
+
+    def test_a_seat_still_in_its_turn_is_not_forced(self):
+        cases = {
+            "tool call pending": dict(last=assistant_entry(120, tool_call=True)),
+            "answer under a minute old": dict(last=assistant_entry(10)),
+            "user message last": dict(last=assistant_entry(120, role="user")),
+            "blocked": dict(last=assistant_entry(120), state="blocked"),
+            "operator typing": dict(last=assistant_entry(120), focused=True),
+            "unsent draft": dict(last=assistant_entry(120), draft=True),
+        }
+        (self.stubs / "easl-busy").touch()
+        self.heartbeat(40)
+        for name, case in cases.items():
+            with self.subTest(name):
+                for path in (self.run_dir / "liveness.json", self.stubs / "easl.log"):
+                    path.unlink(missing_ok=True)
+                self.seat_tile(**case)
+                self.assertIn("restart failed: busy", self.liveness())
+                self.assertFalse(any("--force" in c for c in self.log_lines("easl.log")))

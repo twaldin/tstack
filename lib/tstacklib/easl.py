@@ -86,9 +86,17 @@ def upsert_note(board: dict, key: str, markdown: str) -> None:
          host=board["host"])
 
 
-def restart(board: dict) -> None:
-    """Resume the seat's tile in place. Raises EaslConflict while it works or the operator types."""
-    call("agent.restart", "--target", board["tile"], "--mode", "resume", host=board["host"], timeout=120)
+def agent(board: dict) -> dict | None:
+    """The seat tile's entry in `agent.list`: lifecycle, sessionId, focused, draft, pid."""
+    agents = call("agent.list", host=board["host"]).get("agents", [])
+    return next((a for a in agents if a.get("tile") == board["tile"]), None)
+
+
+def restart(board: dict, force: bool = False) -> None:
+    """Resume the seat's tile in place. Raises EaslConflict while it works or the operator types, unless
+    `force`, which ends whatever runs in the tile."""
+    call("agent.restart", "--target", board["tile"], "--mode", "resume", *(["--force"] if force else []),
+         host=board["host"], timeout=120)
 
 
 def prompt(board: dict, text: str) -> None:

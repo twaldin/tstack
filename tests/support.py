@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import shutil
@@ -81,7 +82,8 @@ else:
 
 STUB_EASL = r'''#!/usr/bin/env python3
 """Fake easl: logs argv; asks live in stubs/asks.json. agent.restart refuses (conflict) when stubs/easl-busy
-exists and fails when stubs/easl-fail exists; agent.prompt fails when stubs/easl-prompt-fail exists."""
+exists unless --force, and fails when stubs/easl-fail exists; agent.prompt fails when stubs/easl-prompt-fail
+exists; agent.list returns stubs/agents.json."""
 import json, os, sys
 from pathlib import Path
 stubs = Path(os.environ["STUBS"])
@@ -104,7 +106,7 @@ elif args[:2] == ["ask", "cancel"]:
     asks[args[2]]["status"] = "cancelled"
     asks_path.write_text(json.dumps(asks))
     out({"object": {"id": args[2]}})
-elif args[0] == "agent.restart" and (stubs / "easl-busy").exists():
+elif args[0] == "agent.restart" and (stubs / "easl-busy").exists() and "--force" not in args:
     print("conflict: the agent is working", file=sys.stderr)
     sys.exit(1)
 elif args[0] == "agent.restart" and (stubs / "easl-fail").exists():
@@ -114,7 +116,7 @@ elif args[0] == "agent.prompt" and (stubs / "easl-prompt-fail").exists():
     print("unavailable: host not connected", file=sys.stderr)
     sys.exit(1)
 elif args[0] == "agent.list":
-    out({"agents": []})
+    print((stubs / "agents.json").read_text() if (stubs / "agents.json").exists() else json.dumps({"agents": []}))
 else:
     out({"object": {"id": "obj_tile"}, "created": True})
 '''
@@ -216,6 +218,18 @@ class Sandbox(unittest.TestCase):
     def board(self) -> None:
         (self.seat / "state" / "board.json").write_text(json.dumps({"host": "testbox", "board": "brd_test", "tile": "obj_seat"}))
 
+    def seat_tile(self, last: dict, state: str = "working", by_session_id: bool = True, **agent) -> None:
+        """easl lists the seat's omp tile as `state`; its session file ends with the entry `last`. Found through
+        the tile's sessionId, or (by_session_id False) as the newest session in the seat's own folder."""
+        sid = "01a1345b-0000-7000-0000-000000000001"
+        folder = "-fake" if by_session_id else "-" + str(self.seat.relative_to(self.home)).replace("/", "-")
+        session = self.home / ".omp" / "agent" / "sessions" / folder / f"2026-10-13T00-00-00-000Z_{sid}.jsonl"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_text(json.dumps({"type": "session", "id": sid}) + "\n" + json.dumps(last) + "\n")
+        tile = {"tile": "obj_seat", "kind": "omp", "lifecycle": {"state": state}, "focused": False, "draft": False,
+                **({"sessionId": sid} if by_session_id else {}), **agent}
+        (self.stubs / "agents.json").write_text(json.dumps({"agents": [tile]}))
+
     # running the CLIs
 
     def cli(self, tool: str, *args: str, check: bool = True, timeout: float = 60, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -272,3 +286,11 @@ class Sandbox(unittest.TestCase):
 
 def dedent(text: str) -> str:
     return textwrap.dedent(text).lstrip("\n")
+
+
+def assistant_entry(seconds_ago: float, tool_call: bool = False, role: str = "assistant") -> dict:
+    """An omp session line: an assistant message (text, or a tool call) written `seconds_ago`."""
+    when = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    content = [{"type": "toolCall", "id": "t1", "name": "bash"}] if tool_call else [{"type": "text", "text": "Done."}]
+    return {"type": "message", "id": "m1", "timestamp": when,
+            "message": {"role": role, "content": content, "stopReason": "toolUse" if tool_call else "stop"}}
