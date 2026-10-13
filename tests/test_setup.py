@@ -149,7 +149,7 @@ DECKBOX_CONFIG = '''"advisor":
 
 
 class OmpConfig(Sandbox):
-    """omp's config.yml in the quoted style omp writes on deckbox."""
+    """omp's config.yml in the quoted style omp writes on a Linux host."""
 
     def setUp(self):
         super().setUp()
