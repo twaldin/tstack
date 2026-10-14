@@ -27,7 +27,7 @@ You need git, Python 3.9 or newer, `gh` logged in, bun, omp and easl.
 | `TSTACK_MACHINE` | the instance machine directory matching `hostname -s` | the machine |
 | `TSTACK_WORKTREES` | `~/worktrees` | where project clones and lane worktrees live |
 | `TSTACK_SEAT` | the nearest ancestor of the cwd with `state/` | the seat `lane` acts on |
-| `TSTACK_LAUNCHER` | `systemd` on Linux, `process` on macOS | how `lane` starts a run |
+| `TSTACK_LAUNCHER` | `systemd` on Linux, `process` on macOS | how `lane` starts a run, and whether setup writes systemd or launchd units |
 
 ## Lanes
 
