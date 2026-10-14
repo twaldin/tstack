@@ -1,215 +1,235 @@
 #!/usr/bin/env python3
-# watch-pr <github-pr-url> [--until merged|checks|event] [--interval SECS]
-#          [--max-interval SECS] [--timeout SECS] [--grace SECS] [--state FILE]
-# watch-pr --classify <rollup.json>
-# watch-pr --fingerprint <pr.json> [threads-json]
-# watch-pr --diff <old.fp.json> <new.fp.json>
-# watch-pr --ack FILE
-#
-# Requires Python 3 and authenticated gh with api --paginate/--slurp support.
-# Live stdout: merged <url>, closed <url>, checks-green <url>, checks-red <url>,
-# event <url> <keys>, or timeout <url>. Exit 2 reports errors only on stderr.
-# Offline stdout: classify prints green/pending/red; fingerprint prints JSON;
-# diff prints comma-separated sorted changed keys; ack prints nothing.
-# Exit codes: 0 merged/green/event/offline success, 1 closed/red, 2 usage/local
-# error or five consecutive failed polls, 3 timeout. A complete poll resets
-# failures. Auth, network, malformed responses, and thread-query failures retry
-# with the quiet-poll x1.5 backoff, capped by --max-interval. Each gh call has a
-# 30-second ceiling within the --timeout deadline, which also bounds sleeping.
-# Defaults: --until merged, --interval 60, --max-interval 600, --timeout 0,
-# --grace 300. Zero timeout means no overall deadline, not unlimited failures.
-# --grace keeps an empty rollup pending for SECS after checks mode starts.
-#
-# CI classification uses conclusion, then state, then PENDING. Green means
-# SUCCESS/NEUTRAL/SKIPPED. Pending means PENDING/EXPECTED/QUEUED/IN_PROGRESS/
-# STALE/empty. Any other conclusion is red. Empty rollup is green unless grace
-# applies in live checks mode.
-#
-# Event mode requires --state. A quiet first snapshot establishes the cursor.
-# Existing red CI, conflicts, reviews, issue comments, or unresolved threads
-# emit event <url> initial,<actionable-keys>. Later changes emit sorted keys.
-# Keys: head,state,mergeable,mergeState,ci,failing,reviews,reviewCount,
-# reviewEvents,comments,reviewRequests,threads,unresolved. Bot feedback is included.
-# Issue comment and review body edits are detected; thread changes use the
-# last reply's updatedAt, not earlier comment edits in a thread with replies.
-# Events atomically write FILE.pending; FILE advances only via --ack after
-# durable handling. Pending events replay before polling; identical pending
-# and cursor snapshots use the key "pending". Ack without pending is a no-op.
-# Old cursors remain readable. New feedback digests emit a migration event
-# once after upgrade. --fingerprint accepts threads-json as [{i,r,u}] or null.
-# Accepted URLs are https://github.com/<owner>/<repo>/pull/<positive-integer>
-# without query strings or trailing slashes.
+"""Print the facts GitHub holds about one pull request. Reads only; never posts, reviews, merges or resolves.
+
+Facts: state, head SHA, mergeability, auto-merge, review decision, each check with its result, each review,
+each issue comment (bot notices such as CodeRabbit's "Review limit reached" included) and each unresolved
+review thread. After merge also the merge SHA; the workflow runs on it, plus each of those workflows' newest
+run on a later base-branch commit that contains it; their deploy and release jobs; and per environment the
+newest GitHub deployment on the merge SHA and on a later containing commit, with its latest status.
+
+--until polls every --interval seconds and prints the facts when its condition first holds:
+  change    any fact differs from the first poll (the report then starts with the changed keys)
+  merged    the PR is merged or closed
+  checks    no check is queued or running (an empty list counts as not started for two minutes)
+  deployed  a deployment, or while there is none a deploy or release job, finished other than skipped or cancelled
+Every mode also stops when the PR is closed without merging. Exit 0 with facts; 1 when gh fails, with its error.
+"""
 
 import argparse
 import json
-import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from tstacklib.prwatch import EVENT_FIELDS, THREADS_QUERY, classify, diff, fingerprint, initial_keys  # noqa: E402
+PR_REF = re.compile(r"(?:https://github\.com/)?([\w.-]+)/([\w.-]+)(?:/pull/|#)(\d+)")
+PR_FIELDS = ("url,title,state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,"
+             "autoMergeRequest,mergeCommit,mergedAt,reviews,comments,statusCheckRollup")
+THREADS_QUERY = """query($o:String!,$r:String!,$n:Int!,$endCursor:String){
+  repository(owner:$o,name:$r){pullRequest(number:$n){
+    reviewThreads(first:100,after:$endCursor){
+      nodes{isResolved,isOutdated,path,line,originalLine,
+            comments(first:1){totalCount,nodes{author{login},body,url}}}
+      pageInfo{hasNextPage,endCursor}
+    }
+  }}
+}"""
+RUNNING = {"QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "EXPECTED"}
+# A job counts as a deploy or release when its own name is that word, alone or followed by a space. Its own name
+# is what follows any "caller / " prefix a reusable workflow adds, so the jobs under a "deploy /" workflow, gates
+# such as "check-if-should-deploy" and preparation such as "deploy-slow-check-policy" stay out.
+DEPLOY_JOB = re.compile(r"(deploy|release)( |$)", re.I)
+EMPTY_CHECKS_GRACE = 120
 
 
-def load(path):
-    return json.loads(Path(path).read_text())
-
-
-def save(path, value):
-    temporary = Path(str(path) + f".tmp{os.getpid()}")
-    try:
-        temporary.write_text(json.dumps(value, separators=(",", ":")) + "\n")
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-class DeadlineExpired(Exception):
+class GhError(Exception):
     pass
 
 
-def remaining(deadline):
-    if deadline is None:
-        return 30
-    seconds = deadline - time.monotonic()
-    if seconds <= 0:
-        raise DeadlineExpired
-    return seconds
-
-
-def gh_json(args, deadline):
+def gh(*args):
     try:
-        result = subprocess.run(["gh", *args], capture_output=True, text=True,
-                                timeout=min(30, remaining(deadline)), check=True)
+        done = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
-        remaining(deadline)
-        raise ValueError("gh request timed out") from None
-    remaining(deadline)
-    return json.loads(result.stdout)
+        raise GhError(f"gh {' '.join(args[:2])} timed out after 120s") from None
+    if done.returncode:
+        raise GhError(done.stderr.strip() or f"gh {' '.join(args[:2])} exited {done.returncode}")
+    return json.loads(done.stdout)
 
 
-def watch(args):
-    match = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)", args.url)
-    if not match:
-        raise ValueError("need a full https://github.com/<owner>/<repo>/pull/<n> URL")
-    if args.until == "event" and not args.state:
-        raise ValueError("--until event requires --state FILE")
-    state = Path(args.state) if args.state else None
-    pending = Path(str(state) + ".pending") if state else None
-    if args.until == "event" and pending.exists():
-        fp = load(pending)
-        if state.exists():
-            keys = diff(load(state), fp) or "pending"
-        else:
-            keys = "initial," + initial_keys(fp)
-        print(f"event {args.url} {keys}")
-        return 0
-    cursor = load(state) if args.until == "event" and state.exists() else None
-    if args.until == "event" and state.exists() and not isinstance(cursor, dict):
-        raise ValueError("state cursor must be a JSON object")
-
-    start = time.monotonic()
-    deadline = start + args.timeout if args.timeout else None
-    sleep_for = min(args.interval, args.max_interval)
-    failures = 0
-    fields = {"merged": "state", "checks": "state,statusCheckRollup", "event": EVENT_FIELDS}[args.until]
-    owner, repo, number = match.groups()
-    while True:
-        try:
-            remaining(deadline)
-            pr = gh_json(["pr", "view", args.url, "--json", fields], deadline)
-            if pr["state"] == "MERGED":
-                print(f"merged {args.url}")
-                return 0
-            if pr["state"] == "CLOSED":
-                print(f"closed {args.url}")
-                return 1
-            if pr["state"] != "OPEN":
-                raise ValueError("unknown PR state")
-            if args.until == "checks":
-                verdict = classify(pr)
-                if not pr["statusCheckRollup"] and time.monotonic() - start < args.grace:
-                    verdict = "pending"
-                if verdict != "pending":
-                    print(f"checks-{verdict} {args.url}")
-                    return int(verdict == "red")
-            elif args.until == "event":
-                pages = gh_json(["api", "graphql", "--paginate", "--slurp", "-f", f"query={THREADS_QUERY}",
-                                 "-f", f"o={owner}", "-f", f"r={repo}", "-F", f"n={number}"], deadline)
-                threads = sorted([
-                    {"i": item["id"], "r": item["isResolved"],
-                     "u": next(iter(item["comments"]["nodes"]), {}).get("updatedAt", "")}
-                    for page in pages
-                    for item in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-                ], key=lambda item: item["i"])
-                fp = fingerprint(pr, threads)
-                keys = diff(cursor, fp) if cursor is not None else initial_keys(fp)
-                if keys:
-                    if cursor is None:
-                        keys = "initial," + keys
-                    save(pending, fp)
-                    print(f"event {args.url} {keys}")
-                    return 0
-                if cursor is None:
-                    save(state, fp)
-                    cursor = fp
-            failures = 0
-        except DeadlineExpired:
-            print(f"timeout {args.url}")
-            return 3
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError) as error:
-            failures += 1
-            print(f"watch-pr: poll failed ({failures}/5, {type(error).__name__})", file=sys.stderr)
-            if failures == 5:
-                return 2
-        try:
-            delay = sleep_for if deadline is None else min(sleep_for, remaining(deadline))
-            time.sleep(delay)
-        except DeadlineExpired:
-            print(f"timeout {args.url}")
-            return 3
-        sleep_for = min(args.max_interval, max(sleep_for + 1, sleep_for * 3 // 2))
+def login(item):
+    return (item.get("author") or {}).get("login", "ghost")
 
 
-def nonnegative(value):
-    number = int(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError("seconds must be nonnegative")
-    return number
+def finished(result):
+    return bool(result) and result.upper() not in RUNNING | {"SKIPPED", "CANCELLED"}
 
 
-def main(argv):
-    if argv and argv[0] in {"--classify", "--fingerprint", "--diff", "--ack"}:
-        mode = argv[0]
-        expected = 3 if mode == "--diff" else 2
-        if len(argv) != expected and not (mode == "--fingerprint" and len(argv) == 3):
-            raise ValueError(f"invalid arguments for {mode}")
-        if mode == "--classify":
-            print(classify(load(argv[1])))
-        elif mode == "--fingerprint":
-            threads = json.loads(argv[2]) if len(argv) == 3 else None
-            print(json.dumps(fingerprint(load(argv[1]), threads), separators=(",", ":")))
-        elif mode == "--diff":
-            print(diff(load(argv[1]), load(argv[2])))
-        elif Path(argv[1] + ".pending").exists():
-            Path(argv[1] + ".pending").replace(argv[1])
-        return 0
-    parser = argparse.ArgumentParser(description="Finite PR watcher owned by the PR-opening session")
-    parser.add_argument("url")
-    parser.add_argument("--until", choices=["merged", "checks", "event"], default="merged")
-    parser.add_argument("--interval", type=nonnegative, default=60)
-    parser.add_argument("--max-interval", type=nonnegative, default=600)
-    parser.add_argument("--timeout", type=nonnegative, default=0)
-    parser.add_argument("--grace", type=nonnegative, default=300)
-    parser.add_argument("--state")
-    return watch(parser.parse_args(argv))
+def snapshot(repo, number):
+    pr = gh("pr", "view", number, "--repo", repo, "--json", PR_FIELDS)
+    owner, name = repo.split("/")
+    pages = gh("api", "graphql", "--paginate", "--slurp", "-f", f"query={THREADS_QUERY}",
+               "-f", f"o={owner}", "-f", f"r={name}", "-F", f"n={number}")
+    threads = [t for page in pages for t in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]]
+    return {
+        "pr": f"{repo}#{number}", "url": pr["url"], "title": pr["title"], "state": pr["state"], "draft": pr["isDraft"],
+        "head": pr["headRefOid"], "base": pr["baseRefName"],
+        "mergeable": pr["mergeable"], "merge_state": pr["mergeStateStatus"],
+        "auto_merge": (pr["autoMergeRequest"] or {}).get("mergeMethod"),
+        "review_decision": pr["reviewDecision"] or None,
+        "checks": [{"name": c.get("name") or c.get("context"),
+                    "result": c.get("conclusion") or c.get("status") or c.get("state"),
+                    "url": c.get("detailsUrl") or c.get("targetUrl") or None} for c in pr["statusCheckRollup"]],
+        "reviews": [{"author": login(r), "state": r["state"], "at": r["submittedAt"], "body": r["body"]}
+                    for r in pr["reviews"]],
+        "comments": [{"author": login(c), "at": c["createdAt"], "body": c["body"], "url": c["url"]}
+                     for c in pr["comments"]],
+        "threads": [{"path": t["path"], "line": t["line"] or t["originalLine"], "outdated": t["isOutdated"],
+                     "comments": t["comments"]["totalCount"], "author": login(first), "body": first["body"],
+                     "url": first["url"]}
+                    for t in threads if not t["isResolved"] for first in t["comments"]["nodes"][:1]],
+        "merge": after_merge(repo, pr) if pr["state"] == "MERGED" else None,
+    }
+
+
+def after_merge(repo, pr):
+    sha, base = pr["mergeCommit"]["oid"], pr["baseRefName"]
+    contains = {sha: True}
+
+    def contained(head):
+        if head not in contains:
+            # Compare head...sha, not sha...head: when sha is an ancestor of head the answer is "behind" with no
+            # commits or files, so the check stays small however far the base branch has moved.
+            contains[head] = gh("api", f"repos/{repo}/compare/{head}...{sha}")["status"] in ("behind", "identical")
+        return contains[head]
+
+    def later(key):
+        workflow, event = key
+        newest = gh("api", f"repos/{repo}/actions/workflows/{workflow}/runs?branch={base}&event={event}&per_page=1")
+        return [r for r in newest["workflow_runs"] if r["head_sha"] != sha and contained(r["head_sha"])]
+
+    def described(run):
+        listed = [] if run["conclusion"] == "skipped" else gh(
+            "api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")["jobs"]
+        return {"workflow": run["name"], "event": run["event"], "sha": run["head_sha"],
+                "result": run["conclusion"] or run["status"], "url": run["html_url"],
+                "jobs": [{"name": j["name"], "result": j["conclusion"] or j["status"], "url": j["html_url"]}
+                         for j in listed if DEPLOY_JOB.match(j["name"].rsplit(" / ", 1)[-1])]}
+
+    def status(deployment):
+        latest = (gh("api", f"repos/{repo}/deployments/{deployment['id']}/statuses?per_page=1") or [{}])[0]
+        return {"environment": deployment["environment"], "sha": deployment["sha"], "state": latest.get("state"),
+                "at": latest.get("created_at"), "url": latest.get("log_url") or latest.get("target_url") or None}
+
+    with ThreadPoolExecutor(8) as pool:
+        runs = gh("api", f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]
+        workflows = dict.fromkeys((r["workflow_id"], r["event"]) for r in runs if r["conclusion"] != "skipped")
+        runs += [r for found in pool.map(later, workflows) for r in found]
+        deployments = {}
+        for d in gh("api", f"repos/{repo}/deployments?sha={sha}&per_page=100"):
+            deployments.setdefault((d["environment"], True), d)
+        for d in gh("api", f"repos/{repo}/deployments?ref={base}&per_page=100"):
+            key = (d["environment"], False)
+            if key not in deployments and d["sha"] != sha and d["created_at"] >= pr["mergedAt"] and contained(d["sha"]):
+                deployments[key] = d
+        return {"sha": sha, "at": pr["mergedAt"], "runs": list(pool.map(described, runs)),
+                "deployments": list(pool.map(status, deployments.values()))}
+
+
+def stopped(until, first, now, waited):
+    if now["state"] == "CLOSED" or (until == "merged" and now["state"] != "OPEN"):
+        return True
+    if until == "change":
+        return now != first
+    if until == "checks":
+        started = bool(now["checks"]) or waited >= EMPTY_CHECKS_GRACE
+        return started and not any(str(c["result"]).upper() in RUNNING for c in now["checks"])
+    merge = now["merge"] or {"runs": [], "deployments": []}
+    if merge["deployments"]:
+        return any(finished(d["state"]) for d in merge["deployments"])
+    return any(finished(j["result"]) for r in merge["runs"] for j in r["jobs"])
+
+
+def headline(body):
+    """The first line of a comment that a reader would see: HTML comments, tags, quote and heading marks and
+    GitHub alert labels ([!WARNING]) removed."""
+    for line in re.sub(r"<!--.*?-->|<[^>]*>", "", body or "", flags=re.S).splitlines():
+        line = line.strip(" \t>#")
+        if line and not re.fullmatch(r"\[![A-Z]+\]", line):
+            return line if len(line) <= 200 else line[:199] + "…"
+    return ""
+
+
+def said(prefix, body):
+    text = headline(body)
+    return f"{prefix}: {text}" if text else prefix
+
+
+def grouped(indent, label, items):
+    groups = {}
+    for item in items:
+        groups.setdefault(item["result"] or "none", []).append(item["name"])
+    return [f"{indent}{label}{result} ({len(names)}): {', '.join(names)}" for result, names in sorted(groups.items())]
+
+
+def render(r):
+    out = [f"changed: {', '.join(r['changed'])}"] if "changed" in r else []
+    out += [f"{r['pr']} {r['state']}{' draft' if r['draft'] else ''}: {r['title']}", r["url"],
+            f"head {r['head']} into {r['base']}",
+            f"mergeable {r['mergeable']}, merge state {r['merge_state']}, auto-merge {r['auto_merge'] or 'off'}",
+            f"review decision {r['review_decision'] or 'none'}",
+            f"checks ({len(r['checks'])}):"]
+    out += grouped("  ", "", r["checks"])
+    out.append(f"reviews ({len(r['reviews'])}):")
+    out += [said(f"  {x['author']} {x['state']} {x['at']}", x["body"]) for x in r["reviews"]]
+    out.append(f"comments ({len(r['comments'])}):")
+    out += [said(f"  {x['author']} {x['at']}", x["body"]) for x in r["comments"]]
+    out.append(f"unresolved threads ({len(r['threads'])}):")
+    out += [said(f"  {t['path']}:{t['line']}{' outdated' if t['outdated'] else ''} {t['author']} "
+                 f"({t['comments']} comments) {t['url']}", t["body"]) for t in r["threads"]]
+    m = r["merge"]
+    if m:
+        out += [f"merged {m['at']} as {m['sha']}",
+                f"runs on {m['sha'][:12]} or a later {r['base']} commit containing it ({len(m['runs'])}):"]
+        for x in m["runs"]:
+            if x["result"] != "skipped":
+                out.append(f"  {x['workflow']} ({x['event']}) on {x['sha'][:12]}: {x['result']} {x['url']}")
+                out += grouped("    ", "deploy/release jobs ", x["jobs"])
+        skipped = Counter(x["workflow"] for x in m["runs"] if x["result"] == "skipped")
+        if skipped:
+            out.append("  skipped: " + ", ".join(f"{name} x{count}" for name, count in skipped.items()))
+        out.append(f"deployments ({len(m['deployments'])}):")
+        out += [f"  {d['environment']} on {d['sha'][:12]}: {d['state'] or 'no status'} {d['at'] or ''} {d['url'] or ''}"
+                .rstrip() for d in m["deployments"]]
+    return "\n".join(out)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("pr", help="https://github.com/<owner>/<repo>/pull/<n> or <owner>/<repo>#<n>")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="print the facts once (the default)")
+    mode.add_argument("--until", choices=["change", "merged", "checks", "deployed"])
+    parser.add_argument("--json", action="store_true", help="print the facts as JSON")
+    parser.add_argument("--interval", type=float, default=60, help="seconds between polls (default 60)")
+    args = parser.parse_args()
+    ref = PR_REF.match(args.pr)
+    if not ref:
+        parser.error(f"not a pull request: {args.pr}")
+    repo, number = f"{ref[1]}/{ref[2]}", ref[3]
+    try:
+        first = report = snapshot(repo, number)
+        start = time.monotonic()
+        while args.until and not stopped(args.until, first, report, time.monotonic() - start):
+            time.sleep(args.interval)
+            report = snapshot(repo, number)
+    except GhError as error:
+        sys.exit(f"watch-pr: {error}")
+    if args.until == "change" and report is not first:
+        report = {"changed": [key for key in report if report[key] != first[key]], **report}
+    print(json.dumps(report, indent=2) if args.json else render(report))
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main(sys.argv[1:]))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        print(f"watch-pr: {error}", file=sys.stderr)
-        sys.exit(2)
+    main()
