@@ -146,9 +146,7 @@ class Lane:
         if SYSTEMD:
             spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
                      f"--working-directory={record['worktree']}", "-p", f"MemoryMax={record['memory']}"]
-            cpus = run(["systemctl", "show", "agents.slice", "-p", "AllowedCPUs", "--value"], check=False)
-            run(spawn + ["-p", f"CPUAffinity={cpus}"] * bool(cpus) + [f"--setenv={k}={v}" for k, v in env.items()]
-                + command, env=BUS)
+            run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
             pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
         else:
             pid = subprocess.Popen(command, cwd=record["worktree"], env=env, stdin=subprocess.DEVNULL,
@@ -232,9 +230,8 @@ def stop(lane: Lane) -> str:
     else:
         with contextlib.suppress(ProcessLookupError, ValueError):
             os.killpg(int(lane.file(number, "pid").read_text()), signal.SIGTERM)
-    for _ in range(150):
-        if not lane.alive(number):
-            break
+    deadline = time.monotonic() + 30
+    while lane.alive(number) and time.monotonic() < deadline:
         time.sleep(0.2)
     lane.refresh(stopped=True)
     return f"{lane.id} stopped (run {number})"

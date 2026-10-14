@@ -1,6 +1,5 @@
 import json
 import subprocess
-import unittest
 from pathlib import Path
 
 from support import Sandbox, git
@@ -22,7 +21,7 @@ class LaneRuns(Sandbox):
         self.assertEqual((lane / "brief.md").read_text(), "Reply with the word done.\n")
         worktree = self.home / "worktrees" / "demo" / "demo-fix-it-1"
         self.assertEqual(git(worktree, "rev-parse", "--abbrev-ref", "HEAD"), "lane/demo-fix-it-1")
-        call = self.log("omp.log")[0]
+        call = self.log("omp")[0]
         self.assertEqual(call["args"][:6], ["-p", "--mode", "json", "--model", "@sol", "--thinking"])
         self.assertTrue(call["args"][-1].endswith("Reply with the word done.\n"))
         self.assertEqual((Path(call["cwd"]).resolve(), call["lane"]), (worktree.resolve(), "demo-fix-it-1"))
@@ -38,7 +37,7 @@ class LaneRuns(Sandbox):
         self.omp(answer="fixed", cost=0.5)
         self.assertEqual(self.cli("lane", "resume", lane_id, "CI failed on test_x").stdout, f"{lane_id} run 2\n")
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\nfixed\n")
-        first, second = self.log("omp.log")
+        first, second = self.log("omp")
         session = self.record(lane_id)["session"]
         self.assertEqual(second["args"][-3:], ["--resume", session, "CI failed on test_x"])
         self.assertNotIn("--resume", first["args"])
@@ -76,14 +75,14 @@ class LaneRuns(Sandbox):
         self.env["TSTACK_LAUNCHER"] = "systemd"
         lane_id = self.start("--memory", "4G")
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
-        spawn = self.log("systemd-run.log")[0]
+        spawn = self.log("systemd-run")[0]["args"]
         self.assertEqual(spawn[:4], ["--user", "--collect", "--quiet", f"--unit=tstack-lane-{lane_id}"])
         self.assertIn("MemoryMax=4G", spawn)
         self.assertIn(f"--setenv=TSTACK_SEAT={self.seat}", spawn)
         self.brief.write_text("SLOW\n")
         slow = self.start()
         self.assertEqual(self.cli("lane", "stop", slow).stdout, f"{slow} stopped (run 1)\n")
-        self.assertIn(f"--user stop tstack-lane-{slow}", (self.stubs / "systemctl.log").read_text())
+        self.assertIn(["--user", "stop", f"tstack-lane-{slow}"], [c["args"] for c in self.log("systemctl")])
 
     def test_clean_removes_the_worktree_and_branch(self):
         lane_id = self.start()
@@ -117,7 +116,7 @@ class LaneRecords(Sandbox):
     def test_merge_squashes_at_the_head_and_records_the_merge(self):
         self.assertEqual(self.cli("lane", "merge", "demo-x-1").stdout, f"merged: {self.url} at {'a' * 12} as {'f' * 12}\n")
         self.assertIn(["pr", "merge", self.url, "--squash", "--delete-branch", "--match-head-commit", "a" * 40],
-                      self.log("gh.log"))
+                      [c["args"] for c in self.log("gh")])
         self.assertEqual((self.record("demo-x-1")["pr"], self.record("demo-x-1")["merge"]), (self.url, "f" * 40))
 
     def test_auto_merge_is_reported_armed_and_github_refusals_pass_through(self):
@@ -139,4 +138,4 @@ class LaneRecords(Sandbox):
         self.assertIn(f"demo-old-1\twaiting\texit 0\t$1.50\t{self.url}\t2026-10-01T01:00:00Z\n", self.cli("lane", "list").stdout)
         self.assertEqual(self.cli("lane", "resume", "demo-old-1", "rebase").stdout, "demo-old-1 run 2\n")
         self.cli("lane", "wait", "demo-old-1")
-        self.assertEqual(self.log("omp.log")[0]["args"][-3:], ["--resume", "/s/2026_old.jsonl", "rebase"])
+        self.assertEqual(self.log("omp")[0]["args"][-3:], ["--resume", "/s/2026_old.jsonl", "rebase"])
