@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import itertools
 import json
 import os
 import re
@@ -19,9 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-HOME = Path.home()
 ENGINE = Path(os.environ.get("TSTACK_HOME") or Path(__file__).resolve().parents[1])
-WORKTREES = Path(os.environ.get("TSTACK_WORKTREES") or HOME / "worktrees")
+WORKTREES = Path(os.environ.get("TSTACK_WORKTREES") or Path.home() / "worktrees")
 SYSTEMD = (os.environ.get("TSTACK_LAUNCHER") or ("process" if sys.platform == "darwin" else "systemd")) == "systemd"
 PASS_ENV = ("PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSH_AUTH_SOCK", "EASL_SOCKET",
             "TSTACK_HOME", "TSTACK_INSTANCE", "TSTACK_WORKTREES", "TSTACK_MACHINE")
@@ -45,56 +45,44 @@ def exit_code(run_entry: dict) -> str:
     return "-" if run_entry.get("exit") is None else str(run_entry["exit"])
 
 
-def run(argv, cwd=None, env=None, check=True) -> subprocess.CompletedProcess:
+def run(argv, cwd=None, env=None, check=True) -> str:
     try:
         result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
     except FileNotFoundError:
         raise Fail(f"{argv[0]}: not found")
     if check and result.returncode:
         raise Fail(f"{' '.join(map(str, argv[:4]))}: {(result.stderr or result.stdout).strip()}")
-    return result
+    return result.stdout.strip()
 
 
 def git(repo, *args, check=True) -> str:
-    return run(["git", "-C", str(repo), *args], check=check).stdout.strip()
+    return run(["git", "-C", str(repo), *args], check=check)
 
 
-def find_seat(explicit) -> Path:
-    if explicit or os.environ.get("TSTACK_SEAT"):
-        return Path(explicit or os.environ["TSTACK_SEAT"]).expanduser().resolve()
-    here = Path.cwd().resolve()
-    seat = next((p for p in (here, *here.parents) if (p / "state").is_dir()), None)
-    if not seat:
-        raise Fail("no seat: pass --seat DIR, set TSTACK_SEAT, or run inside a seat dir")
-    return seat
-
-
-def read_stream(path: Path):
-    """Session id, summed cost and final answer (the last assistant message's text) of an omp json stream."""
-    session, cost, final = None, 0.0, None
+def events(path: Path):
     for line in path.read_text(errors="replace").splitlines() if path.exists() else []:
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        message = event.get("message") or {}
-        if event.get("type") == "session":
-            session = session or event.get("id")
-        elif event.get("type") == "message_end" and message.get("role") == "assistant":
-            cost += float(((message.get("usage") or {}).get("cost") or {}).get("total") or 0)
-            final = "\n".join(c.get("text", "") for c in message.get("content") or [] if c.get("type") == "text").strip()
-    return session, round(cost, 6), final or None
+        yield event
+
+
+def assistant_text(event: dict):
+    """The text of an assistant message_end event, '' for one without text, None for any other event."""
+    message = event.get("message") or {}
+    if event.get("type") != "message_end" or message.get("role") != "assistant":
+        return None
+    return "\n".join(c.get("text", "") for c in message.get("content") or [] if c.get("type") == "text").strip()
 
 
 class Lane:
     def __init__(self, seat: Path, lane_id: str):
-        self.seat, self.id = seat, lane_id
-        self.dir = seat / "state" / "lanes" / lane_id
-        self.run_dir = seat / "state" / "run" / "lanes" / lane_id
-        self.unit = f"tstack-lane-{lane_id}"
+        self.seat, self.id, self.unit = seat, lane_id, f"tstack-lane-{lane_id}"
+        self.dir, self.run_dir = seat / "state" / "lanes" / lane_id, seat / "state" / "run" / "lanes" / lane_id
 
-    def base(self, number: int) -> Path:
-        return self.run_dir / f"run-{number}"
+    def file(self, number: int, ext: str) -> Path:
+        return self.run_dir / f"run-{number}.{ext}"
 
     def load(self) -> dict:
         try:
@@ -104,9 +92,8 @@ class Lane:
 
     def save(self, record: dict) -> None:
         record["updated"] = now()
-        tmp = self.dir / ".lane.json.tmp"
-        tmp.write_text(json.dumps(record, indent=1) + "\n")
-        os.replace(tmp, self.dir / "lane.json")
+        (self.dir / ".lane.json.tmp").write_text(json.dumps(record, indent=1) + "\n")
+        os.replace(self.dir / ".lane.json.tmp", self.dir / "lane.json")
 
     @contextlib.contextmanager
     def locked(self):
@@ -117,18 +104,13 @@ class Lane:
 
     def update(self, **fields) -> None:
         with self.locked():
-            record = self.load()
-            record.update(fields)
-            self.save(record)
+            self.save({**self.load(), **fields})
 
     def alive(self, number: int) -> bool:
-        base = self.base(number)
-        pid_file = Path(f"{base}.pid")
-        if Path(f"{base}.exit").exists() or not pid_file.exists():
+        pid = self.file(number, "pid").read_text().strip() if self.file(number, "pid").exists() else ""
+        if self.file(number, "exit").exists() or not pid.isdigit():
             return False
-        pid = pid_file.read_text().strip()
-        command = run(["ps", "-ww", "-o", "command=", "-p", pid], check=False).stdout if pid.isdigit() else ""
-        return str(base) in command
+        return str(self.run_dir / f"run-{number}") in run(["ps", "-ww", "-o", "command=", "-p", pid], check=False)
 
     def refresh(self, stopped: bool = False) -> dict:
         """Record the latest run's end once its process is gone (or `stopped`): exit, cost, session, final.md."""
@@ -137,15 +119,16 @@ class Lane:
             last = (record.get("runs") or [{}])[-1]
             if not last or last.get("end") or (not stopped and self.alive(last["run"])):
                 return record
-            base = self.base(last["run"])
-            exit_file = Path(f"{base}.exit")
-            code = exit_file.read_text().strip() if exit_file.exists() else ""
-            session, cost, final = read_stream(Path(f"{base}.jsonl"))
-            last.update(end=now(), exit=int(code) if code.lstrip("-").isdigit() else None, cost_usd=cost)
-            record["session"] = session or record.get("session")
+            code = self.file(last["run"], "exit").read_text().strip() if self.file(last["run"], "exit").exists() else ""
+            stream = list(events(self.file(last["run"], "jsonl")))
+            texts = [t for t in map(assistant_text, stream) if t is not None]
+            costs = [((e["message"].get("usage") or {}).get("cost") or {}).get("total") or 0
+                     for e in stream if assistant_text(e) is not None]
+            last.update(end=now(), exit=int(code) if code.lstrip("-").isdigit() else None, cost_usd=round(sum(costs), 6))
+            record["session"] = next((e.get("id") for e in stream if e.get("type") == "session"), record.get("session"))
             record["status"] = "stopped" if stopped else "exited"
-            if final:
-                (self.dir / "final.md").write_text(final + "\n")
+            if texts and texts[-1]:
+                (self.dir / "final.md").write_text(texts[-1] + "\n")
             else:
                 (self.dir / "final.md").unlink(missing_ok=True)
             self.save(record)
@@ -155,32 +138,23 @@ class Lane:
         """Append a run and launch it. Caller holds the lock, so no refresh sees the run before its pid."""
         number = len(record["runs"]) + 1
         record["runs"].append({"run": number, "start": now()})
-        record["status"] = "running"
-        self.save(record)
+        self.save({**record, "status": "running"})
         argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
-                "--append-system-prompt", str(ENGINE / "roles" / "lane.md")]
-        argv += ["--resume", record["session"]] if resume else []
-        base = self.base(number)
-        env = {k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}
-        env.update(TSTACK_LANE=self.id, TSTACK_SEAT=str(self.seat))
-        command = ["sh", "-c", RUNNER, str(base), *argv, text]
+                "--append-system-prompt", str(ENGINE / "roles" / "lane.md")] + ["--resume", record["session"]] * resume
+        env = {**{k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}, "TSTACK_LANE": self.id, "TSTACK_SEAT": str(self.seat)}
+        command = ["sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), *argv, text]
         if SYSTEMD:
             spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
                      f"--working-directory={record['worktree']}", "-p", f"MemoryMax={record['memory']}"]
-            cpus = run(["systemctl", "show", "agents.slice", "-p", "AllowedCPUs", "--value"], check=False).stdout.strip()
-            spawn += ["-p", f"CPUAffinity={cpus}"] if cpus else []
-            run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
-            pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS).stdout
+            cpus = run(["systemctl", "show", "agents.slice", "-p", "AllowedCPUs", "--value"], check=False)
+            run(spawn + ["-p", f"CPUAffinity={cpus}"] * bool(cpus) + [f"--setenv={k}={v}" for k, v in env.items()]
+                + command, env=BUS)
+            pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
         else:
             pid = subprocess.Popen(command, cwd=record["worktree"], env=env, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True).pid
-        Path(f"{base}.pid").write_text(f"{str(pid).strip()}\n")
+        self.file(number, "pid").write_text(f"{pid}\n")
         return number
-
-
-def all_lanes(seat: Path) -> list:
-    root = seat / "state" / "lanes"
-    return [Lane(seat, p.name) for p in sorted(root.iterdir()) if (p / "lane.json").exists()] if root.is_dir() else []
 
 
 def github(record: dict):
@@ -189,30 +163,25 @@ def github(record: dict):
     return None if repo.startswith("/") else repo
 
 
-def main_clone(record: dict) -> Path:
-    return WORKTREES / record["project"] / "main" if github(record) else Path(record["repo"])
-
-
 def find_pr(lane: Lane, record: dict) -> str:
     """The PR URL, recorded or found by branch; '' when there is none or the repo is not on GitHub."""
     if record.get("pr") or not github(record):
         return record.get("pr") or ""
     found = json.loads(run(["gh", "pr", "list", "--repo", github(record), "--head", record["branch"], "--state", "all",
-                            "--json", "url", "--limit", "1"]).stdout or "[]")
+                            "--json", "url", "--limit", "1"]) or "[]")
     if found:
         lane.update(pr=found[0]["url"])
     return found[0]["url"] if found else ""
 
 
 def start(seat: Path, a) -> str:
-    path = Path(a.repo).expanduser()
-    if path.is_dir():
-        main = Path(git(path, "rev-parse", "--show-toplevel"))
+    if Path(a.repo).expanduser().is_dir():
+        main = Path(git(Path(a.repo).expanduser(), "rev-parse", "--show-toplevel"))
         origin = git(main, "remote", "get-url", "origin", check=False)
         match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", origin)
         slug = match.group(1) if match else None
     else:
-        slug, origin = a.repo, a.repo
+        slug = origin = a.repo
         main = WORKTREES / slug.split("/")[-1] / "main"
         if not main.exists():
             run(["gh", "repo", "clone", slug, str(main)])
@@ -221,16 +190,13 @@ def start(seat: Path, a) -> str:
                       or git(main, "rev-parse", "--abbrev-ref", "HEAD"))
     if origin:
         git(main, "fetch", "--quiet", "origin", base)
-    brief = Path(a.brief).read_text()
-    stem, number = f"{project}-{re.sub(r'[^a-z0-9]+', '-', a.name.lower()).strip('-')[:40]}-", 1
-    while True:
-        try:
-            (seat / "state" / "lanes" / f"{stem}{number}").mkdir(parents=True)
+    stem = f"{project}-{re.sub(r'[^a-z0-9]+', '-', a.name.lower()).strip('-')[:40]}"
+    for number in itertools.count(1):
+        with contextlib.suppress(FileExistsError):
+            (seat / "state" / "lanes" / f"{stem}-{number}").mkdir(parents=True)
             break
-        except FileExistsError:
-            number += 1
-    lane = Lane(seat, f"{stem}{number}")
-    worktree, branch = WORKTREES / project / lane.id, f"lane/{lane.id}"
+    lane = Lane(seat, f"{stem}-{number}")
+    worktree, branch, brief = WORKTREES / project / lane.id, f"lane/{lane.id}", Path(a.brief).read_text()
     git(main, "worktree", "add", "--quiet", "-b", branch, str(worktree), f"origin/{base}" if origin else base)
     (lane.dir / "brief.md").write_text(brief)
     record = {"id": lane.id, "project": project, "seat": str(seat),
@@ -245,7 +211,7 @@ def start(seat: Path, a) -> str:
     return lane.id
 
 
-def resume(lane: Lane, text: str) -> int:
+def resume(lane: Lane, text: str) -> str:
     lane.refresh()
     with lane.locked():
         record = lane.load()
@@ -253,7 +219,7 @@ def resume(lane: Lane, text: str) -> int:
             raise Fail(f"{lane.id} is running run {len(record['runs'])}; `lane stop {lane.id}` first")
         if not record.get("session"):
             raise Fail(f"{lane.id} has no omp session to resume")
-        return lane.begin_run(record, text, resume=True)
+        return f"{lane.id} run {lane.begin_run(record, text, resume=True)}"
 
 
 def stop(lane: Lane) -> str:
@@ -265,7 +231,7 @@ def stop(lane: Lane) -> str:
         run(["systemctl", "--user", "stop", lane.unit], env=BUS)
     else:
         with contextlib.suppress(ProcessLookupError, ValueError):
-            os.killpg(int(Path(f"{lane.base(number)}.pid").read_text()), signal.SIGTERM)
+            os.killpg(int(lane.file(number, "pid").read_text()), signal.SIGTERM)
     for _ in range(150):
         if not lane.alive(number):
             break
@@ -279,11 +245,11 @@ def merge(lane: Lane, admin: bool, auto: bool) -> str:
     url = find_pr(lane, record)
     if not url:
         raise Fail(f"no PR for {record['branch']} in {record['repo']}")
-    head = json.loads(run(["gh", "pr", "view", url, "--json", "headRefOid"]).stdout)["headRefOid"]
+    head = json.loads(run(["gh", "pr", "view", url, "--json", "headRefOid"]))["headRefOid"]
     # Run outside any clone, so gh deletes only the remote branch and leaves the worktree's checkout alone.
     run(["gh", "pr", "merge", url, "--squash", "--delete-branch", "--match-head-commit", head]
         + ["--admin"] * admin + ["--auto"] * auto, cwd="/")
-    after = json.loads(run(["gh", "pr", "view", url, "--json", "state,mergeCommit"]).stdout)
+    after = json.loads(run(["gh", "pr", "view", url, "--json", "state,mergeCommit"]))
     if after.get("state") != "MERGED":
         return f"auto-merge armed: {url} at {head[:12]}"
     sha = (after.get("mergeCommit") or {}).get("oid") or ""
@@ -291,65 +257,62 @@ def merge(lane: Lane, admin: bool, auto: bool) -> str:
     return f"merged: {url} at {head[:12]} as {sha[:12]}"
 
 
-def clean(lane: Lane) -> list:
+def clean(lane: Lane) -> str:
     record = lane.refresh()
-    main, worktree, done = main_clone(record), Path(record["worktree"]), []
-    if worktree.exists():
-        git(main, "worktree", "remove", str(worktree))
-        done.append(f"removed worktree {worktree}")
-    done.append(git(main, "branch", "-D", record["branch"]))
-    return done
+    main = WORKTREES / record["project"] / "main" if github(record) else Path(record["repo"])
+    done = []
+    if Path(record["worktree"]).exists():
+        git(main, "worktree", "remove", record["worktree"])
+        done.append(f"removed worktree {record['worktree']}")
+    return "\n".join(done + [git(main, "branch", "-D", record["branch"])])
 
 
-def facts(lane: Lane, record: dict) -> tuple:
-    runs = record.get("runs") or [{}]
+def summary(lane: Lane, record: dict) -> tuple:
     try:
         pr = find_pr(lane, record) or "-"
     except Fail as error:
         pr = f"? ({error})"
-    cost = sum(r.get("cost_usd") or 0 for r in record.get("runs") or [])
-    return runs[-1], pr, f"${cost:.2f}"
+    return (record.get("runs") or [{}])[-1], pr, f"${sum(r.get('cost_usd') or 0 for r in record.get('runs') or []):.2f}"
+
+
+def listing(seat: Path, show_all: bool) -> str:
+    root, rows = seat / "state" / "lanes", []
+    for lane in [Lane(seat, p.name) for p in sorted(root.iterdir()) if (p / "lane.json").exists()] if root.is_dir() else []:
+        record = lane.refresh()
+        if show_all or Path(record["worktree"]).exists():
+            last, pr, cost = summary(lane, record)
+            rows.append(f"{lane.id}\t{record['status']}\texit {exit_code(last)}\t{cost}\t{pr}\t"
+                        f"{last.get('end') or last.get('start') or record.get('created')}")
+    return "\n".join(rows)
 
 
 def show(lane: Lane) -> str:
     record = lane.refresh()
-    last, pr, cost = facts(lane, record)
-    gone = "" if Path(record["worktree"]).exists() else " (removed)"
+    last, pr, cost = summary(lane, record)
+    final = lane.dir / "final.md"
     out = [f"{lane.id}: {record['status']}, run {last.get('run', 0)} exit {exit_code(last)}, {cost}",
            f"repo {record['repo']}, branch {record['branch']} on {record['base']}, PR {pr}",
-           f"worktree {record['worktree']}{gone}", f"model {record['model']} {record['thinking']}, session {record.get('session')}"]
-    out += [f"run {r['run']}: {r.get('start')} to {r.get('end') or 'running'}, exit {exit_code(r)}, ${r.get('cost_usd') or 0:.2f}"
-            for r in record.get("runs") or []]
-    final = lane.dir / "final.md"
+           f"worktree {record['worktree']}" + ("" if Path(record["worktree"]).exists() else " (removed)"),
+           f"model {record['model']} {record['thinking']}, session {record.get('session')}"]
+    out += [f"run {r['run']}: {r.get('start')} to {r.get('end') or 'running'}, exit {exit_code(r)}, "
+            f"${r.get('cost_usd') or 0:.2f}" for r in record.get("runs") or []]
     if record["status"] == "running":
-        out.append("final answer: run in progress")
-    elif final.exists():
-        out += ["final answer (last 20 lines):", *final.read_text().rstrip("\n").splitlines()[-20:]]
-    else:
-        out.append(f"final answer: none (run {last.get('run', 0)} ended without one)")
-    return "\n".join(out)
+        return "\n".join(out + ["final answer: run in progress"])
+    if final.exists():
+        return "\n".join(out + ["final answer (last 20 lines):", *final.read_text().splitlines()[-20:]])
+    return "\n".join(out + [f"final answer: none (run {last.get('run', 0)} ended without one)"])
 
 
 def logs(lane: Lane, lines: int) -> str:
-    """The latest run as readable lines: assistant text, tool calls and failures, then stderr."""
-    record = lane.refresh()
-    base = lane.base(len(record.get("runs") or [{}]))
-    out = []
-    stream = Path(f"{base}.jsonl")
-    for line in stream.read_text(errors="replace").splitlines() if stream.exists() else []:
-        with contextlib.suppress(ValueError):
-            event = json.loads(line)
-            message = event.get("message") or {}
-            if event.get("type") == "message_end" and message.get("role") == "assistant":
-                out += [c["text"].strip() for c in message.get("content") or [] if c.get("type") == "text" and c.get("text")]
-            elif event.get("type") == "tool_execution_start":
-                out.append(f"> {event.get('toolName')}: {event.get('intent') or json.dumps(event.get('args'))[:200]}")
-            elif event.get("type") == "tool_execution_end" and event.get("isError"):
-                out.append(f"! {event.get('toolName')} failed")
-    err = Path(f"{base}.err")
-    if err.exists() and err.read_text().strip():
-        out += ["stderr:", err.read_text().strip()]
-    return "\n".join("\n".join(out).splitlines()[-lines:]) or f"no output yet in {stream}"
+    """The latest run as readable lines: assistant text and tool calls, then stderr."""
+    number, out = len(lane.refresh().get("runs") or [{}]), []
+    for event in events(lane.file(number, "jsonl")):
+        if assistant_text(event):
+            out.append(assistant_text(event))
+        elif event.get("type") == "tool_execution_start":
+            out.append(f"> {event.get('toolName')}: {event.get('intent') or json.dumps(event.get('args'))[:200]}")
+    err = lane.file(number, "err").read_text().strip() if lane.file(number, "err").exists() else ""
+    return "\n".join("\n".join(out + ["stderr:", err] * bool(err)).splitlines()[-lines:])
 
 
 def wait(lanes: list) -> str:
@@ -365,65 +328,47 @@ def wait(lanes: list) -> str:
         time.sleep(2)
 
 
-def parser() -> argparse.ArgumentParser:
-    top = argparse.ArgumentParser(prog="lane", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = top.add_subparsers(dest="cmd", required=True)
-
-    def add(name, help_text, *ids):
-        p = sub.add_parser(name, help=help_text, description=help_text)
-        p.add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/)")
-        for arg in ids:
-            p.add_argument(arg, nargs="+" if arg == "ids" else None)
-        return p
-
-    p = add("start", "make the worktree, start the first run detached, print the lane id", "name")
-    p.add_argument("--repo", required=True, help="OWNER/REPO (cloned to ~/worktrees/<repo>/main if absent) or a local clone")
-    p.add_argument("--brief", required=True)
-    p.add_argument("--base", help="default: origin's default branch, else the clone's current branch")
-    p.add_argument("--model", default="@sol")
-    p.add_argument("--thinking", default="high")
-    p.add_argument("--memory", default="8G", help="MemoryMax of the run's systemd unit (Linux)")
-    add("resume", "new run in the same omp session, prompted with TEXT", "id", "text")
-    add("list", "one line per lane: status, exit, cost, PR, age").add_argument(
-        "--all", action="store_true", help="include lanes whose worktree is gone")
-    add("show", "the lane's facts and the tail of its final answer", "id")
-    add("logs", "the latest run as readable lines", "id").add_argument("-n", type=int, default=60)
-    add("wait", "block until a run of any listed lane ends; print its id, exit and final answer", "ids")
-    add("stop", "stop the running run", "id")
-    p = add("merge", "squash-merge the lane's PR at its current head and delete the branch", "id")
-    p.add_argument("--admin", action="store_true")
-    p.add_argument("--auto", action="store_true")
-    add("clean", "remove the worktree and delete the local branch", "id")
-    return top
-
-
 def main(argv) -> int:
-    a = parser().parse_args(argv)
-    seat = find_seat(a.seat)
+    top = argparse.ArgumentParser(prog="lane", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub, p = top.add_subparsers(dest="cmd", required=True), {}
+    for name, args, text in (
+            ("start", ["name"], "make the worktree, start the first run detached, print the lane id"),
+            ("resume", ["id", "text"], "new run in the same omp session, prompted with TEXT"),
+            ("list", [], "one line per lane: status, exit, cost, PR, last run time"),
+            ("show", ["id"], "the lane's facts and the tail of its final answer"),
+            ("logs", ["id"], "the latest run as readable lines"),
+            ("wait", ["ids"], "block until a run of any listed lane ends; print its id, exit and final answer"),
+            ("stop", ["id"], "stop the running run"),
+            ("merge", ["id"], "squash-merge the lane's PR at its current head and delete the branch"),
+            ("clean", ["id"], "remove the worktree and delete the local branch")):
+        p[name] = sub.add_parser(name, help=text, description=text)
+        p[name].add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/)")
+        for arg in args:
+            p[name].add_argument(arg, nargs="+" if arg == "ids" else None)
+    p["start"].add_argument("--repo", required=True, help="OWNER/REPO (cloned to ~/worktrees/<repo>/main if absent) or a clone")
+    p["start"].add_argument("--brief", required=True)
+    p["start"].add_argument("--base", help="default: origin's default branch, else the clone's current branch")
+    p["start"].add_argument("--model", default="@sol")
+    p["start"].add_argument("--thinking", default="high")
+    p["start"].add_argument("--memory", default="8G", help="MemoryMax of the run's systemd unit (Linux)")
+    p["list"].add_argument("--all", action="store_true", help="include lanes whose worktree is gone")
+    p["logs"].add_argument("-n", type=int, default=60)
+    p["merge"].add_argument("--admin", action="store_true")
+    p["merge"].add_argument("--auto", action="store_true")
+    a = top.parse_args(argv)
+    if a.seat or os.environ.get("TSTACK_SEAT"):
+        seat = Path(a.seat or os.environ["TSTACK_SEAT"]).expanduser().resolve()
+    else:
+        seat = next((d for d in (Path.cwd().resolve(), *Path.cwd().resolve().parents) if (d / "state").is_dir()), None)
+        if not seat:
+            raise Fail("no seat: pass --seat DIR, set TSTACK_SEAT, or run inside a seat dir")
     lane = Lane(seat, a.id) if getattr(a, "id", None) else None
-    if a.cmd == "start":
-        print(start(seat, a))
-    elif a.cmd == "resume":
-        print(f"{a.id} run {resume(lane, a.text)}")
-    elif a.cmd == "list":
-        for item in all_lanes(seat):
-            record = item.refresh()
-            if a.all or Path(record["worktree"]).exists():
-                last, pr, cost = facts(item, record)
-                print(f"{item.id}\t{record['status']}\texit {exit_code(last)}\t{cost}\t{pr}\t"
-                      f"{last.get('end') or last.get('start') or record.get('created')}")
-    elif a.cmd == "show":
-        print(show(lane))
-    elif a.cmd == "logs":
-        print(logs(lane, a.n))
-    elif a.cmd == "wait":
-        print(wait([Lane(seat, i) for i in a.ids]))
-    elif a.cmd == "stop":
-        print(stop(lane))
-    elif a.cmd == "merge":
-        print(merge(lane, a.admin, a.auto))
-    elif a.cmd == "clean":
-        print("\n".join(clean(lane)))
+    out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text), "list": lambda: listing(seat, a.all),
+           "show": lambda: show(lane), "logs": lambda: logs(lane, a.n), "stop": lambda: stop(lane),
+           "wait": lambda: wait([Lane(seat, i) for i in a.ids]), "merge": lambda: merge(lane, a.admin, a.auto),
+           "clean": lambda: clean(lane)}[a.cmd]()
+    if out:
+        print(out)
     return 0
 
 

@@ -27,14 +27,12 @@ class Fail(Exception):
     pass
 
 
-def machine(explicit=None) -> str:
-    """--machine, $TSTACK_MACHINE, else the instance machine dir matching this host's short name."""
-    if explicit or os.environ.get("TSTACK_MACHINE"):
-        return explicit or os.environ["TSTACK_MACHINE"]
+def machine() -> str:
+    """$TSTACK_MACHINE, else the instance machine dir matching this host's short name, else that name."""
     host = socket.gethostname().split(".")[0]
     machines = INSTANCE / "machines"
     names = sorted(p.name for p in machines.iterdir() if p.is_dir()) if machines.is_dir() else []
-    return next((name for name in names if host == name or host.endswith("-" + name)), host)
+    return os.environ.get("TSTACK_MACHINE") or next((n for n in names if host == n or host.endswith("-" + n)), host)
 
 
 def owned(path: Path) -> bool:

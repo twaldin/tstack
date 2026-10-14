@@ -2,8 +2,6 @@ import json
 import os
 import shutil
 import sys
-import unittest
-from pathlib import Path
 
 from support import CODE, Sandbox, git
 
@@ -103,7 +101,3 @@ class Setup(Sandbox):
         assistant, project = (json.loads(c[-1])["props"]["markdown"] for c in upserts)
         self.assertIn("### Open questions\n\n- Ship? (`obj_q`)\n", assistant)
         self.assertIn("### Lanes\n\n```\nnone\n```\n\n### orch\n\n2 units in flight\n", project)
-
-
-if __name__ == "__main__":
-    unittest.main()

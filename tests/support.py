@@ -91,7 +91,8 @@ esac
 
 
 def git(cwd, *args) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                          check=True, capture_output=True, text=True).stdout.strip()
 
 
 class Sandbox(unittest.TestCase):
@@ -110,12 +111,7 @@ class Sandbox(unittest.TestCase):
         self.omp(answer="done", cost=0.02)
         self.env = {
             "HOME": str(self.home), "PATH": f"{self.stubs / 'bin'}:{os.environ['PATH']}",
-            "TSTACK_LAUNCHER": "process", "TSTACK_MACHINE": "box", "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8",
-            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
-            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
-        }
-        for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
-            os.environ.setdefault(key, self.env[key])
+            "TSTACK_LAUNCHER": "process", "TSTACK_MACHINE": "box", "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}
         self.brief = self.root / "brief.md"
         self.brief.write_text("Reply with the word done.\n")
 
@@ -125,23 +121,20 @@ class Sandbox(unittest.TestCase):
     def clone(self, origin: Path, dest: Path, files=None) -> Path:
         """A bare `origin` seeded with `files`, cloned to `dest`."""
         seed = self.root / f"seed-{origin.stem}"
-        subprocess.run(["git", "init", "--quiet", "-b", "main", str(seed)], check=True)
+        git(self.root, "init", "--quiet", "-b", "main", str(seed))
         for name, text in (files or {"README": "demo\n"}).items():
             (seed / name).parent.mkdir(parents=True, exist_ok=True)
             (seed / name).write_text(text)
             (seed / name).chmod(0o755 if name.startswith("bin/") else 0o644)
         git(seed, "add", "-A")
         git(seed, "commit", "--quiet", "-m", "seed")
-        subprocess.run(["git", "clone", "--quiet", "--bare", str(seed), str(origin)], check=True)
-        subprocess.run(["git", "clone", "--quiet", str(origin), str(dest)], check=True)
+        git(self.root, "clone", "--quiet", "--bare", str(seed), str(origin))
+        git(self.root, "clone", "--quiet", str(origin), str(dest))
         return dest
 
-    def project(self) -> Path:
-        return self.clone(self.root / "demo.git", self.home / "worktrees" / "demo" / "main")
-
-    def cli(self, tool, *args, check=True, timeout=60) -> subprocess.CompletedProcess:
+    def cli(self, tool, *args, check=True) -> subprocess.CompletedProcess:
         result = subprocess.run([sys.executable, str(CODE / "bin" / tool), *args], env=self.env, cwd=self.seat,
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, timeout=60)
         if check and result.returncode:
             self.fail(f"{tool} {' '.join(args)}: exit {result.returncode}\n{result.stdout}{result.stderr}")
         return result
@@ -160,6 +153,3 @@ class Sandbox(unittest.TestCase):
                 return True
             time.sleep(0.1)
         return False
-
-    def gone(self, pid: int) -> bool:
-        return self.until(lambda: subprocess.run(["ps", "-p", str(pid)], capture_output=True).returncode != 0)

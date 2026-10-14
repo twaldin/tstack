@@ -1,4 +1,5 @@
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from support import Sandbox, git
 class LaneRuns(Sandbox):
     def setUp(self):
         super().setUp()
-        self.main = self.project()
+        self.main = self.clone(self.root / "demo.git", self.home / "worktrees" / "demo" / "main")
 
     def start(self, *extra) -> str:
         return self.cli("lane", "start", "Fix it", "--repo", "acme/demo", "--brief", str(self.brief), *extra).stdout.strip()
@@ -56,23 +57,19 @@ class LaneRuns(Sandbox):
         run = self.seat / "state" / "run" / "lanes" / lane_id
         self.assertTrue(self.until(lambda: (run / "run-1.jsonl").exists() and (run / "run-1.jsonl").read_text()))
         self.assertEqual(self.cli("lane", "stop", lane_id).stdout, f"{lane_id} stopped (run 1)\n")
-        self.assertTrue(self.gone(int((run / "run-1.pid").read_text())))
+        pid = (run / "run-1.pid").read_text().strip()
+        self.assertTrue(self.until(lambda: subprocess.run(["ps", "-p", pid], capture_output=True).returncode))
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} stopped exit -\n(no final answer)\n")
         self.assertEqual(self.cli("lane", "resume", lane_id, "go on").stdout, f"{lane_id} run 2\n")
 
-    def test_resume_while_running_names_the_run(self):
-        self.brief.write_text("SLOW\n")
-        lane_id = self.start()
-        result = self.cli("lane", "resume", lane_id, "more", check=False)
-        self.assertEqual(result.stderr, f"lane: {lane_id} is running run 1; `lane stop {lane_id}` first\n")
-        self.cli("lane", "stop", lane_id)
-
-    def test_wait_returns_the_first_lane_to_finish(self):
+    def test_wait_returns_the_first_lane_to_finish_and_resume_names_a_running_one(self):
         self.brief.write_text("SLOW\n")
         slow = self.start()
         self.brief.write_text("quick\n")
         quick = self.start()
         self.assertEqual(self.cli("lane", "wait", slow, quick).stdout, f"{quick} exited exit 0\ndone\n")
+        result = self.cli("lane", "resume", slow, "more", check=False)
+        self.assertEqual(result.stderr, f"lane: {slow} is running run 1; `lane stop {slow}` first\n")
         self.cli("lane", "stop", slow)
 
     def test_systemd_runs_a_user_unit_that_stop_stops(self):
@@ -146,7 +143,3 @@ class LaneRecords(Sandbox):
         self.assertEqual(self.cli("lane", "resume", "demo-old-1", "rebase").stdout, "demo-old-1 run 2\n")
         self.cli("lane", "wait", "demo-old-1")
         self.assertEqual(self.log("omp.log")[0]["args"][-3:], ["--resume", "/s/2026_old.jsonl", "rebase"])
-
-
-if __name__ == "__main__":
-    unittest.main()
