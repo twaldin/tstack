@@ -20,7 +20,7 @@ Agents here run pstack's playbooks and principles inside omp. Before engineering
 | Lane | a detached `omp -p` in `~/worktrees/<project>/<id>` | `~/tstack/roles/lane.md` plus its brief |
 | Subagent | omp `task` inside any of the above | its brief |
 
-- A seat wakes when a background bash job it owns ends (`async: true`, `timeout: 0`). The jobs are `lane wait`, `watch-pr --until change`, `easl ask … --wait` and a `sleep` heartbeat. After a restart, `playbooks/session-pickup.md` re-arms them from state.
+- A seat wakes when a background bash job it owns ends (`async: true`, `timeout: 0`). The jobs are `lane wait`, `watch-pr --until change`, `easl ask … --wait` and a `sleep` heartbeat. After a restart, `skill://poteto-mode/playbooks/session-pickup.md` re-arms them from state.
 - Work that writes code or must outlive you is a lane: `lane start <name> --repo <owner/repo> --brief <file>`. Short or read-only parallel work is a `task` subagent with an agent type from `omp.md`.
 - A seat's state lives on disk in its `state/`: lanes in `state/lanes/<id>/`, orch's store in `state/orch/`. Your conversation is a cache; read state again before a consequential action.
 - Subagents and lanes see none of your conversation. Brief them completely: outcome, scope, context, acceptance and the exact proof.

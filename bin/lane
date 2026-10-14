@@ -142,7 +142,7 @@ class Lane:
         argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
                 "--append-system-prompt", str(ENGINE / "roles" / "lane.md")] + ["--resume", record["session"]] * resume
         env = {**{k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}, "TSTACK_LANE": self.id, "TSTACK_SEAT": str(self.seat)}
-        command = ["sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), *argv, text]
+        command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), *argv, text]
         if SYSTEMD:
             spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
                      f"--working-directory={record['worktree']}", "-p", f"MemoryMax={record['memory']}"]

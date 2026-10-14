@@ -12,7 +12,7 @@ A turn starts when a background bash job you own ends (`async: true`, `timeout: 
 - `text inbox --wait` for the operator's texts.
 - `sleep 1800`, the heartbeat for the digest and sweeps.
 
-Handle what the ended job printed, then re-arm that job. After any restart, follow `playbooks/session-pickup.md` and re-arm every job from state. Nothing else wakes you. There is no dispatcher and no liveness timer: a dead seat shows as a plain shell on the board until someone runs `easl agent.restart --mode resume` on it.
+Handle what the ended job printed, then re-arm that job. After any restart, follow `skill://poteto-mode/playbooks/session-pickup.md` and re-arm every job from state. Nothing else wakes you. There is no dispatcher and no liveness timer: a dead seat shows as a plain shell on the board until someone runs `easl agent.restart --mode resume` on it.
 
 ## State
 
