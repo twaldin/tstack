@@ -20,7 +20,11 @@ with open(stubs / f"{Path(__file__).name}.log", "a") as log:
 '''
 FAKES = {
     # A session event, then one assistant message after omp.json's sleep (60 s when the prompt says SLOW).
+    # Like omp, it takes a moment to shut down on SIGTERM; omp.pid holds its pid.
     "omp": PRELUDE + r'''
+import signal
+signal.signal(signal.SIGTERM, lambda *_: (time.sleep(1), sys.exit(143)))
+(stubs / "omp.pid").write_text(str(os.getpid()))
 cfg = json.loads((stubs / "omp.json").read_text())
 print(json.dumps({"type": "session", "id": args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())}), flush=True)
 time.sleep(60 if "SLOW" in args[-1] else cfg.get("sleep", 0))
@@ -46,7 +50,10 @@ print((stubs / "asks.json").read_text() if args[:2] == ["ask", "list"] else json
 ''',
     "bun": PRELUDE,
     # Starts the command detached with its --working-directory and --setenv, keeping its pid for systemctl.
+    # Real systemd-run expands $VAR in the command unless told not to.
     "systemd-run": PRELUDE + r'''
+if "--expand-environment=no" not in args:
+    sys.exit("fake systemd-run: would expand $ in the command line")
 env, cwd, unit, i = dict(os.environ), None, None, 0
 while args[i].startswith("-"):
     key, _, value = args[i].partition("=")

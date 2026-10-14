@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tstack: link this host's omp setup from the engine and instance, update both, and draw one note per seat.
 
-setup  links skills, agent types, bins and the update units; writes ~/.omp/agent/AGENTS.md; installs orch.
+setup  links skills, agent types and bins; writes the update units and ~/.omp/agent/AGENTS.md; installs orch.
 update git pull --ff-only on the engine and instance, then setup.
 board  one easl note per seat: its lanes, orch status and open easl questions.
 """
@@ -70,6 +70,17 @@ def link_dir(target: Path, wanted: dict, out: list) -> None:
         out.append(f"linked {path} -> {source}")
 
 
+def write_owned(path: Path, text: str, out: list) -> None:
+    """Write a file setup generates. Anything else at `path`, a link included, is reported and left alone."""
+    current = None if path.is_symlink() or not path.is_file() else path.read_text(errors="replace")
+    if path.is_symlink() or (path.exists() and MARK not in (current or "")[:500]):
+        out.append(f"left {path}: not written by tstack setup")
+    elif current != text:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        out.append(f"wrote {path}")
+
+
 def setup(name: str) -> int:
     out, failed = [], False
     box = INSTANCE / "machines" / name
@@ -83,18 +94,15 @@ def setup(name: str) -> int:
                                               lambda p: p.is_file() and os.access(p, os.X_OK)), out)
     units, unit_dir = ((ENGINE / "launchd", HOME / "Library" / "LaunchAgents") if sys.platform == "darwin"
                        else (ENGINE / "systemd", HOME / ".config" / "systemd" / "user"))
-    link_dir(unit_dir, sources([units], Path.is_file), out)
+    for template in sorted(units.iterdir()) if units.is_dir() else []:
+        text = template.read_text()
+        for key, value in (("@ENGINE@", ENGINE), ("@INSTANCE@", INSTANCE), ("@MACHINE@", name)):
+            text = text.replace(key, str(value))
+        write_owned(unit_dir / template.name, text, out)
 
     parts = [p for p in (ENGINE / "global.md", INSTANCE / "global.md", box / "global.md") if p.is_file()]
-    text = (f"<!-- {MARK} from {', '.join(map(str, parts))}. Edit those, then rerun `tstack setup`. -->\n"
-            + "".join(f"\n{p.read_text().strip()}\n" for p in parts))
-    agents_md = OMP / "AGENTS.md"
-    current = agents_md.read_text(errors="replace") if agents_md.is_file() else None
-    if current is not None and MARK not in current[:500]:
-        out.append(f"left {agents_md}: not written by tstack setup")
-    elif current != text:
-        agents_md.write_text(text)
-        out.append(f"wrote {agents_md}")
+    header = f"<!-- {MARK} from {', '.join(map(str, parts))}. Edit those, then rerun `tstack setup`. -->\n"
+    write_owned(OMP / "AGENTS.md", header + "".join(f"\n{p.read_text().strip()}\n" for p in parts), out)
 
     scripts = ENGINE / "pstack" / "skills" / "poteto-mode" / "scripts"
     if not (scripts / "package.json").is_file():

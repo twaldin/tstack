@@ -11,7 +11,7 @@ newest GitHub deployment on the merge SHA and on a later containing commit, with
   change    any fact differs from the first poll (the report then starts with the changed keys)
   merged    the PR is merged or closed
   checks    no check is queued or running (an empty list counts as not started for two minutes)
-  deployed  a deploy or release job, or a deployment, finished with a result other than skipped or cancelled
+  deployed  a deployment, or while there is none a deploy or release job, finished other than skipped or cancelled
 Every mode also stops when the PR is closed without merging. Exit 0 with facts; 1 when gh fails, with its error.
 """
 
@@ -37,10 +37,10 @@ THREADS_QUERY = """query($o:String!,$r:String!,$n:Int!,$endCursor:String){
   }}
 }"""
 RUNNING = {"QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "EXPECTED"}
-# A job counts as a deploy or release when its own name starts with either word. Its own name is what follows
-# any "caller / " prefix a reusable workflow adds, so the jobs under a "deploy /" workflow and gates such as
-# "check-if-should-deploy" stay out.
-DEPLOY_JOB = re.compile(r"deploy|release", re.I)
+# A job counts as a deploy or release when its own name is that word, alone or followed by a space. Its own name
+# is what follows any "caller / " prefix a reusable workflow adds, so the jobs under a "deploy /" workflow, gates
+# such as "check-if-should-deploy" and preparation such as "deploy-slow-check-policy" stay out.
+DEPLOY_JOB = re.compile(r"(deploy|release)( |$)", re.I)
 EMPTY_CHECKS_GRACE = 120
 
 
@@ -138,16 +138,17 @@ def after_merge(repo, pr):
 
 
 def stopped(until, first, now, waited):
+    if now["state"] == "CLOSED" or (until == "merged" and now["state"] != "OPEN"):
+        return True
     if until == "change":
         return now != first
-    if now["state"] != "OPEN" and (until == "merged" or now["state"] == "CLOSED"):
-        return True
     if until == "checks":
         started = bool(now["checks"]) or waited >= EMPTY_CHECKS_GRACE
         return started and not any(str(c["result"]).upper() in RUNNING for c in now["checks"])
     merge = now["merge"] or {"runs": [], "deployments": []}
-    return (any(finished(j["result"]) for r in merge["runs"] for j in r["jobs"])
-            or any(finished(d["state"]) for d in merge["deployments"]))
+    if merge["deployments"]:
+        return any(finished(d["state"]) for d in merge["deployments"])
+    return any(finished(j["result"]) for r in merge["runs"] for j in r["jobs"])
 
 
 def headline(body):
@@ -225,7 +226,7 @@ def main():
             report = snapshot(repo, number)
     except GhError as error:
         sys.exit(f"watch-pr: {error}")
-    if args.until == "change":
+    if args.until == "change" and report is not first:
         report = {"changed": [key for key in report if report[key] != first[key]], **report}
     print(json.dumps(report, indent=2) if args.json else render(report))
 

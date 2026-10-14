@@ -8,7 +8,9 @@ from support import Sandbox, git
 class LaneRuns(Sandbox):
     def setUp(self):
         super().setUp()
-        self.main = self.clone(self.root / "demo.git", self.home / "worktrees" / "demo" / "main")
+        # A local origin whose path reads as github.com/acme/demo, so lanes see the slug acme/demo.
+        self.origin = self.root / "github.com" / "acme" / "demo.git"
+        self.main = self.clone(self.origin, self.home / "worktrees" / "demo" / "main")
 
     def start(self, *extra) -> str:
         return self.cli("lane", "start", "Fix it", "--repo", "acme/demo", "--brief", str(self.brief), *extra).stdout.strip()
@@ -50,15 +52,15 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.cli("lane", "show", lane_id).stdout.splitlines()[-1],
                          "final answer: none (run 1 ended without one)")
 
-    def test_stop_ends_the_run_and_wait_sees_it(self):
+    def test_stop_returns_after_omp_exits_and_wait_sees_it(self):
         self.brief.write_text("SLOW\n")
         lane_id = self.start()
         run = self.seat / "state" / "run" / "lanes" / lane_id
         self.assertTrue(self.until(lambda: (run / "run-1.jsonl").exists() and (run / "run-1.jsonl").read_text()))
+        omp = (self.stubs / "omp.pid").read_text()
         self.assertEqual(self.cli("lane", "stop", lane_id).stdout, f"{lane_id} stopped (run 1)\n")
-        pid = (run / "run-1.pid").read_text().strip()
-        self.assertTrue(self.until(lambda: subprocess.run(["ps", "-p", pid], capture_output=True).returncode))
-        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} stopped exit -\n(no final answer)\n")
+        self.assertEqual(subprocess.run(["ps", "-p", omp], capture_output=True).returncode, 1)
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} stopped exit 143\n(no final answer)\n")
         self.assertEqual(self.cli("lane", "resume", lane_id, "go on").stdout, f"{lane_id} run 2\n")
 
     def test_wait_returns_the_first_lane_to_finish_and_resume_names_a_running_one(self):
@@ -73,8 +75,10 @@ class LaneRuns(Sandbox):
 
     def test_systemd_runs_a_user_unit_that_stop_stops(self):
         self.env["TSTACK_LAUNCHER"] = "systemd"
+        self.brief.write_text("Print ${HOME} and $PATH as written.\n")
         lane_id = self.start("--memory", "4G")
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+        self.assertTrue(self.log("omp")[0]["args"][-1].endswith("Print ${HOME} and $PATH as written.\n"))
         spawn = self.log("systemd-run")[0]["args"]
         self.assertEqual(spawn[:4], ["--user", "--collect", "--quiet", f"--unit=tstack-lane-{lane_id}"])
         self.assertIn("MemoryMax=4G", spawn)
@@ -84,10 +88,12 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.cli("lane", "stop", slow).stdout, f"{slow} stopped (run 1)\n")
         self.assertIn(["--user", "stop", f"tstack-lane-{slow}"], [c["args"] for c in self.log("systemctl")])
 
-    def test_clean_removes_the_worktree_and_branch(self):
-        lane_id = self.start()
+    def test_clean_removes_the_worktree_and_branch_from_the_clone_the_lane_came_from(self):
+        other = self.root / "elsewhere"
+        git(self.root, "clone", "--quiet", str(self.origin), str(other))
+        lane_id = self.cli("lane", "start", "Fix it", "--repo", str(other), "--brief", str(self.brief)).stdout.strip()
         self.cli("lane", "wait", lane_id)
-        sha = git(self.main, "rev-parse", "--short", f"lane/{lane_id}")
+        sha = git(other, "rev-parse", "--short", f"lane/{lane_id}")
         worktree = self.home / "worktrees" / "demo" / lane_id
         self.assertEqual(self.cli("lane", "clean", lane_id).stdout,
                          f"removed worktree {worktree}\nDeleted branch lane/{lane_id} (was {sha}).\n")

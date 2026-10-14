@@ -17,7 +17,7 @@ An instance repo at `~/agents` holds one operator's rules, machines, projects an
 You need git, Python 3.9 or newer, `gh` logged in, bun, omp and easl.
 
 1. Clone this repo to `~/tstack` and the instance to `~/agents`.
-2. Run `~/tstack/bin/tstack setup`, adding `--machine <name>` when the host name differs from the instance's machine directory. It links pstack's skills, the instance's skills, the agent types, the bins and the update units, writes `~/.omp/agent/AGENTS.md` from the `global.md` files, and installs orch's dependencies. It replaces only its own links and reports anything else in the way.
+2. Run `~/tstack/bin/tstack setup`, adding `--machine <name>` when the host name differs from the instance's machine directory. It links pstack's skills, the instance's skills, the agent types and the bins. It writes the update units, which carry the engine, instance and machine it ran with, and `~/.omp/agent/AGENTS.md` from the `global.md` files, then installs orch's dependencies. It replaces only its own links and files and reports anything else in the way.
 3. Turn on hourly updates once: `systemctl --user enable --now tstack-update.timer` on Linux, or `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tstack.update.plist` on macOS.
 
 | Variable | Default | Sets |

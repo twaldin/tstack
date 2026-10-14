@@ -29,8 +29,9 @@ PASS_ENV = ("PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR",
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 BUS = {**os.environ, "XDG_RUNTIME_DIR": RUNTIME,
        "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={RUNTIME}/bus"}
-# The run goes through sh so its exit code outlives the detached process that ran it.
-RUNNER = '"$@" > "$0.jsonl" 2> "$0.err"; echo $? > "$0.exit"'
+# The run goes through sh so its exit code outlives the detached process that ran it. The TERM trap keeps the
+# shell waiting until omp has exited, and the exit file appears whole, by rename.
+RUNNER = 'trap : TERM; "$@" > "$0.jsonl" 2> "$0.err"; echo $? > "$0.exit.tmp"; mv -f "$0.exit.tmp" "$0.exit"'
 
 
 class Fail(Exception):
@@ -145,7 +146,8 @@ class Lane:
         command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), *argv, text]
         if SYSTEMD:
             spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
-                     f"--working-directory={record['worktree']}", "-p", f"MemoryMax={record['memory']}"]
+                     "--expand-environment=no", f"--working-directory={record['worktree']}",
+                     "-p", f"MemoryMax={record['memory']}"]
             run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
             pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
         else:
@@ -228,11 +230,14 @@ def stop(lane: Lane) -> str:
     if SYSTEMD:
         run(["systemctl", "--user", "stop", lane.unit], env=BUS)
     else:
-        with contextlib.suppress(ProcessLookupError, ValueError):
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(int(lane.file(number, "pid").read_text()), signal.SIGTERM)
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 90
     while lane.alive(number) and time.monotonic() < deadline:
         time.sleep(0.2)
+    if lane.alive(number):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(int(lane.file(number, "pid").read_text()), signal.SIGKILL)
     lane.refresh(stopped=True)
     return f"{lane.id} stopped (run {number})"
 
@@ -256,12 +261,14 @@ def merge(lane: Lane, admin: bool, auto: bool) -> str:
 
 def clean(lane: Lane) -> str:
     record = lane.refresh()
-    main = WORKTREES / record["project"] / "main" if github(record) else Path(record["repo"])
-    done = []
-    if Path(record["worktree"]).exists():
-        git(main, "worktree", "remove", record["worktree"])
-        done.append(f"removed worktree {record['worktree']}")
-    return "\n".join(done + [git(main, "branch", "-D", record["branch"])])
+    worktree, done = Path(record["worktree"]), []
+    if worktree.exists():
+        repo = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        git(repo, "worktree", "remove", str(worktree))
+        done.append(f"removed worktree {worktree}")
+    else:
+        repo = WORKTREES / record["project"] / "main" if github(record) else record["repo"]
+    return "\n".join(done + [git(repo, "branch", "-D", record["branch"])])
 
 
 def summary(lane: Lane, record: dict) -> tuple:
