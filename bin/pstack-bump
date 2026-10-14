@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# pstack-bump <sha-or-ref> [upstream-repo]
+# Commits upstream's pstack/ at <sha-or-ref>, unchanged, onto branch pstack-upstream, merges that
+# into the current branch, removes again every path pstack/DROPPED lists, and reports our edits and
+# any conflicts. A conflicted merge stays in progress: resolve the files, then `git commit`.
+set -euo pipefail
+ref=${1:?usage: pstack-bump <sha-or-ref> [upstream-repo]}
+upstream=${2:-https://github.com/cursor/plugins.git}
+root=$(git rev-parse --show-toplevel)
+gitdir=$(git rev-parse --absolute-git-dir)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+git init -q --bare "$tmp/up.git"
+git -C "$tmp/up.git" fetch -q --no-tags --depth 1 "$upstream" "$ref"
+sha=$(git -C "$tmp/up.git" rev-parse FETCH_HEAD)
+mkdir "$tmp/tree"
+git -C "$tmp/up.git" archive FETCH_HEAD pstack | tar -x -C "$tmp/tree"
+GIT_INDEX_FILE="$tmp/index" git -C "$tmp/tree" --git-dir="$gitdir" --work-tree=. add -A -f pstack
+tree=$(GIT_INDEX_FILE="$tmp/index" git --git-dir="$gitdir" write-tree)
+
+cd "$root"
+parent=$(git rev-parse -q --verify refs/heads/pstack-upstream || true)
+if [[ -z $parent || $(git rev-parse "$parent^{tree}") != "$tree" ]]; then
+  snap=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "pstack: upstream cursor/plugins $sha")
+  git update-ref refs/heads/pstack-upstream "$snap"
+fi
+if ! out=$(git merge --no-commit --no-ff --allow-unrelated-histories pstack-upstream 2>&1); then
+  git rev-parse -q --verify MERGE_HEAD >/dev/null || { printf '%s\n' "$out" >&2; exit 1; }
+fi
+
+if [[ -f pstack/DROPPED ]]; then
+  git ls-files -- pstack | sort -u | while IFS= read -r path; do
+    while IFS= read -r glob; do
+      [[ -z $glob || $glob == '#'* ]] && continue
+      if [[ $path == pstack/$glob ]]; then git rm -q -f -- "$path"; break; fi
+    done < pstack/DROPPED
+  done
+fi
+
+conflicts=$(git diff --name-only --diff-filter=U)
+if [[ -z $conflicts ]] && git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+  git commit -q --no-edit -m "pstack: merge upstream cursor/plugins $sha"
+fi
+echo "pstack-upstream is cursor/plugins $sha"
+echo "our edits (git diff pstack-upstream -- pstack/):"
+git diff --stat --diff-filter=AM pstack-upstream -- pstack/
+echo "dropped: $(git diff --name-only --diff-filter=D pstack-upstream -- pstack/ | wc -l | tr -d ' ') files"
+if [[ -n $conflicts ]]; then
+  printf '%s\n' "$conflicts" | sed 's/^/conflict: /'
+  echo "resolve the conflicts above, then git commit"
+  exit 1
+fi
