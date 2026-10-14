@@ -1,4 +1,4 @@
-# Installed by tstack setup from @TSTACK_HOME@/systemd/. Edit the template, not this file.
+# Linked by tstack setup. Enable once: systemctl --user enable --now tstack-update.timer
 [Unit]
 Description=Run tstack update at boot and hourly
 
