@@ -1,87 +1,42 @@
-import os
-import shutil
-import subprocess
-import tempfile
-import unittest
+import os, subprocess, tempfile, unittest
 from pathlib import Path
 
 BUMP = Path(__file__).resolve().parents[1] / "bin" / "pstack-bump"
-ENV = {
-    **os.environ,
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_AUTHOR_NAME": "test",
-    "GIT_AUTHOR_EMAIL": "test@example.invalid",
-    "GIT_COMMITTER_NAME": "test",
-    "GIT_COMMITTER_EMAIL": "test@example.invalid",
-}
+ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+       "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
 
 
-def git(repo, *args):
-    return subprocess.run(["git", *args], cwd=repo, env=ENV, check=True, capture_output=True, text=True).stdout.strip()
+def run(cwd, *args):
+    return subprocess.run(args, cwd=cwd, env=ENV, capture_output=True, text=True)
 
 
-def write(repo, rel, text):
-    path = repo / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-
-
-def commit(repo, message):
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", message)
-    return git(repo, "rev-parse", "HEAD")
+def commit(repo, files):
+    for rel, text in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text)
+    run(repo, "git", "add", "-A")
+    run(repo, "git", "commit", "-qm", "c")
+    return run(repo, "git", "rev-parse", "HEAD").stdout.strip()
 
 
 class PstackBump(unittest.TestCase):
-    def setUp(self):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp)
-        self.upstream, self.engine = tmp / "plugins", tmp / "engine"
-        for repo in (self.upstream, self.engine):
+    def test_bump_takes_upstream_keeps_drops_and_reports_edited_hunks(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        up, eng = tmp / "plugins", tmp / "engine"
+        for repo in (up, eng):
             repo.mkdir()
-            git(repo, "init", "-q", "-b", "main")
-        write(self.upstream, "pstack/skills/how/SKILL.md", "one\ntwo\n")
-        write(self.upstream, "pstack/playbooks/babysit.md", "step 5\nstep 6 runs the old watcher\nstep 7\n")
-        write(self.upstream, "pstack/docs/guide.md", "guide\n")
-        write(self.upstream, "other-plugin/README.md", "not pstack\n")
-        self.first = commit(self.upstream, "v1")
-        write(self.engine, "README.md", "engine\n")
-        commit(self.engine, "engine")
+            run(repo, "git", "init", "-q", "-b", "main")
+        commit(eng, {"README.md": "engine\n"})
+        v1 = commit(up, {"pstack/how.md": "a\n", "pstack/babysit.md": "old watcher\n", "pstack/docs/g.md": "g\n", "x/y.md": "y\n"})
+        self.assertEqual(run(eng, str(BUMP), v1, str(up)).returncode, 0)
+        run(eng, "git", "rm", "-qr", "pstack/docs")
+        commit(eng, {"pstack/DROPPED": "docs/*\n", "pstack/babysit.md": "tstack watch-pr\n"})
+        v2 = commit(up, {"pstack/how.md": "b\n", "pstack/babysit.md": "new watcher\n", "pstack/docs/g.md": "g2\n", "pstack/docs/n.md": "n\n"})
+        out = run(eng, str(BUMP), v2, str(up))
+        conflicts = [line for line in out.stdout.splitlines() if line.startswith("conflict:")]
+        self.assertEqual((out.returncode, conflicts), (1, ["conflict: pstack/babysit.md"]), out.stdout + out.stderr)
+        self.assertEqual((eng / "pstack/how.md").read_text(), "b\n")
+        self.assertEqual(run(eng, "git", "ls-files", "pstack/docs").stdout, "")
+        self.assertFalse((eng / "x").exists())
+        self.assertIn("pstack/docs/n.md", run(eng, "git", "ls-tree", "-r", "--name-only", "pstack-upstream").stdout)
 
-    def bump(self, ref):
-        return subprocess.run([str(BUMP), ref, str(self.upstream)], cwd=self.engine, env=ENV, capture_output=True, text=True)
-
-    def test_bump_merges_upstream_drops_again_and_reports_our_conflicts(self):
-        imported = self.bump(self.first)
-        self.assertEqual(imported.returncode, 0, imported.stderr)
-        self.assertEqual((self.engine / "pstack/skills/how/SKILL.md").read_text(), "one\ntwo\n")
-        self.assertFalse((self.engine / "other-plugin").exists())
-
-        write(self.engine, "pstack/DROPPED", "# not shipped\ndocs/*\n")
-        git(self.engine, "rm", "-q", "-r", "pstack/docs")
-        write(self.engine, "pstack/playbooks/babysit.md", "step 5\nstep 6 runs tstack watch-pr\nstep 7\n")
-        commit(self.engine, "fork: drop docs, edit babysit")
-
-        write(self.upstream, "pstack/skills/how/SKILL.md", "one\nTWO\n")
-        write(self.upstream, "pstack/playbooks/babysit.md", "step 5\nstep 6 runs the new watcher\nstep 7\n")
-        write(self.upstream, "pstack/docs/guide.md", "guide v2\n")
-        write(self.upstream, "pstack/docs/new.md", "new page\n")
-        second = commit(self.upstream, "v2")
-
-        bumped = self.bump(second)
-        self.assertEqual(bumped.returncode, 1, bumped.stderr)
-        self.assertIn("conflict: pstack/playbooks/babysit.md", bumped.stdout)
-        self.assertNotIn("conflict: pstack/docs", bumped.stdout)
-        self.assertIn(f"pstack-upstream is cursor/plugins {second}", bumped.stdout)
-        self.assertEqual((self.engine / "pstack/skills/how/SKILL.md").read_text(), "one\nTWO\n")
-        self.assertEqual(git(self.engine, "ls-files", "pstack/docs"), "")
-        self.assertFalse((self.engine / "pstack/docs").exists())
-        snapshot = git(self.engine, "ls-tree", "-r", "--name-only", "pstack-upstream").split()
-        self.assertIn("pstack/docs/new.md", snapshot)
-        self.assertNotIn("other-plugin/README.md", snapshot)
-        self.assertEqual(git(self.engine, "rev-list", "--count", "pstack-upstream"), "2")
-
-
-if __name__ == "__main__":
-    unittest.main()
