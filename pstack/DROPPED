@@ -1,0 +1,37 @@
+# Paths under pstack/ that tstack does not ship, one glob per line (* also matches /).
+# bin/pstack-bump removes them again after every upstream merge.
+
+# Cursor packaging and the human guide
+.cursor-plugin/*
+plugin.json
+README.md
+assets/*
+docs/*
+
+# Cursor Automations (Slack triage); intake is the assistant's job
+automations/*
+
+# Replaced by tstack's bin/watch-pr
+skills/poteto-mode/scripts/watch-pr/*
+
+# Enforces the multi-phase plan format
+skills/poteto-mode/scripts/check-plan.*
+
+# Reads Cursor transcripts; lane clean removes lane worktrees
+skills/poteto-mode/scripts/worktree-audit.sh
+
+# Built on Cursor cloud VMs and pinned chats
+skills/poteto-mode/playbooks/multi-phase-plan.md
+skills/poteto-mode/playbooks/worktree-cleanup.md
+
+# Skills no seat routes to; omp model roles replace setup-pstack
+skills/setup-pstack/*
+skills/poteto-help/*
+skills/automate-me/*
+skills/make-bot-ui/*
+skills/recall/*
+skills/reflect/*
+skills/teach/*
+skills/correct/*
+skills/create-verification-skill/*
+skills/maintain-verification-skill/*
