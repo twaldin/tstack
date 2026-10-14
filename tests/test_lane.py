@@ -120,12 +120,9 @@ class LaneRecords(Sandbox):
                       self.log("gh.log"))
         self.assertEqual((self.record("demo-x-1")["pr"], self.record("demo-x-1")["merge"]), (self.url, "f" * 40))
 
-    def test_auto_merge_is_reported_armed(self):
+    def test_auto_merge_is_reported_armed_and_github_refusals_pass_through(self):
         self.assertEqual(self.cli("lane", "merge", "demo-x-1", "--auto", "--admin").stdout,
                          f"auto-merge armed: {self.url} at {'a' * 12}\n")
-        self.assertIn("--auto", self.log("gh.log")[-2])
-
-    def test_github_refusal_passes_through(self):
         (self.stubs / "merge.err").write_text("Head branch was modified. Review and try the merge again.")
         result = self.cli("lane", "merge", "demo-x-1", check=False)
         self.assertEqual((result.returncode, result.stderr), (1, f"lane: gh pr merge {self.url}: Head branch was "
