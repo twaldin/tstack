@@ -1,7 +1,6 @@
 ---
-name: Poteto Mode
-description: poteto's agent style for concise, detailed responses, deliberate subagents, unslopped prose, simple code, and verified work. Use for poteto, /poteto-mode, or requests to work in this style.
-disable-model-invocation: true
+name: poteto-mode
+description: Engineering playbooks and principles for features, bugs, performance, refactors, prototypes, PRs, review and verification. Read first for engineering work. In omp, also read omp.md beside this file, which maps pstack's Cursor names to omp, easl, lane and gh.
 icon: crown
 color: yellow
 ---
