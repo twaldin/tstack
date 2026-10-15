@@ -9,6 +9,7 @@ newest GitHub deployment on the merge SHA and on a later containing commit, with
 
 --until polls every --interval seconds and prints the facts when its condition first holds:
   change    any fact differs from the first poll (the report then starts with the changed keys)
+            mergeability compares known values only; the first known value sets its baseline
   merged    the PR is merged or closed
   checks    no check is queued or running (an empty list counts as not started for two minutes)
   deployed  a deployment, or while there is none a deploy or release job, finished other than skipped or cancelled
@@ -220,14 +221,22 @@ def main():
     repo, number = f"{ref[1]}/{ref[2]}", ref[3]
     try:
         first = report = snapshot(repo, number)
+        compared = report
         start = time.monotonic()
-        while args.until and not stopped(args.until, first, report, time.monotonic() - start):
+        while args.until and not stopped(args.until, first, compared, time.monotonic() - start):
             time.sleep(args.interval)
             report = snapshot(repo, number)
+            compared = report.copy() if args.until == "change" else report
+            if args.until == "change":
+                for key in ("mergeable", "merge_state"):
+                    if report[key] == "UNKNOWN":
+                        compared[key] = first[key]
+                    elif first[key] == "UNKNOWN":
+                        first = {**first, key: report[key]}
     except GhError as error:
         sys.exit(f"watch-pr: {error}")
     if args.until == "change" and report is not first:
-        report = {"changed": [key for key in report if report[key] != first[key]], **report}
+        report = {"changed": [key for key in compared if compared[key] != first[key]], **report}
     print(json.dumps(report, indent=2) if args.json else render(report))
 
 

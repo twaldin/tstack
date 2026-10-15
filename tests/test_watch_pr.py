@@ -9,7 +9,6 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# Every poll starts with `gh pr view`: the first poll reads earlier.json, later polls read recorded.json.
 FAKE_GH = r'''#!/usr/bin/env python3
 import json, os, sys
 args, here = sys.argv[1:], os.path.dirname(__file__)
@@ -18,21 +17,30 @@ if key == "pr view":
     with open(os.path.join(here, "polls"), "a") as log:
         log.write("poll\n")
 with open(os.path.join(here, "polls")) as log:
-    name = "earlier.json" if len(log.readlines()) == 1 else "recorded.json"
-with open(os.path.join(here, name)) as fixture:
-    recorded = json.load(fixture)
+    poll = len(log.readlines()) - 1
+sequence = os.path.join(here, "sequence.json")
+if os.path.exists(sequence):
+    with open(sequence) as fixture:
+        snapshots = json.load(fixture)
+    recorded = snapshots[min(poll, len(snapshots) - 1)]
+else:
+    name = "earlier.json" if poll == 0 else "recorded.json"
+    with open(os.path.join(here, name)) as fixture:
+        recorded = json.load(fixture)
 print(json.dumps(recorded[key])) if key in recorded else sys.exit(f"no fixture for {key}")
 '''
 
 
 class WatchPr(unittest.TestCase):
-    def watch(self, pr, *args, earlier=lambda recorded: None):
-        """watch-pr on a recorded PR. Its first poll sees the recording as `earlier(recorded)` left it."""
+    def watch(self, pr, *args, earlier=lambda recorded: None, polls=()):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         tmp = Path(scratch.name)
         recorded = json.loads((ROOT / "tests/fixtures/watch_pr" / f"{re.sub('[/#]', '-', pr)}.json").read_text())
         (tmp / "recorded.json").write_text(json.dumps(recorded))
+        if polls:
+            snapshots = [{**recorded, "pr view": {**recorded["pr view"], **poll}} for poll in polls]
+            (tmp / "sequence.json").write_text(json.dumps(snapshots))
         earlier(recorded)
         (tmp / "earlier.json").write_text(json.dumps(recorded))
         (tmp / "gh").write_text(FAKE_GH)
@@ -55,6 +63,50 @@ class WatchPr(unittest.TestCase):
                 lines = self.watch("example/team-instance#1", "--until", mode, earlier=pending).stdout.splitlines()
                 self.assertEqual(lines[0], first_line)
                 self.assertIn("  SUCCESS (1): CodeRabbit", lines)
+
+    def test_until_change_ignores_unknown_mergeability_between_known_values(self):
+        for fields in ({"mergeable": "UNKNOWN"}, {"mergeStateStatus": "UNKNOWN"},
+                       {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}):
+            with self.subTest(fields):
+                result = self.watch("example/team-instance#1", "--until", "change",
+                                    polls=[{}, fields, {}, {**fields, "headRefOid": "new-head"}])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[0], "changed: head")
+                self.assertIn("head new-head into main", result.stdout.splitlines())
+
+    def test_until_change_reports_known_mergeability_changes(self):
+        for field, known, changed, expected in (
+                ("mergeable", "MERGEABLE", "CONFLICTING", "changed: mergeable"),
+                ("mergeStateStatus", "CLEAN", "BLOCKED", "changed: merge_state")):
+            for initial in (known, "UNKNOWN"):
+                with self.subTest(field=field, initial=initial):
+                    result = self.watch("example/team-instance#1", "--until", "change",
+                                        polls=[{field: initial}, {field: known}, {field: "UNKNOWN"},
+                                               {field: changed}])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines()[0], expected)
+                    self.assertIn("mergeable CONFLICTING, merge state CLEAN, auto-merge off"
+                                  if field == "mergeable"
+                                  else "mergeable MERGEABLE, merge state BLOCKED, auto-merge off",
+                                  result.stdout.splitlines())
+
+    def test_unknown_mergeability_is_printed_without_normalizing_the_report(self):
+        unknown = {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}
+        for args, polls in ((("--once",), [unknown]),
+                            (("--once", "--json"), [unknown]),
+                            (("--until", "change", "--json"), [{}, {**unknown, "headRefOid": "new-head"}])):
+            with self.subTest(args=args):
+                result = self.watch("example/team-instance#1", *args, polls=polls)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if "--json" in args:
+                    report = json.loads(result.stdout)
+                    self.assertEqual((report["mergeable"], report["merge_state"]), ("UNKNOWN", "UNKNOWN"))
+                    if "--until" in args:
+                        self.assertEqual(report["changed"], ["head"])
+                        self.assertEqual(report["head"], "new-head")
+                else:
+                    self.assertIn("mergeable UNKNOWN, merge state UNKNOWN, auto-merge off",
+                                  result.stdout.splitlines())
 
     def test_until_change_stops_at_once_on_a_closed_pr(self):
         def closed(recorded):
