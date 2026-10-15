@@ -1,4 +1,4 @@
-"""Test harness: a temp HOME with a seat, and fake omp, gh, easl, bun and systemd on PATH that log each call."""
+"""Test harness: a temp HOME with a seat, and fake omp, gh, easl, ssh, bun and systemd on PATH that log each call."""
 
 import json
 import os
@@ -33,9 +33,12 @@ message = {"role": "assistant", "content": content, "usage": {"cost": {"total": 
 print(json.dumps({"type": "message_end", "message": message}), flush=True)
 sys.exit(cfg.get("exit", 0))
 ''',
-    # pr list and pr view print their JSON file; pr merge fails with merge.err, else merges unless --auto.
+    # pr list prints pr-list.json, or fails with pr-list.err; pr view prints its JSON file; pr merge fails with
+    # merge.err, else merges unless --auto.
     "gh": PRELUDE + r'''
-if args[:2] == ["pr", "list"]:
+if args[:2] == ["pr", "list"] and (stubs / "pr-list.err").exists():
+    sys.exit((stubs / "pr-list.err").read_text())
+elif args[:2] == ["pr", "list"]:
     print((stubs / "pr-list.json").read_text() if (stubs / "pr-list.json").exists() else "[]")
 elif args[:2] == ["pr", "view"]:
     print((stubs / "pr-view.json").read_text())
@@ -45,8 +48,124 @@ elif args[:2] == ["pr", "merge"] and "--auto" not in args:
     view = json.loads((stubs / "pr-view.json").read_text())
     (stubs / "pr-view.json").write_text(json.dumps({**view, "state": "MERGED", "mergeCommit": {"oid": "f" * 40}}))
 ''',
+    # A board store in easl-boards.json ({"boards": {id: [object]}, "agents": [...]}) with the methods tstack board
+    # calls. object.measure and size "fit" give h from the html's length, or fail like easld with no app when no-app
+    # exists. Like easl's RefitFrame, "fit" on an existing object without x/y may move it: here it grows upward.
     "easl": PRELUDE + r'''
-print((stubs / "asks.json").read_text() if args[:2] == ["ask", "list"] else json.dumps({"object": {"id": "obj_1"}}))
+import re
+path = stubs / "easl-boards.json"
+store = json.loads(path.read_text()) if path.exists() else {"boards": {}, "agents": []}
+store.setdefault("next", 100)
+class Refused(Exception):
+    pass
+def objects(board):
+    return store["boards"].setdefault(board, [])
+def locate(oid):
+    for board, held in store["boards"].items():
+        for obj in held:
+            if obj["id"] == oid:
+                return board, obj
+    raise Refused(f"not_found: {oid}")
+def keyed(board, key):
+    return next((o for o in objects(board) if o["props"].get("key") == key), None)
+def hits(a, b):
+    return a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"] and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"]
+def measured(html):
+    if (stubs / "no-app").exists():
+        raise Refused("invalid_params: an html page is measured by the app")
+    return 100 + len(html) // 50
+def settle(obj, params, existed):
+    if params.get("size") == "fit":
+        h = measured(obj["props"].get("html", ""))
+        if existed and "y" not in (params.get("frame") or {}):
+            obj["frame"]["y"] -= h - obj["frame"]["h"]
+        obj["frame"]["h"] = h
+    if sorted(obj["frame"]) != ["h", "w", "x", "y"]:
+        raise Refused(f"invalid_params: frame needs x, y, w and h, got {sorted(obj['frame'])}")
+def apply(method, p, board):
+    if method in ("object.get", "object.update", "object.delete") and "board" in p:
+        raise Refused(f"invalid_params: unknown param board; {method} takes id")
+    if method == "object.get":
+        return {"object": locate(p["id"])[1]}
+    if method == "object.measure":
+        return {"w": p["width"], "h": measured(p["props"].get("html", ""))}
+    if method == "object.find" and sum(k in p for k in ("key", "keyPrefix", "type")) != 1:
+        raise Refused("invalid_params: object.find takes one of key, keyPrefix, or type")
+    if method == "object.find" and "key" in p:
+        if not keyed(board, p["key"]):
+            raise Refused(f"not_found: no object holds key {p['key']}")
+        return {"object": keyed(board, p["key"])}
+    if method == "object.find":
+        found = sorted((o for o in objects(board) if o["props"].get("key", "").startswith(p.get("keyPrefix", ""))
+                        and p.get("type") in (None, o["type"])), key=lambda o: o["props"].get("key", ""))
+        return {"objects": [{**o, "props": {**o["props"], "html": "(use object.get)"}} for o in found]}
+    if method == "object.upsert":
+        obj, created = keyed(board, p["key"]), False
+        if not obj:
+            store["next"] += 1
+            obj, created = {"id": f"obj_{store['next']}", "type": p["type"], "props": {"key": p["key"]},
+                            "frame": dict(p.get("frame") or {})}, True
+            objects(board).append(obj)
+        else:
+            obj["frame"].update(p.get("frame") or {})
+        obj["props"].update(p["props"])
+        settle(obj, p, not created)
+        return {"object": obj, "created": created}
+    if method == "object.update":
+        obj = locate(p["id"])[1]
+        obj["props"].update(p.get("props") or {})
+        obj["frame"].update(p.get("frame") or {})
+        settle(obj, p, True)
+        return {"object": obj}
+    if method == "object.delete":
+        held, obj = locate(p["id"])
+        store["boards"][held].remove(obj)
+        return {"id": p["id"]}
+    if method == "object.batch":
+        results = []
+        for n, op in enumerate(p["ops"]):
+            ref = lambda m: json.dumps(results[int(m.group(1))]["object"]["id"])
+            params = json.loads(re.sub(r'"\$(\d+)"', ref, json.dumps(op["params"])))
+            try:
+                results.append(apply(op["method"], params, board))
+            except Refused as error:
+                raise Refused(f"invalid_params: op {n} ({op['method']}): {error}")
+        return {"results": results, "revision": 1}
+    if method == "board.get":
+        return {"objects": objects(board)}
+    if method == "layout.check":
+        # Like easl: every pair that involves at least one scoped id, against the whole board.
+        held = [o for o in objects(board) if o["type"] not in ("arrow", "group")]
+        pairs = [[a["id"], b["id"]] for n, a in enumerate(held) for b in held[n + 1:]
+                 if (a["id"] in p["ids"] or b["id"] in p["ids"]) and hits(a["frame"], b["frame"])]
+        return {"overlaps": pairs, "overflow": [], "truncated": [], "scrolls": [], "arrowCrossings": [],
+                "labelOverlaps": [], "arrowOverlaps": [], "arrowIntersections": []}
+    if method == "agent.list":
+        return {"agents": store["agents"]}
+    raise Refused(f"fake easl: no method {method}")
+try:
+    if args[:2] == ["ask", "list"] and (stubs / "ask.err").exists():
+        raise Refused((stubs / "ask.err").read_text())
+    if args[:2] == ["ask", "list"]:
+        board = args[args.index("--board") + 1]
+        out = {"objects": [o for o in objects(board) if o["type"] == "question" and o["props"].get("status") == "open"]}
+    else:
+        params = {}
+        for flag, value in zip(args[1::2], args[2::2]):
+            params.update(json.loads(sys.stdin.read()) if flag == "--json" else {flag[2:]: value})
+        out = apply(args[0], params, params.get("board"))
+except Refused as error:
+    sys.exit(str(error))
+path.write_text(json.dumps(store, indent=1))
+print(json.dumps(out))
+''',
+    # Runs the remote command here, in $HOME as ssh would, with stdin passed through. Exits 0 whatever the command
+    # exited with, as ssh to the tailnet Macs does.
+    "ssh": PRELUDE + r'''
+i = 0
+while args[i].startswith("-"):
+    i += 2 if args[i] == "-o" else 1
+subprocess.run(["sh", "-c", " ".join(args[i + 1:])], cwd=os.environ["HOME"])
 ''',
     "bun": PRELUDE,
     # Starts the command detached with its --working-directory and --setenv, keeping its pid for systemctl.

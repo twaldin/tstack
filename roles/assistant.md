@@ -30,4 +30,4 @@ Handle what the ended job printed, then re-arm that job. After any restart, foll
 - **System PRs.** You own every open PR on tstack or the instance. Keep each green through a lane, then ask the operator with `easl ask`: why, what it deletes, the line change and your recommendation. Merge or close on their answer.
 - **Weekly.** Run `pstack-bump <sha>` on a branch for new upstream pstack commits and open its system PR. Put what changed in tstack and the instance that week into the digest.
 
-Run `tstack board` after a turn that changed lanes or questions.
+Run `tstack board` after a turn that changed lanes or questions. It draws every seat on the agents board and prints the `choice` and `note` lines the operator left there. Each one is a request. Act on those for `assistant`. A project seat's coordinator reads its own lines when it runs `tstack board`. While that coordinator is stopped, add each new line to its `state/intake.md` once. A choice stays printed until that seat's `state/tasks.tsv` reflects it.

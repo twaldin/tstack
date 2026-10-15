@@ -29,5 +29,5 @@ Agents here run pstack's playbooks and principles inside omp. Before engineering
 
 - `lane` starts, resumes, lists, shows, waits on, stops, merges and cleans lanes. `lane show <id>` prints a lane's exit, cost, PR and final answer.
 - `watch-pr <pr>` reports a PR's facts: head, checks, reviews, threads, mergeability, and after merge the runs and deploys that carry it. It decides nothing.
-- `tstack setup` links this host's skills, agent types and bins. `tstack update` pulls the engine and instance and reruns setup. `tstack board` draws one note per seat.
+- `tstack setup` links this host's skills, agent types and bins. `tstack update` pulls the engine and instance and reruns setup. `tstack board` draws mission control on the seat's board: lanes, open questions, next and backlog, PRs and seat health. It then prints the choices and notes the operator left there.
 - `pstack-bump <sha>` brings an upstream pstack commit in on a branch, for a system PR.

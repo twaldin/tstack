@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-"""tstack: link this host's omp setup from the engine and instance, update both, and draw one note per seat.
+"""tstack: link this host's omp setup from the engine and instance, update both, and draw mission control.
 
 setup  links skills, agent types and bins; writes the update units and ~/.omp/agent/AGENTS.md; installs orch.
 update git pull --ff-only on the engine and instance, then setup.
-board  one easl note per seat: its lanes, orch status and open easl questions.
+board  draws mission control on the seat's easl board as keyed HTML tiles (mc/summary, mc/questions, mc/lanes,
+       mc/queues, mc/landed), then prints the choices and notes left on it. The assistant seat's board shows
+       every seat, the remote ones in <instance>/remote-seats included; any other seat's board shows that seat.
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html as htmlib
 import json
 import os
+import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
+from collections import Counter
+from itertools import combinations
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 HOME = Path.home()
@@ -153,50 +163,1291 @@ def update(name: str) -> int:
     return setup_run.returncode or code
 
 
-def easl(where: dict, *args) -> dict:
-    argv = ["easl", *args]
+EASL_APP = "/Applications/easl.app/Contents/Resources/bin"
+
+
+def easl(where: dict, *args, params=None) -> dict:
+    """One easl call on `where`'s host, over ssh when that is not this machine. `params` go as --json on stdin."""
+    argv = [*args] + ["--json", "@-"] * (params is not None)
     if where.get("host") and where["host"] != machine():
-        argv = ["ssh", where["host"], shlex.join(argv)]
-    result = subprocess.run(argv, capture_output=True, text=True)
-    if result.returncode:
-        raise Fail(f"easl {args[0]}: {(result.stderr or result.stdout).strip()}")
-    return json.loads(result.stdout or "{}")
+        argv = ["ssh", where["host"], f'PATH="$PATH:{EASL_APP}" ' + shlex.join(["easl", *argv])]
+    else:
+        local = Path(EASL_APP) / "easl"
+        argv = [str(local) if not shutil.which("easl") and local.exists() else "easl", *argv]
+    try:
+        result = subprocess.run(argv, input="" if params is None else json.dumps(params), capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Fail(f"{argv[0]}: not found")
+    # ssh to the tailnet Macs returns 0 whatever the remote command exited with, so stderr alone also means failure.
+    if result.returncode or (result.stderr.strip() and not result.stdout.strip()):
+        raise Fail(f"easl {args[0]}: {one_line(result.stderr or result.stdout)}")
+    try:
+        return json.loads(result.stdout or "{}")
+    except ValueError:
+        raise Fail(f"easl {args[0]}: not JSON: {one_line(result.stdout)}")
 
 
-def read_board(seat: Path):
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(stamp):
+    try:
+        moment = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
+
+
+def one_line(error) -> str:
+    return " ".join(str(error).split())[:300] or type(error).__name__
+
+
+# The snapshot a board is drawn from. A source that failed to read is None plus a Problem, never [].
+
+@dataclass
+class Problem:
+    source: str
+    error: str
+
+
+@dataclass
+class Health:
+    state: str
+    kind: str | None = None
+    name: str | None = None
+    live: bool | None = None
+    open: bool | None = None
+    detail: str | None = None
+
+
+@dataclass
+class Lane:
+    id: str
+    task: str | None
+    state: str
+    recorded: str | None
+    run: int | None
+    started: str | None
+    ended: str | None
+    exit: int | None
+    cost: float
+    pr: str | None
+    repo: str | None
+    branch: str | None
+    worktree: str | None
+    worktree_exists: bool
+    brief: str | None
+    final: str | None
+    answer_tail: str | None
+
+
+@dataclass
+class Question:
+    id: str
+    board: str
+    host: str
+    seat: str
+    question: str | None
+    options: list | None
+    recommended: str | None
+    asked: str | None
+    expires: str | None
+    asker: str | None
+    frame: dict | None
+
+
+@dataclass
+class Task:
+    id: str
+    effort: str | None
+    title: str | None
+    state: str
+    lane: str | None
+    pr: str | None
+    updated: str | None
+    row: int
+
+
+@dataclass
+class Intake:
+    at: str | None
+    source: str | None
+    text: str | None
+    line: int | None
+
+
+@dataclass
+class Effort:
+    name: str
+    path: str
+    goal: str | None
+    due: str | None
+
+
+@dataclass
+class PR:
+    url: str
+    repo: str
+    number: int | None
+    title: str | None
+    state: str
+    draft: bool
+    checks: str
+    failing: list
+    review: str
+    mergeable: str | None
+    merge_state: str | None
+    merged_at: str | None
+    read_at: str | None
+
+
+@dataclass
+class Seat:
+    name: str
+    path: str | None
+    host: str
+    remote: bool = False
+    redacted: bool = False
+    board: dict | None = None
+    health: Health | None = None
+    lanes: list | None = None
+    questions: list | None = None
+    tasks: list | None = None
+    intake: list | None = None
+    goal: str | None = None
+    efforts: list | None = None
+    orch: str | None = None
+    sources: dict = field(default_factory=dict)
+    errors: list = field(default_factory=list)
+
+
+@dataclass
+class Snapshot:
+    scope: str
+    machine: str
+    at: str
+    seats: list
+    prs: dict
+    errors: list
+
+
+def load_snapshot(data: dict) -> Snapshot:
+    def many(cls, rows):
+        return None if rows is None else [cls(**row) for row in rows]
+    seats = []
+    for raw in data["seats"]:
+        seat = Seat(**raw)
+        seat.health = Health(**raw["health"]) if raw.get("health") else None
+        seat.lanes, seat.questions = many(Lane, raw["lanes"]), many(Question, raw["questions"])
+        seat.tasks, seat.intake, seat.efforts = many(Task, raw["tasks"]), many(Intake, raw["intake"]), many(Effort, raw["efforts"])
+        seat.errors = many(Problem, raw["errors"])
+        seats.append(seat)
+    return Snapshot(data["scope"], data["machine"], data["at"], seats, {url: PR(**pr) for url, pr in data["prs"].items()},
+                    many(Problem, data["errors"]))
+
+
+# Collection: read only. `lane list` is not called because it records ended runs and asks gh once per lane.
+
+TASK_COLUMNS = ["id", "effort", "title", "state", "lane", "pr", "updated"]
+NEXT = 3
+APPLE_EPOCH = 978307200
+LEGACY = {"waiting": "waiting", "done": "done", "cancelled": "done", "stuck": "failed", "failed": "failed"}
+READ_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
+
+
+def seat_dir(arg) -> Path:
+    if arg or os.environ.get("TSTACK_SEAT"):
+        return Path(arg or os.environ["TSTACK_SEAT"]).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    return next((d for d in (cwd, *cwd.parents) if (d / "state").is_dir()), INSTANCE.resolve() / "assistant")
+
+
+def seat_name(path: Path) -> str:
+    try:
+        return str(path.relative_to(INSTANCE.resolve()))
+    except ValueError:
+        return path.name
+
+
+def read_pointer(seat: Path):
+    """The seat's state/board.json: {host, board, tile}."""
     path = seat / "state" / "board.json"
-    return json.loads(path.read_text()) if path.is_file() else None
+    if not path.is_file():
+        return None
+    pointer = json.loads(path.read_text())
+    if not isinstance(pointer, dict) or not pointer.get("board"):
+        raise ValueError("no board id")
+    return pointer
 
 
-def board(target) -> int:
-    projects = INSTANCE / "projects"
-    seats = [INSTANCE / "assistant"] + sorted(p.parent for p in projects.glob("**/state")
-                                              if p.is_dir() and "state" not in p.parent.relative_to(projects).parts)
-    where = {"board": target} if target else read_board(INSTANCE / "assistant")
-    if not where:
-        raise Fail(f"no board: pass --board, or write {INSTANCE / 'assistant' / 'state' / 'board.json'}")
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    for seat in (s for s in seats if (s / "state").is_dir()):
-        name = str(seat.relative_to(INSTANCE))
-        lanes = subprocess.run([sys.executable, str(ENGINE / "bin" / "lane"), "list", "--seat", str(seat)],
-                               capture_output=True, text=True)
-        parts = [f"## {name}", f"Drawn {stamp} on {machine()} by `tstack board`.", "### Lanes",
-                 "```\n" + ((lanes.stdout or lanes.stderr).strip() or "none") + "\n```"]
-        status = seat / "state" / "orch" / "status.md"
-        if status.is_file():
-            parts += ["### orch", status.read_text().strip()]
-        own = read_board(seat)
-        if own:
+def scoped(seat: Path):
+    """(scope, seat dirs, every seat?): the assistant seat sees every seat, any other seat sees itself."""
+    root = INSTANCE.resolve()
+    if seat != root / "assistant":
+        return seat_name(seat), [seat], False
+    projects = root / "projects"
+    found = sorted(p.parent for p in projects.glob("**/state")
+                   if p.is_dir() and "state" not in p.parent.relative_to(projects).parts)
+    return "all", [s for s in [seat, *found] if (s / "state").is_dir()], True
+
+
+def attempt(seat: Seat, source: str, read):
+    try:
+        return read()
+    except READ_ERRORS as error:
+        seat.errors.append(Problem(source, one_line(error)))
+        return None
+
+
+def mtime(path: Path) -> str:
+    return dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_tasks(path: Path) -> list:
+    lines = path.read_text().splitlines() if path.is_file() else []
+    if not lines:
+        return []
+    if lines[0].split("\t") != TASK_COLUMNS:
+        raise ValueError(f"line 1: the header is not {' '.join(TASK_COLUMNS)} (tab-separated)")
+    tasks = []
+    for number, text in enumerate(lines[1:], 2):
+        if not text.strip():
+            continue
+        cells = text.split("\t")
+        if len(cells) != len(TASK_COLUMNS):
+            raise ValueError(f"line {number}: {len(cells)} columns, want {len(TASK_COLUMNS)}")
+        cells = [None if cell in ("", "-") else cell for cell in cells]
+        tasks.append(Task(*cells, row=len(tasks) + 1))
+    return tasks
+
+
+def read_intake(path: Path) -> list:
+    items = []
+    for number, text in enumerate(path.read_text().splitlines() if path.is_file() else [], 1):
+        item = re.match(r"\s*- \[ \] (.*)", text)
+        if item:
+            parts = re.match(r"(\S+) ([^:]+): (.*)", item.group(1))
+            items.append(Intake(*(parts.groups() if parts else (None, None, item.group(1))), line=number))
+    return items
+
+
+def read_goal(path: Path):
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", path.read_text())] if path.is_file() else []
+    return next((p for p in paragraphs if p and not re.fullmatch(r"#[^\n]*", p)), None)
+
+
+def field_line(text: str, name: str):
+    found = re.search(rf"^[-*\s]*(?:\*\*)?{name}:(?:\*\*)?\s*(.+)$", text, re.M)
+    return found.group(1).strip() if found else None
+
+
+def read_efforts(folder: Path) -> list:
+    efforts = []
+    for path in sorted(folder.glob("*.md")) if folder.is_dir() else []:
+        text = path.read_text()
+        efforts.append(Effort(path.stem, str(path), field_line(text, "Goal"), field_line(text, "Due")))
+    return efforts
+
+
+def run_alive(run_dir: Path, number) -> bool:
+    """bin/lane's Lane.alive: the pid's command line still names this run."""
+    pid_file = run_dir / f"run-{number}.pid"
+    pid = pid_file.read_text().strip() if pid_file.exists() else ""
+    if not pid.isdigit():
+        return False
+    ps = subprocess.run(["ps", "-ww", "-o", "command=", "-p", pid], capture_output=True, text=True)
+    return str(run_dir / f"run-{number}") in ps.stdout
+
+
+def lane_state(recorded, last: dict, exited: bool, alive, mine: bool, answered: bool) -> str:
+    """What a lane is doing, from its record and run files. `waiting` may become `done` once PRs are known."""
+    if recorded in LEGACY:
+        return LEGACY[recorded]
+    if recorded == "running" and not last.get("end"):
+        if exited:
+            return "unrecorded"
+        return "running" if not mine or alive() else "gone"
+    if recorded == "stopped":
+        return "stopped"
+    if last.get("exit") != 0:
+        return "failed"
+    return "waiting" if answered else "no-answer"
+
+
+def settle(lane: Lane, pr) -> None:
+    if lane.state == "waiting" and lane.recorded not in LEGACY and (
+            (pr and pr.state in ("MERGED", "CLOSED")) or not lane.worktree_exists):
+        lane.state = "done"
+
+
+def read_lane(seat_path: Path, folder: Path, here: str, tasks: list) -> Lane:
+    record = json.loads((folder / "lane.json").read_text())
+    runs = record.get("runs") or []
+    last = runs[-1] if runs else {}
+    number = last.get("run")
+    run_dir = seat_path / "state" / "run" / "lanes" / folder.name
+    final, brief = folder / "final.md", folder / "brief.md"
+    answer = final.read_text().strip() if final.is_file() else None
+    worktree = record.get("worktree")
+    task = next((f"{t.id}: {t.title}" for t in tasks if t.lane == folder.name), None) or record.get("task")
+    if not task and brief.is_file():
+        task = next((line.strip("# ").strip() for line in brief.read_text().splitlines() if line.strip()), None)
+    state = lane_state(record.get("status"), last, (run_dir / f"run-{number}.exit").exists(),
+                       lambda: run_alive(run_dir, number), (record.get("host") or here) == here, answer is not None)
+    return Lane(id=folder.name, task=task[:160] if task else None, state=state, recorded=record.get("status"), run=number,
+                started=last.get("start") or record.get("created"), ended=last.get("end"), exit=last.get("exit"),
+                cost=round(sum(r.get("cost_usd") or 0 for r in runs), 6), pr=record.get("pr") or None,
+                repo=record.get("repo"), branch=record.get("branch"), worktree=worktree,
+                worktree_exists=bool(worktree) and Path(worktree).exists(), brief=str(brief) if brief.is_file() else None,
+                final=str(final) if answer is not None else None,
+                answer_tail=answer.splitlines()[-1][:200] if answer else None)
+
+
+def read_seat(path: Path, here: str) -> Seat:
+    state = path / "state"
+    seat = Seat(name=seat_name(path), path=str(path), host=here)
+    seat.board = attempt(seat, "board.json", lambda: read_pointer(path))
+    seat.tasks = attempt(seat, "tasks.tsv", lambda: read_tasks(state / "tasks.tsv"))
+    records = attempt(seat, "lanes", lambda: [d / "lane.json" for d in sorted((state / "lanes").iterdir())
+                                              if (d / "lane.json").exists() or (d / "lane.json").is_symlink()]
+                      if (state / "lanes").is_dir() else [])
+    seat.lanes = None if records is None else []
+    for record in records or []:
+        lane = attempt(seat, f"lanes/{record.parent.name}/lane.json", lambda: read_lane(path, record.parent, here, seat.tasks or []))
+        seat.lanes += [lane] if lane else []
+    seat.intake = attempt(seat, "intake.md", lambda: read_intake(state / "intake.md"))
+    seat.goal = attempt(seat, "goal.md", lambda: read_goal(state / "goal.md"))
+    seat.efforts = attempt(seat, "efforts", lambda: read_efforts(state / "efforts"))
+    status = state / "orch" / "status.md"
+    seat.orch = attempt(seat, "orch/status.md", lambda: status.read_text().strip() if status.is_file() else None)
+    def stamp(source: str, file: Path):
+        try:
+            return mtime(file) if file.is_file() else None
+        except OSError as error:
+            if not any(p.source == source for p in seat.errors):
+                seat.errors.append(Problem(source, one_line(error)))
+            return None
+    lanes = [stamp(f"lanes/{r.parent.name}/lane.json", r) for r in records or []]
+    for source in ("tasks.tsv", "intake.md", "goal.md"):
+        seat.sources[source] = stamp(source, state / source)
+    seat.sources["lanes"] = max((s for s in lanes if s), default=None)
+    seat.sources = {k: v for k, v in seat.sources.items() if v}
+    return seat
+
+
+def apple_iso(value):
+    """easld writes times as seconds since 2001-01-01."""
+    if isinstance(value, (int, float)):
+        return dt.datetime.fromtimestamp(value + APPLE_EPOCH, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value if isinstance(value, str) else None
+
+
+def read_question(obj: dict, board: str, host: str, seat: str) -> Question:
+    props = obj.get("props") or {}
+    options = [o if isinstance(o, dict) else {"id": None, "label": o} for o in props.get("options") or []]
+    asker = props.get("asker")
+    if isinstance(asker, dict):
+        asker = asker.get("name") or asker.get("tile")
+    return Question(id=obj["id"], board=board, host=host, seat=seat, question=props.get("question"),
+                    options=[{"id": o.get("id"), "label": o.get("label")} for o in options],
+                    recommended=props.get("recommended"), asked=apple_iso(obj.get("createdAt")),
+                    expires=apple_iso(props.get("expiresAt")), asker=None if asker is None else str(asker),
+                    frame=obj.get("frame"))
+
+
+def attach_questions(seats: list, here: str) -> None:
+    """One `easl ask list` per board; a board's questions go to the first seat that names it."""
+    owners = {}
+    for seat in seats:
+        if seat.board:
+            owners.setdefault(seat.board["board"], []).append(seat)
+        elif not any(p.source == "board.json" for p in seat.errors):
+            seat.questions = []
+    for board_id, (first, *rest) in owners.items():
+        host = first.board.get("host") or here
+        try:
+            found = easl(first.board, "ask", "list", "--open", "--board", board_id).get("objects") or []
+            first.questions = [read_question(o, board_id, host, first.name) for o in found]
+        except (Fail, *READ_ERRORS) as error:
+            first.errors.append(Problem(f"easl ask list {board_id}", one_line(error)))
+        for seat in rest:
+            seat.questions = None if first.questions is None else []
+
+
+def read_health(tile: str, agents: list) -> Health:
+    agent = next((a for a in agents if a.get("tile") == tile), None)
+    if not agent:
+        return Health("missing", detail=f"tile {tile} is not on the board")
+    facts = {"kind": agent.get("kind"), "name": agent.get("name"), "live": agent.get("live"), "open": agent.get("open")}
+    if agent.get("kind") == "omp":
+        raw = (agent.get("lifecycle") or {}).get("state")
+        state = raw if raw in ("working", "idle", "done", "blocked") else "unknown"
+        return Health(state, detail=f"omp {raw}", **facts)
+    return Health("shell", detail=f"plain shell ({agent.get('program') or agent.get('kind')})", **facts)
+
+
+def attach_health(seats: list, here: str) -> None:
+    """One `easl agent.list` per easl host; a seat's health is its terminal tile's agent."""
+    hosts = {}
+    for seat in seats:
+        if seat.board and seat.board.get("tile"):
+            hosts.setdefault(seat.board.get("host") or here, []).append(seat)
+    for host, group in hosts.items():
+        try:
+            agents = easl({"host": host}, "agent.list").get("agents") or []
+        except Fail as error:
+            for seat in group:
+                seat.errors.append(Problem("easl agent.list", one_line(error)))
+            continue
+        for seat in group:
+            seat.health = read_health(seat.board["tile"], agents)
+
+
+def remote_seats():
+    """Seats on other hosts, from <instance>/remote-seats lines `<name> <ssh target> <seat dir>`, read redacted."""
+    path, seats, prs, errors = INSTANCE / "remote-seats", [], {}, []
+    for number, line in enumerate(path.read_text().splitlines() if path.is_file() else [], 1):
+        parts = line.split("#", 1)[0].split()
+        if not parts:
+            continue
+        if len(parts) != 3:
+            errors.append(Problem("remote-seats", f"line {number}: want <name> <ssh target> <seat dir>"))
+            continue
+        name, target, folder = parts
+        command = shlex.join(["python3", "-", "board", "--print", "--redact", "--seat", folder])
+        category = "ssh or tstack failed"
+        try:
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, command],
+                                    input=Path(__file__).read_text(), capture_output=True, text=True, timeout=90)
+            if result.returncode or not result.stdout.strip():
+                raise Fail(category)
+            category = "ssh or tstack failed" if result.stderr.strip() else "output is not a snapshot"
+            snap = load_snapshot(json.loads(result.stdout))
+        except (Fail, subprocess.TimeoutExpired, *READ_ERRORS) as error:
+            # Remote stderr may carry the content redaction keeps on that host, so only the category is stored.
+            category = "timeout" if isinstance(error, subprocess.TimeoutExpired) else category
+            seats.append(Seat(name=name, path=folder, host=target, remote=True, redacted=True, errors=[Problem(
+                f"ssh {target}", f"no snapshot ({category}); run tstack board --print --seat {folder} on {target} to see why")]))
+            continue
+        for seat in snap.seats:
+            seat.name = name if len(snap.seats) == 1 else f"{name}/{seat.name}"
+            seat.host, seat.remote, seat.redacted = target, True, True
+            seat.errors += snap.errors
+            for question in seat.questions or []:
+                question.seat = seat.name
+            seats.append(seat)
+        prs.update(snap.prs)
+    return seats, prs, errors
+
+
+def redact(snap: Snapshot) -> None:
+    """Keep counts, ids, states and PR links; drop every title, text, path, answer and error detail."""
+    hidden = f"unreadable; details stay on {machine()}"
+    snap.errors = [Problem(p.source, hidden) for p in snap.errors]
+    for seat in snap.seats:
+        seat.redacted, seat.path, seat.goal, seat.efforts, seat.orch = True, None, None, None, None
+        seat.errors = [Problem(p.source, hidden) for p in seat.errors]
+        seat.health = seat.health and Health(seat.health.state)
+        if seat.lanes is not None:
+            seat.lanes = [replace(lane, task=None, repo=None, branch=None, worktree=None, brief=None, final=None,
+                                  answer_tail=None) for lane in seat.lanes]
+        if seat.questions is not None:
+            seat.questions = [replace(q, question=None, options=None, recommended=None, expires=None, asker=None,
+                                      frame=None) for q in seat.questions]
+        if seat.tasks is not None:
+            seat.tasks = [replace(t, effort=None, title=None, updated=None) for t in seat.tasks]
+        if seat.intake is not None:
+            seat.intake = [Intake(None, None, None, None) for _ in seat.intake]
+    snap.prs = {url: replace(pr, title=None, failing=[]) for url, pr in snap.prs.items()}
+
+
+def collect(seat: Path) -> Snapshot:
+    scope, paths, everyone = scoped(seat)
+    here = machine()
+    snap = Snapshot(scope, here, now_iso(), [read_seat(p, here) for p in paths], {}, [])
+    attach_questions(snap.seats, here)
+    attach_health(snap.seats, here)
+    snap.prs, snap.errors = pr_facts(snap.seats)
+    for lane in (lane for s in snap.seats for lane in s.lanes or []):
+        settle(lane, snap.prs.get(lane.pr))
+    if everyone:
+        seats, prs, errors = remote_seats()
+        snap.seats += seats
+        snap.prs.update(prs)
+        snap.errors += errors
+    return snap
+
+
+# PR facts: one cached `gh pr list` per repo, so a draw does not cost a call per PR.
+
+GH_TTL = 300
+PR_FIELDS = ("number,url,title,state,isDraft,headRefName,reviewDecision,mergeable,mergeStateStatus,"
+             "statusCheckRollup,mergedAt")
+FAILED_RUNS = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
+
+
+def repo_of(url: str):
+    parts = url.split("/")
+    return f"{parts[3]}/{parts[4]}" if url.startswith("https://github.com/") and len(parts) > 4 else None
+
+
+def gh_prs(repo: str):
+    """(rows or None, read time, Problem or None). A fresh cache wins; a failed read falls back to a stale one."""
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "tstack" / "gh" / f"{repo.replace('/', '_')}.json"
+    try:
+        cached = json.loads(cache.read_text())
+        read = parse_iso(cached["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        cached, read = None, None
+    if read and (dt.datetime.now(dt.timezone.utc) - read).total_seconds() < GH_TTL:
+        return cached["prs"], cached["at"], None
+    argv = ["gh", "pr", "list", "--repo", repo, "--state", "all", "--limit", "100", "--json", PR_FIELDS]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True)
+        if result.returncode:
+            raise Fail(result.stderr or result.stdout)
+        rows = json.loads(result.stdout or "[]")
+    except (Fail, OSError, ValueError) as error:
+        if cached:
+            return cached["prs"], cached["at"], Problem(f"gh {repo}", f"{one_line(error)}; showing the cache from {cached['at']}")
+        return None, None, Problem(f"gh {repo}", one_line(error))
+    at = now_iso()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"at": at, "prs": rows}))
+    return rows, at, None
+
+
+def check_state(rollup: list):
+    failing, pending = [], False
+    for check in rollup:
+        if check.get("__typename") == "StatusContext" or "conclusion" not in check:
+            if check.get("state") in ("FAILURE", "ERROR"):
+                failing.append(check.get("context") or "?")
+            pending = pending or check.get("state") in ("PENDING", "EXPECTED")
+        elif check.get("conclusion") in FAILED_RUNS:
+            failing.append(check.get("name") or "?")
+        else:
+            pending = pending or check.get("status") != "COMPLETED"
+    return ("failing" if failing else "pending" if pending else "passing" if rollup else "none"), failing
+
+
+def pr_fact(url: str, repo: str, row, read_at) -> PR:
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    if not row:
+        return PR(url, repo, int(tail) if tail.isdigit() else None, None, "UNKNOWN", False, "none", [], "", None, None,
+                  None, read_at)
+    checks, failing = check_state(row.get("statusCheckRollup") or [])
+    return PR(url, repo, row.get("number"), row.get("title"), row.get("state") or "UNKNOWN", bool(row.get("isDraft")),
+              checks, failing, row.get("reviewDecision") or "", row.get("mergeable"), row.get("mergeStateStatus"),
+              row.get("mergedAt"), read_at)
+
+
+def pr_facts(seats: list):
+    lanes = [lane for s in seats for lane in s.lanes or []]
+    named = {url for url in [lane.pr for lane in lanes] + [t.pr for s in seats for t in s.tasks or []] if url and repo_of(url)}
+    unnamed = [lane for lane in lanes if not lane.pr and lane.branch and lane.repo and "/" in lane.repo
+               and not lane.repo.startswith("/")]
+    prs, errors = {}, []
+    for repo in sorted({repo_of(url) for url in named} | {lane.repo for lane in unnamed}):
+        rows, read_at, problem = gh_prs(repo)
+        errors += [problem] if problem else []
+        listed = {row.get("url"): row for row in rows or []}
+        for lane in (lane for lane in unnamed if lane.repo == repo):
+            lane.pr = next((row.get("url") for row in rows or [] if row.get("headRefName") == lane.branch), None)
+        for url in sorted({url for url in named if repo_of(url) == repo} | {l.pr for l in unnamed if l.repo == repo and l.pr}):
+            prs[url] = pr_fact(url, repo, listed.get(url), read_at)
+            if rows is not None and url not in listed:
+                errors.append(Problem(f"gh {repo}", f"{url} is not among the repo's latest 100 PRs"))
+    return prs, errors
+
+
+# Rendering: a pure function of the snapshot. Volatile times are <time data-v>, masked when comparing drawn pages.
+
+@dataclass
+class Region:
+    key: str
+    title: str
+    width: int
+    html: str
+
+
+LIVE = ("running", "waiting")
+ATTENTION = ("failed", "no-answer", "gone", "unrecorded", "stopped")
+DOWN = ("shell", "missing", "unread", "unreachable", "blocked")
+WEEK = dt.timedelta(days=7)
+TONES = {"muted": "bg-muted text-muted-foreground", "warn": "bg-muted text-warn font-semibold", "ok": "bg-muted text-ok",
+         "accent": "bg-accent text-accent-foreground"}
+FIELD = "bg-card border border-border rounded px-1"
+SCRIPT = """<script>
+(() => {
+  const kit = window.canvasKit;
+  const save = (key, value) => { if (kit) Promise.resolve(kit.setState(key, value)).catch(() => {}); };
+  const ago = (s) => { s = Math.max(0, Math.floor(s)); return (s >= 86400 ? Math.floor(s / 86400) + 'd' : s >= 3600 ? Math.floor(s / 3600) + 'h' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's') + ' ago'; };
+  const tick = () => { for (const el of document.querySelectorAll('time[data-age]')) { const t = Date.parse(el.dataset.age); if (!isNaN(t)) el.textContent = ago((Date.now() - t) / 1000); } };
+  tick(); setInterval(tick, 30000);
+  const search = document.querySelector('[data-search]');
+  const selects = [...document.querySelectorAll('select[data-filter]')];
+  const rows = [...document.querySelectorAll('[data-row]')];
+  const shown = document.querySelector('[data-shown]');
+  const apply = () => {
+    const words = search ? search.value.trim().toLowerCase() : '';
+    let n = 0;
+    for (const row of rows) {
+      row.hidden = Boolean(words && !row.textContent.toLowerCase().includes(words)) || selects.some((s) => s.value && row.dataset[s.dataset.filter] !== s.value);
+      n += row.hidden ? 0 : 1;
+    }
+    if (shown) shown.textContent = n + ' of ' + rows.length + ' shown';
+  };
+  const verdict = (row, v) => !v ? 'none' : (v === 'next' && row.dataset.place === 'next') || (v === 'later' && row.dataset.place === 'backlog' && row.dataset.taskState === 'todo') || (v === 'drop' && row.dataset.taskState === 'cancelled') ? 'applied' : 'requested';
+  const choices = [...document.querySelectorAll('select[data-choice]')];
+  const mark = (ctl) => { const row = ctl.closest('[data-place]'); const out = row && row.querySelector('[data-verdict]'); if (out) out.textContent = verdict(row, ctl.value); };
+  for (const ctl of choices) ctl.addEventListener('change', () => { mark(ctl); save('choice:' + ctl.dataset.choice, ctl.value || null); });
+  const notes = [...document.querySelectorAll('textarea[data-note]')];
+  const timers = {};
+  for (const box of notes) box.addEventListener('input', () => { clearTimeout(timers[box.dataset.note]); timers[box.dataset.note] = setTimeout(() => save('note:' + box.dataset.note, box.value || null), 500); });
+  if (search) search.addEventListener('input', apply);
+  for (const s of selects) s.addEventListener('change', apply);
+  const load = (state) => {
+    state = state || {};
+    for (const ctl of choices) { ctl.value = state['choice:' + ctl.dataset.choice] || ''; mark(ctl); }
+    for (const box of notes) if (document.activeElement !== box) box.value = state['note:' + box.dataset.note] || '';
+  };
+  apply();
+  load({});
+  if (kit) { Promise.resolve(kit.getState()).then(load, () => {}); kit.onState(load); }
+})();
+</script>"""
+
+
+def e(value) -> str:
+    return htmlib.escape("" if value is None else str(value))
+
+
+def age_tag(stamp, empty: str = "-") -> str:
+    return f'<time data-age="{e(stamp)}" datetime="{e(stamp)}">{e(stamp)}</time>' if stamp else e(empty)
+
+
+def read_tag(stamp) -> str:
+    return f'<time data-v data-age="{e(stamp)}" datetime="{e(stamp)}">{e(stamp)}</time>'
+
+
+def badge(text, tone: str = "muted") -> str:
+    return f'<span class="inline-block rounded px-1.5 py-0.5 text-xs {TONES[tone]}">{e(text)}</span>'
+
+
+def link(url: str, text: str) -> str:
+    return f'<a class="underline" href="{e(url)}">{e(text)}</a>'
+
+
+def file_link(path, text: str) -> str:
+    return f'<canvas-link path="{e(path)}">{e(text)}</canvas-link>' if path else ""
+
+
+def recent(stamp, at: str) -> bool:
+    moment, now = parse_iso(stamp), parse_iso(at)
+    return bool(moment and now and now - moment <= WEEK)
+
+
+def next_backlog(tasks: list):
+    todo = [t for t in tasks if t.state == "todo"]
+    return todo[:NEXT], todo[NEXT:]
+
+
+def problem_of(seat: Seat, source: str) -> str:
+    return next((p.error for p in seat.errors if p.source == source), "see Problems in Mission control")
+
+
+def health_label(seat: Seat) -> str:
+    if seat.health:
+        return seat.health.state
+    if seat.remote and seat.board is None:
+        return "unreachable"
+    if not seat.board:
+        return "no board.json"
+    return "unread" if seat.board.get("tile") else "no tile"
+
+
+def page(title: str, body: str) -> str:
+    return (f'<div class="bg-background text-foreground font-sans text-sm p-4 space-y-3">'
+            f'<h2 class="text-lg font-semibold">{e(title)}</h2>{body}</div>{SCRIPT}')
+
+
+def filters(seats: list, states=()) -> str:
+    def select(name, label, values):
+        options = "".join(f'<option value="{e(v)}">{e(v)}</option>' for v in values)
+        return (f'<label>{label} <select data-filter="{name}" class="{FIELD}"><option value="">all</option>'
+                f'{options}</select></label>')
+    parts = [f'<label>Search <input data-search type="search" class="{FIELD}"></label>', select("seat", "Seat", seats)]
+    parts += [select("state", "State", states)] if states else []
+    return (f'<div class="flex flex-wrap gap-3 items-center text-xs">{"".join(parts)}'
+            f'<span data-shown class="text-muted-foreground"></span></div>')
+
+
+def pr_link(url: str, text: str) -> str:
+    """A link only to a GitHub PR: a tasks.tsv or lane.json value may hold any scheme."""
+    return link(url, text) if repo_of(url) else f'{e(url)} {badge("not a GitHub PR URL", "warn")}'
+
+
+def pr_badges(url, prs: dict) -> str:
+    if not url:
+        return ""
+    if not repo_of(url):
+        return pr_link(url, url)
+    pr = prs.get(url)
+    parts = [link(url, f"PR #{url.rstrip('/').rsplit('/', 1)[-1]}")]
+    if not pr or pr.state == "UNKNOWN":
+        return " ".join(parts + [badge("state unknown", "warn")])
+    parts.append(badge(pr.state.lower(), "ok" if pr.state == "MERGED" else "muted"))
+    if pr.state == "OPEN":
+        parts += [badge("draft")] if pr.draft else []
+        checks = f"checks {pr.checks}" + (f": {', '.join(pr.failing)}" if pr.failing else "")
+        parts.append(badge(checks, {"passing": "ok", "failing": "warn"}.get(pr.checks, "muted")))
+        parts += [badge(pr.review.lower().replace("_", " "), "ok" if pr.review == "APPROVED" else "muted")] if pr.review else []
+        parts += [badge(pr.mergeable.lower(), "warn" if pr.mergeable == "CONFLICTING" else "muted")] if pr.mergeable else []
+    return " ".join(parts)
+
+
+def card(name: str, label: str, value: int, source: str, gaps: int = 0, noun: str = "", tone: str = "muted") -> str:
+    loud = " text-warn" if tone == "warn" and value else ""
+    gap = f'<div class="text-xs text-warn">{gaps} {e(noun)} unreadable</div>' if gaps else ""
+    return (f'<div data-count="{name}" class="bg-card border border-border rounded-lg p-3 min-w-[160px]">'
+            f'<div class="text-xs text-muted-foreground">{e(label)}</div>'
+            f'<div class="text-2xl font-semibold{loud}">{"≥" if gaps else ""}{value}</div>'
+            f'<div class="text-xs text-muted-foreground">{e(source)}</div>{gap}</div>')
+
+
+def summary(snap: Snapshot) -> Region:
+    states = [lane.state for s in snap.seats for lane in s.lanes or []]
+    lane_gaps = sum(s.lanes is None for s in snap.seats) + sum(p.source.startswith("lanes/") for s in snap.seats for p in s.errors)
+    board_gaps = len({(s.board or {}).get("board") or s.name for s in snap.seats if s.questions is None})
+    open_prs = [p for p in snap.prs.values() if p.state == "OPEN"]
+    checks = ", ".join(f"{sum(p.checks == c for p in open_prs)} {c}" for c in ("passing", "failing", "pending", "none"))
+    queues = [next_backlog(s.tasks) for s in snap.seats if s.tasks is not None]
+    task_gaps = sum(s.tasks is None for s in snap.seats)
+    noun = "lane source(s)"
+    cards = [
+        card("running", "Running lanes", states.count("running"), "lane.json and the run's pid", lane_gaps, noun),
+        card("waiting", "Waiting on their seat", states.count("waiting"), "lane.json and final.md", lane_gaps, noun),
+        card("failed", "Failed", states.count("failed"), "lane.json run exit", lane_gaps, noun, "warn"),
+        card("no-answer", "Ended without answer", states.count("no-answer"), "lane.json and final.md", lane_gaps, noun,
+             "warn"),
+        card("gone", "Gone or unrecorded", states.count("gone") + states.count("unrecorded"), "run pid and exit files",
+             lane_gaps, noun, "warn"),
+        card("questions", "Open questions", sum(len(s.questions or []) for s in snap.seats), "easl ask list", board_gaps,
+             "board(s)", "warn"),
+        card("prs", "Open PRs", len(open_prs), f"gh pr list: checks {checks}",
+             sum(p.state == "UNKNOWN" for p in snap.prs.values()), "PR state(s)"),
+        card("seats-down", "Seats down", sum(health_label(s) in ("shell", "missing") for s in snap.seats),
+             "easl agent.list: plain shell or missing tile",
+             sum(s.health is None and bool((s.board or {}).get("tile") or s.remote) for s in snap.seats), "seat health(s)",
+             "warn"),
+        card("next", "Next", sum(len(n) for n, _ in queues), f"tasks.tsv: first {NEXT} todo rows per seat", task_gaps,
+             "tasks.tsv"),
+        card("backlog", "Backlog", sum(len(b) for _, b in queues), "tasks.tsv: the other todo rows", task_gaps, "tasks.tsv"),
+        card("intake", "Unhandled intake", sum(len(s.intake or []) for s in snap.seats), "intake.md unchecked lines",
+             sum(s.intake is None for s in snap.seats), "intake.md"),
+    ]
+    newest = {k: max((s.sources[k] for s in snap.seats if k in s.sources), default=None) for k in ("lanes", "tasks.tsv")}
+    gh_at = max((p.read_at for p in snap.prs.values() if p.read_at), default=None)
+    scope = "every seat" if snap.scope == "all" else snap.scope
+    head = (f'<p>Scope: {e(scope)}. Drawn {read_tag(snap.at)} on {e(snap.machine)} by '
+            f'<span class="font-mono">tstack board</span>.</p>'
+            f'<p class="text-xs text-muted-foreground">lane.json newest {age_tag(newest["lanes"], "none")} · '
+            f'tasks.tsv newest {age_tag(newest["tasks.tsv"], "none")} · easl read {read_tag(snap.at)} · '
+            f'gh read {read_tag(gh_at) if gh_at else "no PRs"}</p>')
+    chips = []
+    for s in snap.seats:
+        label = health_label(s)
+        tone = "warn" if label in DOWN else "ok" if label in ("working", "idle", "done") else "muted"
+        count = badge(f"{len(s.errors)} problem(s)", "warn" if s.errors else "muted")
+        chips.append(f'<span class="inline-flex items-center gap-1 bg-card border border-border rounded px-2 py-1 text-xs">'
+                     f'<span class="font-mono">{e(s.name)}</span> {badge(label, tone)} {count}</span>')
+    problems = [(f"{s.name} · {p.source}", p.error) for s in snap.seats for p in s.errors]
+    problems += [(p.source, p.error) for p in snap.errors]
+    listed = "".join(f'<li class="text-warn"><span class="font-mono">{e(where)}</span>: {e(error)}</li>'
+                     for where, error in problems)
+    body = (head + f'<div class="flex flex-wrap gap-3">{"".join(cards)}</div>'
+            f'<div class="flex flex-wrap gap-2">{"".join(chips)}</div>'
+            f'<details{" open" if problems else ""}><summary class="cursor-pointer font-semibold">'
+            f'Problems ({len(problems)})</summary><ul class="text-xs space-y-1">{listed}</ul></details>')
+    return Region("mc/summary", "Mission control", 1440, page("Mission control", body))
+
+
+def needs_tim(snap: Snapshot, board_id: str, placed: set) -> Region:
+    rows, total = [], 0
+    for s in snap.seats:
+        b = s.board or {}
+        if s.questions is None:
+            rows.append(f'<li data-row data-seat="{e(s.name)}" class="text-warn">{badge("unreadable", "warn")} '
+                        f'<span class="font-mono">{e(s.name)}</span>: open questions on {e(b.get("board") or "its board")} '
+                        f'could not be read; see Problems in Mission control.</li>')
+            continue
+        total += len(s.questions)
+        if s.redacted:
+            rows += [f'<li data-row data-seat="{e(s.name)}"><span class="font-mono">{e(s.name)}</span>: '
+                     f'{len(s.questions)} open on {e(b.get("board"))}@{e(b.get("host"))} (kept there)</li>'] if s.questions else []
+            continue
+        for q in s.questions:
+            here = q.board == board_id
+            options = ", ".join(f"{o['id']}) {o['label']}" + (" (recommended)" if o["id"] == q.recommended else "")
+                                for o in q.options or [])
+            where = (f'tile <span class="font-mono">{e(q.id)}</span>, in the grid beside this list' if here else
+                     f'board <span class="font-mono">{e(q.board)}</span> on {e(q.host)}, tile '
+                     f'<span class="font-mono">{e(q.id)}</span>: open that board')
+            expires = f" · expires {age_tag(q.expires)}" if q.expires else ""
+            mark = f' data-question="{e(q.id)}"' if here else ""
+            rows.append(f'<li data-row data-seat="{e(q.seat)}"{mark} class="border-b border-border pb-2 space-y-1">'
+                        f'<div class="font-medium">{e(q.question)}</div>'
+                        + (f'<div class="text-muted-foreground">{e(options)}</div>' if options else "")
+                        + f'<div class="text-xs text-muted-foreground"><span class="font-mono">{e(q.seat)}</span>'
+                          f'{" · asked by " + e(q.asker) if q.asker else ""} · asked {age_tag(q.asked, "?")}{expires} · '
+                          f'{where}</div></li>')
+    # The data-question ids are the placement memory: while this board's questions are unreadable, keep the old ones.
+    unread = any(s.questions is None and (s.board or {}).get("board") == board_id for s in snap.seats)
+    memory = "".join(f'<span hidden data-question="{e(i)}"></span>' for i in sorted(placed)) if unread else ""
+    body = (f'<p class="font-semibold">{total} open question(s). Answer each on its own question tile.</p>'
+            + filters([s.name for s in snap.seats])
+            + (f'<ul class="space-y-2">{"".join(rows)}</ul>' if rows else '<p class="text-muted-foreground">Nothing open.</p>')
+            + memory)
+    return Region("mc/questions", "Needs Tim", 560, page("Needs Tim", body))
+
+
+def lane_row(seat: Seat, lane: Lane, prs: dict) -> str:
+    tone = "accent" if lane.state == "running" else "warn" if lane.state in ATTENTION else "muted"
+    task = f" · {e(lane.task)}" if lane.task else ""
+    facts = [f'run {e("-" if lane.run is None else lane.run)} started {age_tag(lane.started)}']
+    facts += [f"ended {age_tag(lane.ended)}"] if lane.ended else []
+    facts += [f'exit {e("-" if lane.exit is None else lane.exit)}', f"${lane.cost:.2f} recorded"]
+    facts += [x for x in (pr_badges(lane.pr, prs), file_link(lane.brief, "brief.md"), file_link(lane.final, "final.md")) if x]
+    tail = (f'<details><summary class="cursor-pointer text-xs">answer tail</summary>'
+            f'<div class="text-xs text-muted-foreground">{e(lane.answer_tail)}</div></details>') if lane.answer_tail else ""
+    return (f'<li data-row data-seat="{e(seat.name)}" data-state="{e(lane.state)}" class="border-b border-border py-1 space-y-1">'
+            f'<div>{badge(lane.state, tone)} <span class="font-mono">{e(seat.name)}</span> · '
+            f'<span class="font-mono">{e(lane.id)}</span>{task}</div>'
+            f'<div class="text-xs text-muted-foreground">{" · ".join(facts)}</div>{tail}</li>')
+
+
+def lane_list(rows: list, empty: str) -> str:
+    return f'<ul>{"".join(rows)}</ul>' if rows else f'<p class="text-muted-foreground text-xs">{e(empty)}</p>'
+
+
+def lane_board(snap: Snapshot) -> Region:
+    pairs = [(s, lane) for s in snap.seats for lane in s.lanes or []]
+    live = [lane_row(s, lane, snap.prs) for s, lane in pairs if lane.state in LIVE]
+    attention = [lane_row(s, lane, snap.prs) for s, lane in pairs if lane.state in ATTENTION]
+    attention += [f'<li data-row data-seat="{e(s.name)}" data-state="unread" class="text-warn text-xs">'
+                  f'<span class="font-mono">{e(s.name)}</span>: lanes unreadable; see Problems in Mission control.</li>'
+                  for s in snap.seats if s.lanes is None]
+    ended = [(s, lane) for s, lane in pairs if lane.state == "done"]
+    lately = [lane_row(s, lane, snap.prs) for s, lane in ended if recent(lane.ended, snap.at)]
+    older = Counter(s.name for s, lane in ended if not recent(lane.ended, snap.at))
+    by_lane = {(s.name, lane.id): lane for s, lane in pairs}
+    covered = {lane.pr for _, lane in pairs if lane.pr and lane.state in LIVE}
+    loose = {}
+    for s, lane in pairs:
+        pr = snap.prs.get(lane.pr)
+        if pr and pr.state == "OPEN" and lane.pr not in covered:
+            loose.setdefault(lane.pr, (s.name, f"lane {lane.id} ({lane.state})"))
+    for s in snap.seats:
+        for t in s.tasks or []:
+            pr, lane = snap.prs.get(t.pr), by_lane.get((s.name, t.lane))
+            if pr and pr.state == "OPEN" and t.pr not in covered and not (lane and lane.state in LIVE):
+                loose.setdefault(t.pr, (s.name, f"task {t.id}" + (f" {t.title}" if t.title else "") + f" ({t.state})"))
+    loose_rows = [f'<li data-row data-seat="{e(name)}" data-state="open PR" class="text-xs py-0.5">'
+                  f'<span class="font-mono">{e(name)}</span> · {e(text)} {pr_badges(url, snap.prs)}</li>'
+                  for url, (name, text) in sorted(loose.items())]
+    paths = {s.name: s.path or s.name for s in snap.seats}
+    older_lines = "".join(f'<p class="text-xs text-muted-foreground">{n} older ended lanes: '
+                          f'<span class="font-mono">lane list --all --seat {e(paths[name])}</span></p>'
+                          for name, n in sorted(older.items()))
+    states = sorted({lane.state for _, lane in pairs if lane.state in LIVE + ATTENTION or recent(lane.ended, snap.at)})
+    body = (filters([s.name for s in snap.seats], states)
+            + f'<div class="grid grid-cols-2 gap-4">'
+              f'<section data-section="live" class="space-y-1"><h3 class="font-semibold">Running and waiting ({len(live)})</h3>'
+              f'{lane_list(live, "No lane is running or waiting.")}</section>'
+              f'<section data-section="attention" class="space-y-1"><h3 class="font-semibold">Needs attention ({len(attention)})</h3>'
+              f'{lane_list(attention, "No lane failed, ended without an answer or lost its process.")}</section></div>'
+              f'<section data-section="loose" class="space-y-1"><h3 class="font-semibold">Open PRs without a running lane '
+              f'({len(loose_rows)})</h3>{lane_list(loose_rows, "None.")}</section>'
+              f'<details data-section="ended"><summary class="cursor-pointer font-semibold">Recently ended: {len(lately)} in '
+              f'the last 7 days</summary>{lane_list(lately, "None.")}</details>{older_lines}')
+    return Region("mc/lanes", "Lanes", 840, page("Lanes", body))
+
+
+def task_row(seat: Seat, task: Task, place: str, prs: dict) -> str:
+    effort = f" {badge(task.effort)}" if task.effort else ""
+    effort += f" {badge('task ' + task.state)}" if place == "gone" else ""
+    options = "".join(f'<option value="{v}">{v or "none"}</option>' for v in ("", "next", "later", "drop"))
+    return (f'<li data-task="{e(task.id)}" data-place="{place}" data-task-state="{e(task.state)}" class="py-0.5">'
+            f'<span class="font-mono">{e(task.id)}</span> {e(task.title)}{effort} {pr_badges(task.pr, prs)} '
+            f'<label class="text-muted-foreground">choice for {e(task.id)} <select data-choice="{e(seat.name)}:{e(task.id)}" '
+            f'class="{FIELD}">{options}</select></label> <span data-verdict class="inline-block rounded px-1.5 py-0.5 '
+            f'{TONES["muted"]}">none</span></li>')
+
+
+def queue_card(seat: Seat, prs: dict, choices: dict) -> str:
+    parts = [f'<div class="font-semibold font-mono text-sm">{e(seat.name)}</div>']
+    unread = '<div class="text-warn">{} unreadable: {}</div>'
+    if seat.redacted:
+        b = seat.board or {}
+        if seat.tasks is None:
+            parts.append(unread.format("tasks.tsv", e(problem_of(seat, "tasks.tsv"))))
+        else:
+            nxt, later = next_backlog(seat.tasks)
+            ids = ", ".join(f'<span class="font-mono">{e(t.id)}</span> {pr_badges(t.pr, prs)}'.strip() for t in nxt) or "none"
+            parts.append(f"<div>Next: {ids} · Backlog: {len(later)} more todo rows</div>")
+        if seat.intake is not None:
+            parts.append(f"<div>Unhandled intake: {len(seat.intake)} items (kept on {e(seat.host)})</div>")
+        parts.append(f'<div>Content stays on {e(seat.host)}: open the board <span class="font-mono">{e(b.get("board"))}</span> '
+                     f'on {e(b.get("host"))}.</div>' if b else '<div class="text-warn">unreachable; see Problems in Mission control.</div>')
+        return f'<div data-row data-seat="{e(seat.name)}" class="bg-card border border-border rounded-lg p-3 text-xs space-y-1 w-[440px]">{"".join(parts)}</div>'
+    if seat.goal:
+        rest = f'<details><summary class="cursor-pointer">rest of the goal</summary>{e(seat.goal[400:])}</details>' if seat.goal[400:] else ""
+        parts.append(f'<div><span class="font-medium">Goal:</span> {e(seat.goal[:400])}{rest}</div>')
+    for effort in seat.efforts or []:
+        due = f" · due {e(effort.due)}" if effort.due else ""
+        parts.append(f'<div>Effort {file_link(effort.path, effort.name)}: {e(effort.goal or "no Goal line")}{due}</div>')
+    if seat.tasks is None:
+        parts.append(unread.format("tasks.tsv", e(problem_of(seat, "tasks.tsv"))))
+    else:
+        nxt, later = next_backlog(seat.tasks)
+        parts.append('<div class="font-medium">Next candidates (first todo rows in tasks.tsv order)</div>')
+        parts.append(f'<ol class="list-decimal pl-5">{"".join(task_row(seat, t, "next", prs) for t in nxt)}</ol>' if nxt
+                     else '<div class="text-muted-foreground">No todo rows.</div>')
+        if later:
+            parts.append(f'<details><summary class="cursor-pointer">Backlog: {len(later)} more todo rows</summary>'
+                         f'<ol class="list-decimal pl-5" start="{len(nxt) + 1}">'
+                         f'{"".join(task_row(seat, t, "backlog", prs) for t in later)}</ol></details>')
+        other = Counter(t.state for t in seat.tasks if t.state != "todo")
+        if other:
+            parts.append(f'<div class="text-muted-foreground">Other rows: {e(" · ".join(f"{k} {n}" for k, n in sorted(other.items())))}</div>')
+        rows = {t.id: t for t in seat.tasks}
+        prefix = f"choice:{seat.name}:"
+        earlier = [rows.get(key[len(prefix):]) or Task(key[len(prefix):], None, None, "not in tasks.tsv", None, None, None, 0)
+                   for key, value in sorted(choices.items()) if value and key.startswith(prefix)]
+        earlier = [t for t in earlier if t.state != "todo"]
+        if earlier:
+            parts.append('<div class="font-medium">Your earlier choices</div>'
+                         f'<ul class="pl-5">{"".join(task_row(seat, t, "gone", prs) for t in earlier)}</ul>')
+    if seat.intake is None:
+        parts.append(unread.format("intake.md", e(problem_of(seat, "intake.md"))))
+    elif seat.intake:
+        items = "".join(f'<li><span class="font-mono">{e(i.at)}</span> {e(i.source)}: {e(i.text)}</li>' for i in seat.intake)
+        parts.append(f'<details><summary class="cursor-pointer">Unhandled intake ({len(seat.intake)})</summary>'
+                     f'<ul class="pl-4">{items}</ul></details>')
+    if seat.orch:
+        parts.append(f'<details><summary class="cursor-pointer">orch status</summary>'
+                     f'<pre class="whitespace-pre-wrap font-mono">{e(seat.orch)}</pre></details>')
+    parts.append(f'<label class="block text-muted-foreground">Notes for {e(seat.name)} <textarea data-note="{e(seat.name)}" '
+                 f'rows="2" class="w-full {FIELD}"></textarea></label>')
+    return f'<div data-row data-seat="{e(seat.name)}" class="bg-card border border-border rounded-lg p-3 text-xs space-y-1 w-[440px]">{"".join(parts)}</div>'
+
+
+def queues(snap: Snapshot, choices: dict) -> Region:
+    body = (filters([s.name for s in snap.seats]) + '<p class="text-xs text-muted-foreground">A choice is a request: '
+            'the owning seat reads it on its next <span class="font-mono">tstack board</span> and shows applied once '
+            'tasks.tsv agrees.</p>'
+            f'<div class="flex flex-wrap gap-3 items-start">{"".join(queue_card(s, snap.prs, choices) for s in snap.seats)}</div>')
+    return Region("mc/queues", "Queues", 1440, page("Queues", body))
+
+
+def landed(snap: Snapshot) -> Region:
+    refs = {}
+    for s in snap.seats:
+        for lane in s.lanes or []:
+            refs.setdefault(lane.pr, []).append((s.name, f'lane <span class="font-mono">{e(lane.id)}</span>'))
+        for t in s.tasks or []:
+            refs.setdefault(t.pr, []).append((s.name, f'task <span class="font-mono">{e(t.id)}</span> {badge("task " + t.state)}'))
+    rows, older = [], 0
+    for url, pr in sorted(snap.prs.items()):
+        if pr.state not in ("MERGED", "CLOSED"):
+            continue
+        if pr.state == "MERGED" and not recent(pr.merged_at, snap.at):
+            older += 1
+            continue
+        where = refs.get(url) or [("", "")]
+        when = f"merged {age_tag(pr.merged_at)}" if pr.state == "MERGED" else "closed unmerged"
+        title = f" · {e(pr.title)}" if pr.title else ""
+        rows.append(f'<li data-row data-seat="{e(where[0][0])}" class="text-xs py-0.5">'
+                    f'{pr_link(url, f"{pr.repo}#{pr.number}")} {badge(pr.state.lower(), "ok" if pr.state == "MERGED" else "muted")} '
+                    f'{when}{title} · {" · ".join(x for _, x in where)}</li>')
+    body = (filters([s.name for s in snap.seats])
+            + (f'<ul>{"".join(rows)}</ul>' if rows else '<p class="text-muted-foreground">Nothing merged or closed in the last 7 days.</p>')
+            + f'<p class="text-xs text-muted-foreground">{older} older merged PRs.</p>')
+    return Region("mc/landed", "Merged and deployed", 1440, page("Merged and deployed", body))
+
+
+KEYS = ("mc/summary", "mc/questions", "mc/lanes", "mc/queues", "mc/landed")
+
+
+def regions(snap: Snapshot, board_id: str, choices: dict, placed: set) -> list:
+    """The five pages, in KEYS order. `choices` is the mc/queues tile's saved state; `placed`, the question ids the
+    drawn Needs Tim page holds."""
+    return [summary(snap), needs_tim(snap, board_id, placed), lane_board(snap), queues(snap, choices), landed(snap)]
+
+
+# Drawing: reconcile the regions with the board. The operator's moves win: only new objects get a frame.
+
+GAP, CELL = 40, 460
+NO_APP = "measured by the app"
+
+
+def mask(page_html: str) -> str:
+    return re.sub(r"<time data-v [^>]*>.*?</time>", "<time data-v>", page_html)
+
+
+def key_of(obj: dict):
+    return obj.get("key") or (obj.get("props") or {}).get("key")
+
+
+def frame_of(obj: dict) -> dict:
+    frame = obj.get("frame") or {}
+    return {k: frame.get(k) or 0 for k in ("x", "y", "w", "h")}
+
+
+def overlaps(a: dict, b: dict) -> bool:
+    return a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"] and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"]
+
+
+def estimate(page_html: str) -> int:
+    return 120 + 28 * sum(page_html.count(tag) for tag in ("<li", "<details", "data-count"))
+
+
+def first_layout(frames: dict, term: dict, others: list) -> dict:
+    """Reading order, the block's top-right 80 left of the terminal, two question columns reserved on its left."""
+    top = frames["mc/summary"]["h"] + GAP
+    below = top + max(frames["mc/questions"]["h"], frames["mc/lanes"]["h"]) + GAP
+    spots = {"mc/summary": (0, 0), "mc/questions": (0, top), "mc/lanes": (frames["mc/questions"]["w"] + GAP, top),
+             "mc/queues": (0, below), "mc/landed": (0, below + frames["mc/queues"]["h"] + GAP)}
+    width = max(dx + frames[k]["w"] for k, (dx, _) in spots.items())
+    height = max(dy + frames[k]["h"] for k, (_, dy) in spots.items())
+    reserve = 2 * (CELL + GAP)
+    x = term["x"] - 80 - width
+    while True:
+        hits = [o for o in others if overlaps({"x": x - reserve, "y": term["y"], "w": width + reserve, "h": height}, o)]
+        if not hits:
+            return {k: {"x": x + dx, "y": term["y"] + dy} for k, (dx, dy) in spots.items()}
+        x = min(o["x"] for o in hits) - 80 - width
+
+
+def grid_spot(anchor: dict, height: int, taken: list) -> dict:
+    """The first free 460-wide cell, in reading order, of the two columns left of the Needs Tim tile."""
+    best = None
+    for x in (anchor["x"] - 2 * (CELL + GAP), anchor["x"] - CELL - GAP):
+        y = anchor["y"]
+        while True:
+            hits = [o for o in taken if overlaps({"x": x, "y": y, "w": CELL, "h": height}, o)]
+            if not hits:
+                break
+            y = max(o["y"] + o["h"] for o in hits) + GAP
+        if best is None or y < best["y"]:
+            best = {"x": x, "y": y}
+    return best
+
+
+def applied(choice: str, place, state) -> bool:
+    return ((choice == "next" and place == "next") or (choice == "later" and place == "backlog" and state == "todo")
+            or (choice == "drop" and state == "cancelled"))
+
+
+def pending(state: dict, snap: Snapshot, only=None) -> list:
+    """`choice` lines tasks.tsv does not reflect yet, and every non-empty `note`, from a mc/queues tile's state."""
+    facts = {}
+    for s in snap.seats:
+        nxt, later = next_backlog(s.tasks or [])
+        places = {**{t.id: "backlog" for t in later}, **{t.id: "next" for t in nxt}}
+        facts.update({(s.name, t.id): (places.get(t.id), t.state) for t in s.tasks or []})
+    lines = []
+    for key, value in sorted(state.items()):
+        kind, _, rest = key.partition(":")
+        seat, _, task = rest.rpartition(":") if kind == "choice" else (rest, "", "")
+        if not value or (only and seat != only):
+            continue
+        if kind == "choice" and not applied(value, *facts.get((seat, task), (None, None))):
+            lines.append(f"choice\t{seat}\t{task}\t{value}")
+        elif kind == "note":
+            lines.append(f"note\t{seat}\t{json.dumps(value)}")
+    return lines
+
+
+def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
+    def call(method, **params):
+        return easl(where, method, params=params)
+
+    def batch(ops):
+        if not ops:
+            return []
+        return call("object.batch", board=board_id, ops=[{"method": m, "params": p} for m, p in ops]).get("results") or []
+
+    out = []
+    found = call("object.find", board=board_id, keyPrefix="mc/").get("objects") or []
+    existing = {key_of(o): o for o in found if str(key_of(o)).startswith("mc/")}
+    old = {k: call("object.get", id=existing[k]["id"]).get("object") or {} for k in KEYS if k in existing}
+    choices = ((old.get("mc/queues") or {}).get("props") or {}).get("state") or {}
+    previous = ((old.get("mc/questions") or {}).get("props") or {}).get("html") or ""
+    placed = set(re.findall(r'data-question="([^"]+)"', previous))
+    wanted = regions(snap, board_id, choices, placed)
+    ids = {k: o["id"] for k, o in old.items()}
+    frames = {k: frame_of(o) for k, o in old.items()}
+    term = {"x": 0, "y": 0, "w": 0, "h": 0}
+    if not old and pointer and pointer.get("tile"):
+        try:
+            term = frame_of(call("object.get", id=pointer["tile"]).get("object") or {})
+        except Fail:
+            pass
+    lowest = max(frames.values(), key=lambda f: f["y"] + f["h"], default=None)
+    spot = {"x": term["x"] - 80 - 1440, "y": term["y"]}
+    seen, taken = None, None
+
+    def on_board():
+        """The board's objects before this draw writes, arrows and groups aside; read at most once."""
+        nonlocal seen
+        if seen is None:
+            seen = {o["id"]: o for o in call("board.get", board=board_id).get("objects") or []
+                    if o.get("type") not in ("arrow", "group")}
+        return seen
+
+    asked = [q for s in snap.seats if not s.redacted for q in s.questions or [] if q.board == board_id]
+    new = [q for q in asked if q.id not in placed]
+    placing, moves = {q.id for q in new}, {}
+
+    def place(objects, regions_now):
+        mine = set(ids.values())
+        taken = list(regions_now) + [frame_of(o) for i, o in objects.items() if i not in mine and i not in placing]
+        for q in new:
+            if q.id in objects and "mc/questions" in frames:
+                height = frame_of(objects[q.id])["h"]
+                moves[q.id] = grid_spot(frames["mc/questions"], height, taken)
+                taken.append({**moves[q.id], "w": CELL, "h": height})
+                out.append(f"question {q.id}\tplaced")
+
+    ops, upserted, estimated, planned = [], [], False, {k: dict(f) for k, f in frames.items()}
+    for region in wanted:
+        props = (old.get(region.key) or {}).get("props") or {}
+        if region.key in old and props.get("title") == region.title and mask(props.get("html") or "") == mask(region.html):
+            out.append(f"{region.key}\tunchanged")
+            continue
+        page_props = {"html": region.html, "title": region.title}
+        size = {"w": region.width, "h": estimate(region.html)}
+        if not estimated:
             try:
-                asks = easl(own, "ask", "list", "--open", "--board", own["board"]).get("objects") or []
-                listed = "\n".join(f"- {o.get('props', {}).get('question')} (`{o.get('id')}`)" for o in asks)
+                got = call("object.measure", board=board_id, type="html", props=page_props, width=region.width)
+                size = {"w": got["w"], "h": got["h"]}
             except Fail as error:
-                listed = str(error)
-            parts += ["### Open questions", listed or "none"]
-        note = {"props": {"markdown": "\n\n".join(parts) + "\n"}, "frame": {"w": 640}, "size": "fit"}
-        easl(where, "object.upsert", "--board", where["board"], "--key", f"seat:{name}", "--type", "note",
-             "--json", json.dumps(note))
-        print(f"seat:{name}")
+                if NO_APP not in str(error):
+                    raise
+                estimated = True
+        # No size "fit": easl refits an update without x/y from wherever fits, which can move the origin.
+        frame = size
+        if region.key not in old and not old:
+            frame = {**spot, **size}
+        elif region.key not in old:
+            if taken is None:
+                taken = [frame_of(o) for o in on_board().values()]
+            frame = {"x": frames.get("mc/summary", lowest)["x"], "y": lowest["y"] + lowest["h"] + GAP, **size}
+            while hits := [o for o in taken if overlaps(frame, o)]:
+                frame["y"] = max(o["y"] + o["h"] for o in hits) + GAP
+            taken.append(frame)
+        planned.setdefault(region.key, {}).update(frame)
+        op = {"key": region.key, "type": "html", "props": page_props, "frame": frame}
+        ops.append(("object.upsert", op))
+        upserted.append(region.key)
+        out.append(f"{region.key}\t{'updated' if region.key in old else 'created'}")
+    for key, obj in sorted(existing.items()):
+        if key not in old:
+            ops.append(("object.delete", {"id": obj["id"]}))
+            out.append(f"{key}\tdeleted")
+    for obj in call("object.find", board=board_id, keyPrefix="seat:").get("objects") or []:
+        if obj.get("type") == "note" and str(key_of(obj)).startswith("seat:"):
+            ops.append(("object.delete", {"id": obj["id"]}))
+            out.append(f"{key_of(obj)}\tdeleted (old note)")
+    out += ["heights\testimated: no easl app is attached to measure the pages"] if estimated else []
+    # With the index already drawn, its new questions move in the same batch, so a failed write places none of them
+    # and records none.
+    early = "mc/questions" in old
+    if early and new:
+        place(on_board(), planned.values())
+        ops += [("object.update", {"id": i, "frame": f}) for i, f in moves.items()]
+    results = batch(ops)
+    before = {k: dict(f) for k, f in frames.items()}
+    for key, result in zip(upserted, results):
+        ids[key], frames[key] = result["object"]["id"], frame_of(result["object"])
+
+    if not old or (new and not early):
+        objects = {o["id"]: o for o in call("board.get", board=board_id).get("objects") or []
+                   if o.get("type") not in ("arrow", "group")}
+        if not old:
+            others = [frame_of(o) for i, o in objects.items() if i not in set(ids.values()) and i not in {q.id for q in asked}]
+            for key, frame in first_layout(frames, term, others).items():
+                frames[key].update(frame)
+                moves[ids[key]] = frame
+        place(objects, frames.values())
+        batch([("object.update", {"id": i, "frame": f}) for i, f in moves.items()])
+
+    keys = {i: k for k, i in ids.items()}
+    check_ids = list(ids.values()) + [i for i in moves if i not in keys]
+    order = [r.key for r in wanted]
+
+    def rank(key):
+        return (before.get(key) or frames[key])["y"], order.index(key)
+
+    # Only an overlap this draw made is repaired, in the order the regions had before it; one already there is the
+    # operator's to keep.
+    kept = {frozenset(pair) for pair in combinations(before, 2) if overlaps(before[pair[0]], before[pair[1]])}
+    pushed = {}
+    for _ in range(len(order) ** 2):
+        clash = next((pair for pair in combinations(sorted(frames, key=rank), 2)
+                      if frozenset(pair) not in kept and overlaps(frames[pair[0]], frames[pair[1]])), None)
+        if not clash:
+            break
+        upper, lower = clash
+        frames[lower]["y"] = pushed[lower] = frames[upper]["y"] + frames[upper]["h"] + GAP
+    batch([("object.update", {"id": ids[k], "frame": {"y": y}}) for k, y in pushed.items()])
+    out += [f"{k}\tmoved down" for k in pushed]
+    check = call("layout.check", board=board_id, ids=check_ids)
+    findings = {k: v for k, v in check.items() if v and k not in ("hints", "approximate")}
+    out.append("layout.check\t" + (json.dumps(findings, sort_keys=True) if findings else "clean"))
+    return out + pending(choices, snap)
+
+
+def assistant_requests(snap: Snapshot, board_id: str, seat: Path) -> list:
+    """A project seat also reads what Tim left for it on the assistant's board."""
+    assistant = INSTANCE.resolve() / "assistant"
+    try:
+        pointer = None if seat == assistant else read_pointer(assistant)
+    except READ_ERRORS as error:
+        return [f"requests\tunread: {assistant / 'state' / 'board.json'}: {one_line(error)}"]
+    if not pointer or pointer["board"] == board_id:
+        return []
+    try:
+        queue = easl(pointer, "object.find", params={"board": pointer["board"], "key": "mc/queues"}).get("object") or {}
+    except Fail as error:
+        return [] if "not_found" in str(error) else [f"requests\tunread: {error}"]
+    return pending((queue.get("props") or {}).get("state") or {}, snap, only=seat_name(seat))
+
+
+def board(a) -> int:
+    seat = seat_dir(a.seat)
+    if not (seat / "state").is_dir():
+        raise Fail(f"no seat at {seat}: it has no state/ dir")
+    pointer = None
+    if not a.print_only:
+        try:
+            pointer = read_pointer(seat)
+        except READ_ERRORS as error:
+            raise Fail(f"{seat / 'state' / 'board.json'}: {one_line(error)}")
+        if not (a.board or pointer):
+            raise Fail(f"no board: pass --board, or write {seat / 'state' / 'board.json'}")
+    snap = collect(seat)
+    if a.redact:
+        redact(snap)
+    if a.print_only:
+        print(json.dumps(asdict(snap), indent=1, sort_keys=True))
+        return 0
+    target = a.board or pointer["board"]
+    own = pointer if pointer and pointer["board"] == target else None
+    print("\n".join(draw(snap, own or {"board": target}, target, own) + assistant_requests(snap, target, seat)))
     return 0
 
 
@@ -209,7 +1460,17 @@ def main(argv) -> int:
     sub = top.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup", parents=[common])
     sub.add_parser("update", parents=[common])
-    sub.add_parser("board", parents=[common]).add_argument("--board", help="board id (default: the assistant's)")
+    text = ("Draw mission control on the seat's easl board: keyed HTML tiles mc/summary, mc/questions, mc/lanes, "
+            "mc/queues and mc/landed. Unchanged tiles are left alone, moved tiles stay put, old seat:<name> notes and "
+            "stale mc/ tiles are deleted. Prints one line per action, then the choices and notes left on the board.")
+    p = sub.add_parser("board", parents=[common], help=text, description=text)
+    p.add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/, else "
+                                  "<instance>/assistant, whose board shows every seat)")
+    p.add_argument("--board", help="board id to draw on (default: the seat's state/board.json)")
+    p.add_argument("--print", dest="print_only", action="store_true",
+                   help="print the collected snapshot as JSON and draw nothing")
+    p.add_argument("--redact", action="store_true",
+                   help="keep only counts, ids, states and PR links (how remote seats are read)")
     a = top.parse_args(argv)
     if a.instance:
         INSTANCE = Path(a.instance).expanduser().resolve()
@@ -219,7 +1480,7 @@ def main(argv) -> int:
         return setup(machine())
     if a.cmd == "update":
         return update(machine())
-    return board(a.board)
+    return board(a)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # tstack
 
-tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/oh-my-pi) on easl boards. Three small CLIs do what agents repeat: `lane` runs one task as a detached omp session in its own worktree, `watch-pr` reports a PR's facts through merge and deploy, and `tstack` sets a host up. None of them refuses, demands proof or blocks an agent. Errors from gh, git and systemd pass through as errors.
+tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/oh-my-pi) on easl boards. Three small CLIs do what agents repeat: `lane` runs one task as a detached omp session in its own worktree, `watch-pr` reports a PR's facts through merge and deploy, and `tstack` sets a host up and draws mission control on a seat's board. None of them refuses, demands proof or blocks an agent. Errors from gh, git and systemd pass through as errors.
 
 | Path | Holds |
 |---|---|
@@ -32,6 +32,14 @@ You need git, Python 3.9 or newer, `gh` logged in, bun, omp and easl.
 ## Lanes
 
 `lane start <name> --repo <owner/repo or path> --brief <file>` makes `~/worktrees/<project>/<id>` on branch `lane/<id>` and runs `omp -p --mode json` there, under `systemd-run --user` on Linux, with `roles/lane.md` appended and the brief as the prompt. A lane's record, brief and final answer live in `<seat>/state/lanes/<id>/`. Each run's json stream, stderr and exit code live in `<seat>/state/run/lanes/<id>/`. `lane wait <id>...` exits when a run ends and prints its final answer, so a seat runs it as a background job to wake on it.
+
+## Board
+
+`tstack board` draws mission control on the seat's board as five keyed HTML tiles: a summary, Needs Tim (every open question), lanes, queues (next, backlog, intake) and merged PRs. It reads lane records, tasks, intake, goals, open easl questions, terminal health and one cached `gh pr list` per repo. It writes nothing but the board and the gh cache. A failed read shows on the board as an error, never as zero. A redraw leaves unchanged tiles and moved tiles alone, and places each new question tile once. The assistant seat's board shows every seat. Any other seat's board shows that seat. `tstack board --print` prints what it read as JSON and draws nothing.
+
+The instance file `remote-seats` lists seats on other hosts, one per line: `<name> <ssh target> <seat dir>`. tstack reads each over ssh with `--redact`, so only counts, ids, states and PR links leave that host.
+
+Choices and notes left on the queues tile print as `choice` and `note` lines after the draw. The seat that owns the task acts on them.
 
 ## Upstream
 
