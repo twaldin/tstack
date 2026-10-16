@@ -30,6 +30,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from itertools import combinations
+from html.parser import HTMLParser
 from pathlib import Path
 
 HOME = Path.home()
@@ -45,6 +46,10 @@ BUS = {**os.environ, "XDG_RUNTIME_DIR": RUNTIME,
 
 
 class Fail(Exception):
+    pass
+
+
+class ConnectionFail(Fail):
     pass
 
 
@@ -175,18 +180,22 @@ EASL_APP = "/Applications/easl.app/Contents/Resources/bin"
 def easl(where: dict, *args, params=None) -> dict:
     """One easl call on `where`'s host, over ssh when that is not this machine. `params` go as --json on stdin."""
     argv = [*args] + ["--json", "@-"] * (params is not None)
-    if where.get("host") and where["host"] != machine():
-        argv = ["ssh", where["host"], f'PATH="$PATH:{EASL_APP}" ' + shlex.join(["easl", *argv])]
+    remote = where.get("host") and where["host"] != machine()
+    if remote:
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", where["host"],
+                f'PATH="$PATH:{EASL_APP}" ' + shlex.join(["easl", *argv])]
     else:
         local = Path(EASL_APP) / "easl"
         argv = [str(local) if not shutil.which("easl") and local.exists() else "easl", *argv]
     try:
         result = subprocess.run(argv, input="" if params is None else json.dumps(params), capture_output=True, text=True)
     except FileNotFoundError:
-        raise Fail(f"{argv[0]}: not found")
+        error_type = ConnectionFail if remote else Fail
+        raise error_type(f"{argv[0]}: not found")
     # ssh to the tailnet Macs returns 0 whatever the remote command exited with, so stderr alone also means failure.
     if result.returncode or (result.stderr.strip() and not result.stdout.strip()):
-        raise Fail(f"easl {args[0]}: {one_line(result.stderr or result.stdout)}")
+        error_type = ConnectionFail if remote and result.returncode == 255 else Fail
+        raise error_type(f"easl {args[0]}: {one_line(result.stderr or result.stdout)}")
     try:
         return json.loads(result.stdout or "{}")
     except ValueError:
@@ -1676,16 +1685,18 @@ def project_key(seat: Seat) -> str:
 
 def projects(snap: Snapshot, choices: dict) -> list:
     """One tile per project, numbered in seat order. `choices` is every project tile's saved state, merged."""
-    return [Region(project_key(s), f"{n} · {project_name(s)}", 820, page("", project_card(n, s, snap, choices)), "left")
+    return [Region(project_key(s), f"{n} · {project_name(s)}", 820, page("", project_card(n, s, snap, choices)),
+                   "project" if snap.scope == "all" and n > 1 else "left")
             for n, s in enumerate(snap.seats, 1)]
 
 
-def question_item(q: Question, board_id: str, project: str, stays: bool) -> str:
+def question_item(q: Question, board_id: str, project: str, stays: bool, beside: bool) -> str:
     here = q.board == board_id
     options = ", ".join(f"{o['id']}) {o['label']}" + (" (recommended)" if o["id"] == q.recommended else "")
                         for o in q.options or [])
     tile = f'tile <span class="font-mono">{e(q.id)}</span>'
-    where = (f"{tile}, under the terminal that asked it" if here and stays else f"{tile}, beside this panel" if here else
+    where = (f"{tile}, under the terminal that asked it" if here and stays else
+             f"{tile}, beside this panel" if here and beside else tile if here else
              f'board <span class="font-mono">{e(q.board)}</span> on {e(q.host)}, {tile}')
     expires = local(q.expires)
     chips = [pill(e(project)), pill(f"asked {age_tag(q.asked, '?')}")]
@@ -1754,7 +1765,7 @@ def todo_page(snap: Snapshot, board_id: str, placed: set, stay: set) -> Region:
     asked = sorted((q for s in snap.seats if not s.redacted for q in s.questions or []),
                    key=lambda q: (parse_iso(q.asked) is None, q.asked or ""))
     project = names(snap)
-    entries = [question_item(q, board_id, project.get(q.seat, q.seat), q.id in stay) for q in asked]
+    entries = [question_item(q, board_id, project.get(q.seat, q.seat), q.id in stay, snap.scope != "all") for q in asked]
     for s in snap.seats:
         b = s.board or {}
         if s.questions is None:
@@ -1857,9 +1868,10 @@ def regions(snap: Snapshot, board_id: str, choices: dict, placed: set, stay: set
             + [panel_region(p, "centre") for p in mine] + [done_page(snap)] + [panel_region(p, "right") for p in rest])
 
 
-# Drawing: reconcile the regions with the board. The operator's moves win: only new objects get a frame.
+# Drawing: reconcile regions and project columns with the board.
 
 GAP, QUESTIONS, BATCH = 40, 460, 50
+COORDINATOR_WIDTH = 1000
 NO_APP = "measured by the app"
 REGION_KEYS = ("mc/strip", "mc/todo", "mc/done")
 COLUMNS = ("left", "centre", "questions", "right")
@@ -1883,7 +1895,36 @@ def overlaps(a: dict, b: dict) -> bool:
 
 
 def estimate(page_html: str) -> int:
-    return 120 + 28 * sum(page_html.count(tag) for tag in ("<li", "<details", "<section", "data-count"))
+    class VisibleRows(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+            self.rows = 0
+
+        def handle_starttag(self, tag, attrs):
+            hidden = bool(self.stack and self.stack[-1][1])
+            if not hidden:
+                self.rows += tag in ("li", "details", "section", "p", "pre", "tr", "h1", "h2", "h3", "h4", "textarea")
+                self.rows += any(name == "data-count" for name, _ in attrs)
+            hidden |= tag in ("script", "style", "summary") or (
+                tag == "details" and not any(name == "open" for name, _ in attrs))
+            if tag not in ("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+                           "source", "track", "wbr"):
+                self.stack.append((tag, hidden))
+
+        def handle_endtag(self, tag):
+            for n in range(len(self.stack) - 1, -1, -1):
+                if self.stack[n][0] == tag:
+                    del self.stack[n:]
+                    break
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            self.handle_endtag(tag)
+
+    visible = VisibleRows()
+    visible.feed(page_html)
+    return 120 + 28 * visible.rows
 
 
 def below(frame: dict, taken: list) -> dict:
@@ -1895,17 +1936,109 @@ def below(frame: dict, taken: list) -> dict:
         frame["y"] = max(o["y"] + o["h"] for o in hits) + GAP
 
 
-def first_layout(drawn: list, sizes: dict, stale: list, term: dict, others: list) -> dict:
-    """Each column's origin: the strip on top, then projects, to-do, a column kept for questions, and done. The block
-    goes where the stale mc/ tiles were, else 80 left of the terminal, then left past anything in `others` it covers."""
+def project_columns(snap: Snapshot, where: dict, board_id: str, objects: dict, own_tile) -> dict:
+    columns, claimed = {}, {own_tile}
+    if snap.scope != "all":
+        return columns
+    for seat in snap.seats[1:]:
+        members = []
+        pointer = seat.board or {}
+        terminal = pointer.get("tile")
+        if (pointer.get("board") == board_id
+                and (pointer.get("host") or snap.machine) == (where.get("host") or snap.machine)
+                and terminal not in claimed
+                and objects.get(terminal, {}).get("type") == "terminal"):
+            members.append(terminal)
+            claimed.add(terminal)
+            members += [i for i, obj in sorted(objects.items(), key=lambda item: (item[1].get("createdAt") or 0, item[0]))
+                        if obj.get("type") == "question"
+                        and read_question(obj, board_id, snap.machine, seat.name).asker == terminal
+                        and not (obj.get("props") or {}).get("archived")]
+        columns[project_key(seat)] = members
+    return columns
+
+
+def column_size(card: dict, members: list, objects: dict) -> dict:
+    frames = [card, *[frame_of(objects[i]) for i in members]]
+    return {"w": max(f["w"] for f in frames), "h": sum(f["h"] for f in frames) + GAP * (len(frames) - 1)}
+
+
+def column_grid(columns: dict, sizes: dict, objects: dict) -> dict:
+    dimensions = {key: column_size(sizes[key], members, objects) for key, members in columns.items()}
+    keys = list(columns)
+    widths = [max(COORDINATOR_WIDTH, *(dimensions[k]["w"] for k in keys[n::4])) for n in range(min(4, len(keys)))]
+    positions, y = {}, 0
+    for start in range(0, len(keys), 4):
+        row, x = keys[start:start + 4], 0
+        for n, key in enumerate(row):
+            positions[key] = {"x": x, "y": y}
+            x += widths[n] + GAP
+        y += max(dimensions[k]["h"] for k in row) + GAP
+    return {"positions": positions, "w": sum(widths) + GAP * (len(widths) - 1), "h": max(0, y - GAP)}
+
+
+def stack_columns(columns: dict, frames: dict, before: dict, objects: dict) -> dict:
+    bounds = {key: {**frames[key], **column_size(frames[key], members, objects)}
+              for key, members in columns.items() if key in frames}
+    previous = {}
+    for key in bounds:
+        if key not in before:
+            continue
+        card, members = before[key], columns[key]
+        height, width = card["h"], card["w"]
+        if members:
+            first = frame_of(objects[members[0]])
+            if first["x"] == card["x"] and card["y"] + GAP <= first["y"] < card["y"] + height + GAP:
+                height = first["y"] - card["y"] - GAP
+        for oid in members:
+            member = frame_of(objects[oid])
+            if member["x"] != card["x"] or member["y"] != card["y"] + height + GAP:
+                break
+            height += GAP + member["h"]
+            width = max(width, member["w"])
+        previous[key] = {**card, "h": height, "w": width}
+    taken, moves = [], {}
+    owned = {i for members in columns.values() for i in members}
+    unrelated = [frame_of(obj) for i, obj in objects.items()
+                 if i not in owned and key_of(obj) not in {*columns, "mc/strip"}
+                 and not (obj.get("props") or {}).get("archived")]
+    for key in sorted(bounds, key=lambda k: ((before.get(k) or frames[k])["y"], frames[k]["x"])):
+        frame = bounds[key]
+        blockers = [bounds[k] for k in taken
+                    if key not in previous or k not in previous or not overlaps(previous[k], previous[key])]
+        if "mc/strip" in frames and (key not in previous or "mc/strip" not in before
+                                    or not overlaps(before["mc/strip"], previous[key])):
+            blockers.append(frames["mc/strip"])
+        below(frame, blockers)
+        if frame["y"] != frames[key]["y"]:
+            below(frame, blockers + unrelated)
+        frames[key]["y"] = frame["y"]
+        y = frame["y"] + frames[key]["h"] + GAP
+        for oid in columns[key]:
+            current = frame_of(objects[oid])
+            if current["x"] != frame["x"] or current["y"] != y:
+                moves[oid] = {"x": frame["x"], "y": y}
+            y += current["h"] + GAP
+        taken.append(key)
+    return moves
+
+
+def first_layout(drawn: list, sizes: dict, stale: list, term: dict, others: list, grid=None, questions=True) -> dict:
+    """Place the strip, left block and optional project grid clear of unrelated objects."""
     stacks = {c: [sizes[r.key] for r in drawn if r.column == c] for c in ("left", "centre", "right")}
-    width = {**{c: max(f["w"] for f in stack) for c, stack in stacks.items()}, "questions": QUESTIONS}
+    width = {c: max(f["w"] for f in stack) for c, stack in stacks.items()}
+    if questions:
+        width["questions"] = QUESTIONS
+    order = [c for c in COLUMNS if c in width]
     offset, x = {}, 0
-    for column in COLUMNS:
+    for column in order:
         offset[column], x = x, x + width[column] + GAP
     top = sizes["mc/strip"]["h"] + GAP
     block = {"w": max(sizes["mc/strip"]["w"], x - GAP),
              "h": top + max(sum(f["h"] + GAP for f in stack) - GAP for stack in stacks.values())}
+    if grid:
+        block["w"] = max(block["w"], x + grid["w"])
+        block["h"] = max(block["h"], top + grid["h"])
     if stale:
         x, y = min(f["x"] for f in stale), min(f["y"] for f in stale)
     else:
@@ -1915,7 +2048,8 @@ def first_layout(drawn: list, sizes: dict, stale: list, term: dict, others: list
         if not hits:
             break
         x = min(o["x"] for o in hits) - 80 - block["w"]
-    return {"strip": {"x": x, "y": y}, **{c: {"x": x + offset[c], "y": y + top} for c in COLUMNS}}
+    return {"strip": {"x": x, "y": y}, "projects": {"x": x + sum(width.values()) + GAP * len(order), "y": y + top},
+            **{c: {"x": x + offset[c], "y": y + top} for c in order}}
 
 
 def spot(region: Region, planned: dict, order: list) -> dict:
@@ -1978,7 +2112,7 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
         nonlocal seen
         if seen is None:
             seen = {o["id"]: o for o in call("board.get", board=board_id).get("objects") or []
-                    if o.get("type") not in ("arrow", "group")}
+                    if o.get("type") not in ("arrow", "group") and not (o.get("props") or {}).get("archived")}
         return seen
 
     found = call("object.find", board=board_id, keyPrefix="mc/").get("objects") or []
@@ -1995,8 +2129,10 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
     placed = set(re.findall(r'data-question="([^"]+)"', props("mc/todo").get("html") or ""))
     asked = [q for s in snap.seats if not s.redacted for q in s.questions or [] if q.board == board_id]
     # A question asked from a terminal on this board, other than the drawing seat's own, stays under that terminal.
-    terminals = ({i for i, o in on_board().items() if o.get("type") == "terminal"} - {(pointer or {}).get("tile")}
-                 if any(q.id not in placed for q in asked) else set())
+    columns = project_columns(snap, where, board_id, on_board(), (pointer or {}).get("tile")) if snap.scope == "all" else {}
+    terminals = {i for members in columns.values() for i in members if on_board()[i].get("type") == "terminal"}
+    if snap.scope != "all" and any(q.id not in placed for q in asked):
+        terminals = {i for i, o in on_board().items() if o.get("type") == "terminal"} - {(pointer or {}).get("tile")}
     stay = {q.id for q in asked if q.asker in terminals}
     wanted = regions(snap, board_id, choices, placed, stay)
     column = {r.key: r.column for r in wanted}
@@ -2008,9 +2144,10 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
     unlisted = tuple(f"mc/panel/{s.name}/" for s in snap.seats if s.panels is None)
     stale = {k: o for k, o in existing.items() if k not in {r.key for r in wanted if r.html is not None or r.key in old}
              and not (unlisted and k.startswith(unlisted))}
-    new = [q for q in asked if q.id not in placed and q.id not in stay]
+    new = [q for q in asked if q.id not in placed and q.id not in stay] if snap.scope != "all" else []
 
     out, sizes, estimated = [], {}, False
+    measuring, measure_board, remote_host, remote_measured = where, board_id, None, False
     for region in wanted:
         if region.html is None:
             out += [f"{region.key}\tkept (unreadable)"] if region.key in old else []
@@ -2021,14 +2158,34 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
             continue
         size = {"w": region.width, "h": estimate(region.html)}
         if not estimated:
+            params = {"type": "html", "props": {"html": region.html, "title": region.title}, "width": region.width}
             try:
-                got = call("object.measure", board=board_id, type="html", props={"html": region.html, "title": region.title},
-                           width=region.width)
-                size = {"w": got["w"], "h": got["h"]}
+                got = easl(measuring, "object.measure", params={**params, **({"board": measure_board} if measure_board else {})})
             except Fail as error:
-                if NO_APP not in str(error):
-                    raise
-                estimated = True
+                if measure_board is not None:
+                    if NO_APP not in str(error):
+                        raise
+                    config = INSTANCE / "machines" / machine() / "board.json"
+                    settings = read_json(config)
+                    remote_host = settings.get("measure_host") if isinstance(settings, dict) else None
+                    remote_host = remote_host if isinstance(remote_host, str) else None
+                    measuring, measure_board = {"host": remote_host}, None
+                    if remote_host:
+                        try:
+                            got = easl(measuring, "object.measure", params=params)
+                        except Fail as remote_error:
+                            if not isinstance(remote_error, ConnectionFail) and NO_APP not in str(remote_error):
+                                raise
+                            estimated = True
+                    else:
+                        estimated = True
+                else:
+                    if not isinstance(error, ConnectionFail) and NO_APP not in str(error):
+                        raise
+                    estimated = True
+            if not estimated:
+                size = {"w": got["w"], "h": got["h"]}
+                remote_measured |= measure_board is None
         sizes[region.key] = size
         out.append(f"{region.key}\t{'updated' if region.key in old else 'created'}")
 
@@ -2040,15 +2197,20 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
     changed, ops = [r for r in wanted if r.key in sizes], []
     if not old:
         objects = on_board()
-        skip = {o["id"] for o in stale.values()} | {q.id for q in asked}
-        origin = first_layout(changed, sizes, [frame_of(o) for o in stale.values()],
+        skip = {o["id"] for o in stale.values()} | {q.id for q in new} | {i for members in columns.values() for i in members}
+        grid = column_grid(columns, sizes, objects) if columns else None
+        origin = first_layout([r for r in changed if r.key not in columns], sizes, [frame_of(o) for o in stale.values()],
                               frame_of(objects.get((pointer or {}).get("tile")) or {}),
-                              [frame_of(o) for i, o in objects.items() if i not in skip])
-        # Each tile is written at its final place, so a failed later chunk leaves no tiles on top of each other.
+                              [frame_of(o) for i, o in objects.items() if i not in skip], grid, snap.scope != "all")
         y = {c: at["y"] for c, at in origin.items()}
         for r in changed:
-            ops.append(upsert(r, {"x": origin[r.column]["x"], "y": y[r.column], **sizes[r.key]}))
-            y[r.column] += sizes[r.key]["h"] + GAP
+            if r.key in columns:
+                at = grid["positions"][r.key]
+                frame = {"x": origin["projects"]["x"] + at["x"], "y": origin["projects"]["y"] + at["y"], **sizes[r.key]}
+            else:
+                frame = {"x": origin[r.column]["x"], "y": y[r.column], **sizes[r.key]}
+                y[r.column] += sizes[r.key]["h"] + GAP
+            ops.append(upsert(r, frame))
     else:
         taken = None
         for region in changed:
@@ -2058,7 +2220,22 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
                 continue
             if taken is None:
                 taken = [frame_of(o) for o in on_board().values()]
-            planned[region.key] = below({**spot(region, planned, wanted), **sizes[region.key]}, taken)
+            if region.key in columns:
+                existing_columns = [k for k in columns if k in planned]
+                if existing_columns:
+                    x = planned[existing_columns[0]]["x"]
+                    y = max(planned[k]["y"] + column_size(planned[k], columns[k], on_board())["h"]
+                            for k in existing_columns) + GAP
+                else:
+                    edge = max(planned.values(), key=lambda f: f["x"] + f["w"])
+                    x, y = edge["x"] + edge["w"] + GAP, edge["y"]
+                owned = {i for members in columns.values() for i in members}
+                blockers = [frame_of(o) for i, o in on_board().items() if i not in owned]
+                whole = below({"x": x, "y": y, **column_size(sizes[region.key], columns[region.key], on_board())},
+                              blockers + list(planned.values()))
+                planned[region.key] = {**whole, **sizes[region.key]}
+            else:
+                planned[region.key] = below({**spot(region, planned, wanted), **sizes[region.key]}, taken)
             taken.append(planned[region.key])
             ops.append(upsert(region, planned[region.key]))
     for key, obj in sorted(stale.items()):
@@ -2120,17 +2297,26 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
     for _ in range(len(order) ** 2):
         clash = next((pair for pair in combinations(sorted(order, key=rank), 2)
                       if frozenset(pair) not in kept and column[pair[0]] in (column[pair[1]], "strip")
+                      and pair[0] not in columns and pair[1] not in columns
+                      and (snap.scope != "all" or pair[1] in (*REGION_KEYS, project_key(snap.seats[0])))
                       and overlaps(frames[pair[0]], frames[pair[1]])), None)
         if not clash:
             break
         upper, lower = clash
         frames[lower]["y"] = pushed[lower] = frames[upper]["y"] + frames[upper]["h"] + GAP
     batch([("object.update", {"id": ids[k], "frame": {"y": y}}) for k, y in pushed.items()])
+    column_moves = stack_columns(columns, frames, before, on_board())
+    card_moves = {key: {"y": frames[key]["y"]} for key in columns if key in frames
+                  and frames[key]["y"] != (planned.get(key) or frames[key])["y"]}
+    batch([("object.update", {"id": ids[k], "frame": f}) for k, f in card_moves.items()]
+          + [("object.update", {"id": oid, "frame": f}) for oid, f in column_moves.items()])
+    moves.update(column_moves)
     keys = {i: k for k, i in ids.items()}
     check = call("layout.check", board=board_id, ids=list(ids.values()) + [i for i in moves if i not in keys])
     findings = {k: v for k, v in check.items() if v and k not in ("hints", "approximate")}
     return (out + notes + placing + ["heights\testimated: no easl app is attached to measure the pages"] * estimated
-            + [f"{k}\tmoved down" for k in pushed]
+            + [f"heights\tmeasured on {remote_host}"] * remote_measured
+            + [f"{k}\tmoved down" for k in (*pushed, *card_moves)]
             + ["layout.check\t" + (json.dumps(findings, sort_keys=True) if findings else "clean")]
             + pending(choices, snap.seats) + todo_done(marks, snap))
 

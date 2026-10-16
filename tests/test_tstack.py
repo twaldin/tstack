@@ -477,11 +477,11 @@ class Board(Sandbox):
                          "layout.check\tclean\n")
         strip, todo, done = self.frame("mc/strip"), self.frame("mc/todo"), self.frame("mc/done")
         top = strip["h"] + 40
-        self.assertEqual((strip["x"], strip["y"], strip["w"]), (-2840, 0, 1560))
-        self.assertEqual([(self.frame(k)["x"], self.frame(k)["y"]) for k in ("mc/project/assistant", "mc/todo", "mc/done")],
-                         [(-2840, top), (-1980, top), (-720, top)])
-        self.assertEqual(self.frame("mc/panel/assistant/plan"), {"x": -1980, "y": top + todo["h"] + 40, "w": 640, "h": 100})
-        self.assertEqual(self.frame("mc/panel/assistant/health"), {"x": -720, "y": top + done["h"] + 40, "w": 640, "h": 100})
+        self.assertEqual([self.frame(k)["y"] for k in ("mc/project/assistant", "mc/todo", "mc/done")], [top] * 3)
+        self.assertEqual(self.frame("mc/panel/assistant/plan")["x"], todo["x"])
+        self.assertEqual(self.frame("mc/panel/assistant/plan")["y"], top + todo["h"] + 40)
+        self.assertEqual(self.frame("mc/panel/assistant/health")["x"], done["x"])
+        self.assertEqual(self.frame("mc/panel/assistant/health")["y"], top + done["h"] + 40)
         self.assertEqual(self.obj("brd_a", "mc/panel/assistant/plan")["props"]["title"], "Plan")
         self.assertIn('<span class="font-mono">assistant · panels/Bad Name.html</span>: the id is not '
                       '[a-z0-9][a-z0-9_-]{0,63}</li>', self.html("mc/strip"))
@@ -548,8 +548,8 @@ class Board(Sandbox):
                       'checks failing: test</span>', self.html("mc/project/assistant"))
         easl, gh = len(self.log("easl")), len(self.log("gh"))
         self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\n")
-        self.assertEqual({call["args"][0] for call in self.log("easl")[easl:]},
-                         {"agent.list", "ask", "layout.check", "object.find", "object.get"})
+        self.assertFalse(any(call["args"][0] in ("object.batch", "object.upsert", "object.update", "object.delete")
+                             for call in self.log("easl")[easl:]))
         self.assertEqual(self.log("gh")[gh:], [])
         self.assertEqual(sorted(c["args"][:2] for c in self.log("gh")), [
             ["api", "repos/o/r/deployments?per_page=30"], ["api", "repos/o/r/releases?per_page=10"], ["pr", "list"]])
@@ -607,59 +607,24 @@ class Board(Sandbox):
         self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-orange-500/15 border '
                       'border-orange-500/50 text-foreground">1 open question(s)</span>', self.card("demo"))
 
-    def test_a_question_on_the_drawn_board_is_placed_once_beside_the_todo(self):
-        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
-                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open")]}, [AGENT])
-        self.assertEqual(self.board_cli(), CREATED + "question obj_q\tplaced\nlayout.check\tclean\n")
-        todo = self.frame("mc/todo")
-        self.assertEqual((todo["x"], todo["w"]), (-1900, 720))
-        self.assertEqual(self.frame("obj_q"), {"x": -1140, "y": todo["y"], "w": 460, "h": 200})
-        self.assertEqual(self.frame("mc/done")["x"], -640)
-        self.assertIn('data-question="obj_q"', self.html("mc/todo"))
-        self.assertIn('Answer on tile <span class="font-mono">obj_q</span>, beside this panel.', self.html("mc/todo"))
-        self.edit("brd_a", "obj_q", frame={"x": -9000, "y": -9000})
-        self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\n")
-        self.assertEqual(self.frame("obj_q"), {"x": -9000, "y": -9000, "w": 460, "h": 200})
-
-    def test_a_question_asked_from_a_terminal_on_the_board_keeps_its_frame(self):
-        demo = self.project("demo")
-        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_ct"}))
-        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
-                               self.tile("obj_ct", "terminal", 5000, 0, 800, 600),
-                               self.tile("obj_cq", "question", 5000, 640, question="Which way?", status="open",
-                                         asker={"tile": "obj_ct", "name": "demo-coordinator"}),
-                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open",
-                                         asker={"tile": "obj_t"})]}, [AGENT])
-        self.assertEqual(self.board_cli(), created("projects/demo") + "question obj_q\tplaced\nlayout.check\tclean\n")
-        self.assertEqual(self.frame("obj_cq"), {"x": 5000, "y": 640, "w": 420, "h": 200})
-        self.assertIn('<li data-row data-project="demo" class="space-y-1"><div class="font-semibold">Which way?</div>',
-                      self.html("mc/todo"))
-        self.assertIn('Answer on tile <span class="font-mono">obj_cq</span>, under the terminal that asked it.',
-                      self.html("mc/todo"))
-        self.assertEqual(self.board_cli(), UNCHANGED.replace("mc/todo", "mc/project/projects/demo\tunchanged\nmc/todo")
-                         + "layout.check\tclean\n")
-        self.assertEqual(self.frame("obj_cq"), {"x": 5000, "y": 640, "w": 420, "h": 200})
-
-    def test_a_placed_question_stays_placed_across_a_failed_question_read(self):
-        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
-                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open")]}, [AGENT])
-        self.assertIn("question obj_q\tplaced\n", self.board_cli())
+    def test_unowned_questions_keep_their_positions_across_redraws(self):
+        question = self.tile("obj_q", "question", -1000, 300, question="Ship it?", status="open",
+                             asker={"tile": "obj_t"})
+        self.add("brd_a", question)
+        self.assertIn("layout.check\tclean\n", self.board_cli())
+        self.assertEqual(self.frame("obj_q"), question["frame"])
+        second = self.tile("obj_q2", "question", 3000, 3600, question="And this?", status="open")
+        self.add("brd_a", second)
+        self.board_cli()
+        self.assertEqual(self.frame("obj_q"), question["frame"])
+        self.assertEqual(self.frame("obj_q2"), second["frame"])
         self.edit("brd_a", "obj_q", frame={"x": -9000, "y": -9000})
         (self.stubs / "ask.err").write_text("unavailable: easld restarting")
         self.board_cli()
-        self.assertIn('<span hidden data-question="obj_q"></span>', self.html("mc/todo"))
         (self.stubs / "ask.err").unlink()
-        self.assertNotIn("question obj_q\tplaced", self.board_cli())
-        self.assertEqual(self.frame("obj_q"), {"x": -9000, "y": -9000, "w": 460, "h": 200})
-
-    def test_a_question_new_since_the_last_draw_goes_below_the_placed_ones(self):
-        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
-                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open")]}, [AGENT])
         self.board_cli()
-        self.add("brd_a", self.tile("obj_q2", "question", 3000, 3600, question="And this?", status="open"))
-        self.assertIn("mc/todo\tupdated\nmc/done\tunchanged\nquestion obj_q2\tplaced\n", self.board_cli())
-        first = self.frame("obj_q")
-        self.assertEqual(self.frame("obj_q2"), {"x": first["x"], "y": first["y"] + 240, "w": 460, "h": 200})
+        self.assertEqual(self.frame("obj_q"), {"x": -9000, "y": -9000, "w": 420, "h": 200})
+
 
     def test_cleanup_deletes_stale_mc_tiles_and_old_seat_notes_and_takes_their_place(self):
         self.boards({"brd_a": [
@@ -675,7 +640,6 @@ class Board(Sandbox):
         left = sorted(o["props"].get("key") or o["id"] for o in self.boards()["brd_a"])
         self.assertEqual(left, ["digest", "mc/done", "mc/project/assistant", "mc/strip", "mc/todo", "obj_n", "obj_old",
                                 "obj_t"])
-        self.assertEqual((self.frame("mc/strip")["x"], self.frame("mc/strip")["y"]), (-2000 - 80 - 2680, 700))
 
     def test_choices_and_notes_left_on_the_board_are_printed_until_tasks_reflect_them(self):
         rows = [("t1", "todo"), ("t2", "todo"), ("t3", "todo"), ("t4", "todo"), ("t5", "cancelled")]
@@ -782,19 +746,78 @@ class Board(Sandbox):
         self.assertGreater(projects["frame"]["h"], before["h"])
         self.assertIn("object.measure", {c["args"][0] for c in self.log("easl")})
 
-    def test_growth_pushes_the_tiles_below_it_in_its_column_down(self):
+    def test_project_columns_follow_card_growth_and_operator_moves(self):
+        demo = self.project("demo")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_ct"}))
+        self.add("brd_a", self.tile("obj_ct", "terminal", 5000, 0, 900, 600),
+                 self.tile("obj_open", "question", 5000, 640, asker={"tile": "obj_ct"},
+                           status="open", question="Which way?") | {"createdAt": 1},
+                 self.tile("obj_answered", "question", 5000, 880, asker={"tile": "obj_ct"},
+                           status="answered", question="Earlier question") | {"createdAt": 2},
+                 self.tile("obj_unowned", "terminal", 20000, 0, 800, 600),
+                 self.tile("obj_note", "note", 20000, 800, markdown="Operator's note"))
+        self.board_cli()
+        unrelated = {k: self.frame(k) for k in ("obj_t", "obj_unowned", "obj_note")}
+        key = "mc/project/projects/demo"
+        card = self.frame(key)
+        self.assertEqual(self.frame("obj_ct"), {"x": card["x"], "y": card["y"] + card["h"] + 40,
+                                               "w": 900, "h": 600})
+        self.assertEqual(self.frame("obj_open")["y"], self.frame("obj_ct")["y"] + 640)
+        self.assertEqual(self.frame("obj_answered")["y"], self.frame("obj_open")["y"] + 240)
+        self.put(demo, "status.json", json.dumps({"what": "A long visible project description. " * 100}))
+        self.board_cli()
+        grown = self.frame(key)
+        self.assertEqual((grown["x"], grown["y"]), (card["x"], card["y"]))
+        self.assertGreater(grown["h"], card["h"])
+        self.assertEqual(self.frame("obj_ct")["y"], grown["y"] + grown["h"] + 40)
+        self.assertEqual(self.frame("obj_open")["y"], self.frame("obj_ct")["y"] + 640)
+        self.assertEqual(self.frame("obj_answered")["y"], self.frame("obj_open")["y"] + 240)
+        self.edit("brd_a", key, frame={"x": 12000, "y": -2000})
+        self.board_cli()
+        self.assertEqual((self.frame(key)["x"], self.frame(key)["y"]), (12000, -2000))
+        self.assertEqual(self.frame("obj_ct")["x"], 12000)
+        self.assertEqual(self.frame("obj_ct")["y"], -2000 + grown["h"] + 40)
+        self.assertEqual(self.frame("obj_open")["x"], 12000)
+        self.assertEqual(self.frame("obj_answered")["x"], 12000)
+        self.assertEqual({k: self.frame(k) for k in unrelated}, unrelated)
+
+    def test_project_rows_have_four_columns_and_only_push_on_collision(self):
+        for n in range(8):
+            seat = self.project(f"p{n}")
+            self.put(seat, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": f"obj_c{n}"}))
+            self.add("brd_a", self.tile(f"obj_c{n}", "terminal", 10000 + n * 1000, 0, 800, 600))
+        self.board_cli()
+        keys = [f"mc/project/projects/p{n}" for n in range(8)]
+        cards = [self.frame(k) for k in keys]
+        self.assertEqual([c["y"] for c in cards[:4]], [cards[0]["y"]] * 4)
+        self.assertEqual([c["y"] for c in cards[4:]], [cards[4]["y"]] * 4)
+        self.assertEqual([c["x"] for c in cards[:4]], [c["x"] for c in cards[4:]])
+        self.assertGreaterEqual(cards[0]["x"], self.frame("mc/done")["x"] + self.frame("mc/done")["w"] + 40)
+        self.assertLess(self.frame("mc/project/assistant")["x"], cards[0]["x"])
+        self.edit("brd_a", keys[4], frame={"y": cards[4]["y"] + 2000})
+        lower = self.frame(keys[4])
+        self.put(self.instance / "projects/p0", "status.json", json.dumps({"what": "Visible growth. " * 20}))
+        self.board_cli()
+        self.assertEqual(self.frame(keys[4]), lower)
+        self.put(self.instance / "projects/p0", "status.json", json.dumps({"what": "Visible growth. " * 10000}))
+        self.board_cli()
+        top_terminal = self.frame("obj_c0")
+        self.assertEqual(self.frame(keys[4])["y"], top_terminal["y"] + top_terminal["h"] + 40)
+        self.assertEqual(self.frame("obj_c4")["y"], self.frame(keys[4])["y"] + self.frame(keys[4])["h"] + 40)
+        self.assertEqual(self.frame(keys[5]), cards[5])
+
+    def test_todo_growth_leaves_panels_and_done_in_place(self):
         self.put(self.seat, "panels/plan.html", "<p>Plan</p>")
         self.put(self.seat, "panels/plan.json", json.dumps({"group": "you"}))
         self.board_cli()
         done = self.frame("mc/done")
+        panel = self.frame("mc/panel/assistant/plan")
         items = [{"id": f"i{n}", "title": f"Item {n}", "body": "A longer body " * 8} for n in range(12)]
         self.put(self.seat, "todo.json", json.dumps({"items": items}))
         out = self.board_cli()
         self.assertIn("mc/todo\tupdated\n", out)
-        self.assertTrue(out.endswith("mc/panel/assistant/plan\tmoved down\nlayout.check\tclean\n"), out)
-        todo = self.frame("mc/todo")
-        self.assertEqual(self.frame("mc/panel/assistant/plan")["y"], todo["y"] + todo["h"] + 40)
         self.assertEqual(self.frame("mc/done"), done)
+        self.assertEqual(self.frame("mc/panel/assistant/plan"), panel)
 
     def test_growth_leaves_an_overlap_the_operator_made(self):
         self.put(self.seat, "panels/plan.html", "<p>Plan</p>")
@@ -940,3 +963,245 @@ class Board(Sandbox):
         self.assertIn('<div class="text-xs text-warn">1 board(s) unreadable</div>', self.html("mc/strip"))
         self.assertIn('<p class="text-warn">unreachable; see Problems in Mission control.</p>', self.card("sample-app"))
         self.assertEqual({n for _, n in self.stages("sample-app")}, {"?"})
+
+    def measuring_host(self, host="render") -> None:
+        config = self.instance / "machines" / "box" / "board.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"measure_host": host}))
+
+    def test_a_headless_board_measures_on_the_configured_app_host_at_each_tiles_width(self):
+        self.measuring_host()
+        (self.stubs / "no-app").touch()
+        (self.stubs / "app-render").touch()
+        out = self.board_cli()
+        self.assertIn("heights\tmeasured on render\n", out)
+        self.assertNotIn("heights\testimated", out)
+        self.assertEqual(set(self.boards()), {"brd_a"})
+        for key in REGIONS:
+            self.assertEqual(self.frame(key)["h"], 100 + len(self.html(key)) // 50)
+        self.assertEqual({key: self.frame(key)["w"] for key in REGIONS},
+                         {"mc/strip": 1560, "mc/project/assistant": 820, "mc/todo": 720, "mc/done": 560})
+        measures = [row for row in self.log("easl") if row["args"][0] == "object.measure"]
+        self.assertEqual([row["host"] for row in measures], [None, "render", "render", "render", "render"])
+        self.assertEqual({row["args"][0] for row in self.log("easl") if row["host"]}, {"object.measure"})
+
+    def test_an_unreachable_measuring_host_keeps_the_estimated_height_notice(self):
+        self.measuring_host()
+        (self.stubs / "no-app").touch()
+        (self.stubs / "ssh-render.err").write_text("ssh: could not resolve hostname render")
+        self.put(self.seat, "panels/plain.html", "<p>Visible</p>")
+        out = self.board_cli()
+        self.assertIn("heights\testimated: no easl app is attached to measure the pages\n", out)
+        self.assertNotIn("heights\tmeasured on", out)
+        self.assertEqual(self.frame("mc/panel/assistant/plain")["h"], 148)
+        self.assertEqual(len(self.log("ssh")), 1)
+
+    def test_no_app_on_either_host_falls_back_without_claiming_remote_measurement(self):
+        self.measuring_host()
+        (self.stubs / "no-app").touch()
+        self.put(self.seat, "panels/plain.html", "<p>Visible</p>")
+        out = self.board_cli()
+        self.assertIn("heights\testimated: no easl app is attached to measure the pages\n", out)
+        self.assertNotIn("heights\tmeasured on", out)
+        self.assertEqual(self.frame("mc/panel/assistant/plain")["h"], 148)
+        self.assertEqual(len(self.log("ssh")), 1)
+
+    def test_a_native_measurement_error_other_than_no_app_is_not_hidden_by_remote_fallback(self):
+        self.measuring_host()
+        (self.stubs / "measure.err").write_text("invalid_params: malformed html props")
+        result = self.cli("tstack", "board", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid_params: malformed html props", result.stderr)
+        self.assertEqual(self.boards()["brd_a"], [self.tile("obj_t", "terminal", 0, 0, 800, 600)])
+        self.assertEqual(self.log("ssh"), [])
+
+    def test_fallback_estimates_only_visible_rows_across_disclosure_boundaries(self):
+        (self.stubs / "no-app").touch()
+        hidden = "<li>Hidden</li>" * 120
+        pages = {
+            "closed": ("<details><summary><span>Summary</span></summary><ul>" + hidden
+                       + "<details open><summary>Nested</summary><p>Hidden too</p></details></ul></details>"
+                       "<p>Visible after</p>"),
+            "open": ("<details open><summary>Summary</summary><p>Visible</p>"
+                     "<details><summary>Nested</summary>" + hidden + "</details></details><p>Visible after</p>"),
+            "false": '<details open="false"><summary>HTML boolean attribute</summary><p>Visible</p></details>',
+            "empty": "<details></details>",
+            "blocks": '<section><h2>Heading</h2><p>Text</p><div data-count="n">1</div><textarea>Notes</textarea></section>',
+            "script": '<script>const sample = "<li>not markup</li>";</script><style>li {color:red}</style><p>Text</p>',
+        }
+        for name, page_html in pages.items():
+            self.put(self.seat, f"panels/{name}.html", page_html)
+        self.board_cli()
+        self.assertEqual({name: self.frame(f"mc/panel/assistant/{name}")["h"] for name in pages},
+                         {"closed": 176, "open": 232, "false": 176, "empty": 148, "blocks": 260, "script": 148})
+
+    def test_collapsed_card_fallback_stays_within_twice_its_app_measured_height(self):
+        (self.stubs / "no-app").touch()
+        self.status(self.seat, what="A project with a public release.", status="active",
+                    status_line="Review the next release.", next_steps=["Ship the release"] * 50,
+                    risks=["A release risk"] * 50, evidence=["https://example.com/proof"] * 50)
+        self.board_cli()
+        measured = 356
+        height = self.frame("mc/project/assistant")["h"]
+        self.assertGreaterEqual(height, measured / 2)
+        self.assertLessEqual(height, measured * 2)
+
+    def test_new_column_question_pushes_the_next_row_without_moving_unowned_tiles(self):
+        for n in range(5):
+            seat = self.project(f"p{n}")
+            self.put(seat, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": f"obj_c{n}"}))
+            self.add("brd_a", self.tile(f"obj_c{n}", "terminal", 10000 + n * 1000, 0, 800, 600))
+        self.board_cli()
+        key = "mc/project/projects/p4"
+        lower = self.frame(key)
+        note = self.tile("obj_note", "note", lower["x"], lower["y"] + lower["h"] + 740, 800, 300,
+                         markdown="Leave this note in place")
+        self.add("brd_a", note)
+        self.add("brd_a", self.tile("obj_new", "question", 20000, 800, 460, 500, asker={"tile": "obj_c0"},
+                                   status="answered", question="Already answered"))
+        self.board_cli()
+        question = self.frame("obj_new")
+        self.assertEqual(question["y"], self.frame("obj_c0")["y"] + 640)
+        self.assertGreater(self.frame(key)["y"], lower["y"])
+        self.assertEqual(self.frame(key)["y"], note["frame"]["y"] + note["frame"]["h"] + 40)
+        self.assertEqual(self.frame("obj_note"), note["frame"])
+        self.assertEqual(self.frame("obj_c4")["y"], self.frame(key)["y"] + self.frame(key)["h"] + 40)
+
+    def test_unusable_measurement_settings_fall_back_to_estimated_heights(self):
+        self.measuring_host()
+        (self.stubs / "no-app").touch()
+        config = self.instance / "machines/box/board.json"
+        for contents in ("{", "[]", '{"measure_host": []}'):
+            with self.subTest(contents=contents):
+                self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600)]}, [AGENT])
+                config.write_text(contents)
+                out = self.board_cli()
+                self.assertIn("heights\testimated: no easl app is attached to measure the pages\n", out)
+                self.assertEqual(self.log("ssh"), [])
+
+    def test_a_late_coordinator_pushes_the_column_below_it(self):
+        for n in range(5):
+            seat = self.project(f"p{n}")
+            self.put(seat, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": f"obj_c{n}"}))
+        self.board_cli()
+        self.add("brd_a", self.tile("obj_c0", "terminal", 20000, 0, 800, 600))
+        out = self.board_cli()
+        terminal = self.frame("obj_c0")
+        lower = self.frame("mc/project/projects/p4")
+        self.assertEqual(lower["y"], terminal["y"] + terminal["h"] + 40)
+        self.assertIn("layout.check\tclean\n", out)
+        self.board_cli()
+        self.assertEqual(self.frame("mc/project/projects/p4"), lower)
+
+    def test_a_failed_member_move_is_repaired_on_the_next_draw(self):
+        for n in range(5):
+            seat = self.project(f"p{n}")
+            self.put(seat, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": f"obj_c{n}"}))
+            self.add("brd_a", self.tile(f"obj_c{n}", "terminal", 10000 + n * 1000, 0, 800, 600))
+        self.board_cli()
+        card = self.frame("mc/project/projects/p0")
+        terminal = self.frame("obj_c0")
+        failure = self.stubs / "column-moves.err"
+        failure.touch()
+        self.status(self.instance / "projects/p0", what="Visible growth. " * 10000)
+        failed = self.cli("tstack", "board", check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("column move batch failed", failed.stderr)
+        self.assertGreater(self.frame("mc/project/projects/p0")["h"], card["h"])
+        self.assertEqual(self.frame("obj_c0"), terminal)
+        failure.unlink()
+        out = self.board_cli()
+        card = self.frame("mc/project/projects/p0")
+        terminal = self.frame("obj_c0")
+        self.assertEqual(terminal["y"], card["y"] + card["h"] + 40)
+        self.assertEqual(self.frame("mc/project/projects/p4")["y"], terminal["y"] + terminal["h"] + 40)
+        self.assertIn("layout.check\tclean\n", out)
+
+    def test_column_questions_keep_creation_order_and_only_visible_questions_take_space(self):
+        demo = self.project("demo")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_c"}))
+        archived = self.tile("obj_hidden", "question", 9000, 9000, asker={"tile": "obj_c"},
+                             status="answered", archived=True)
+        self.add("brd_a", self.tile("obj_c", "terminal", 5000, 0, 800, 600),
+                 self.tile("obj_open", "question", 5000, 880, asker={"tile": "obj_c"}) | {"createdAt": 2},
+                 self.tile("obj_expired", "question", 5000, 640, asker={"tile": "obj_c"}, status="expired") | {"createdAt": 1},
+                 archived)
+        self.board_cli()
+        self.assertEqual(self.frame("obj_expired")["y"], self.frame("obj_c")["y"] + 640)
+        self.assertEqual(self.frame("obj_open")["y"], self.frame("obj_expired")["y"] + 240)
+        self.assertEqual(self.frame("obj_hidden"), archived["frame"])
+        self.edit("brd_a", "obj_expired", props={"archived": True})
+        self.board_cli()
+        self.assertEqual(self.frame("obj_open")["y"], self.frame("obj_c")["y"] + 640)
+
+    def test_a_project_board_places_questions_once_and_preserves_placement_memory(self):
+        demo = self.project("demo")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_d", "tile": "obj_dt"}))
+        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600)],
+                     "brd_d": [self.tile("obj_dt", "terminal", 0, 0, 800, 600),
+                               self.tile("obj_q", "question", 5000, 3000, status="open", question="Ship?",
+                                         asker={"tile": "obj_dt"})]}, [AGENT])
+        self.board_cli("--seat", str(demo))
+        todo = self.obj("brd_d", "mc/todo")["frame"]
+        self.assertEqual(self.obj("brd_d", "obj_q")["frame"],
+                         {"x": todo["x"] + todo["w"] + 40, "y": todo["y"], "w": 460, "h": 200})
+        self.edit("brd_d", "obj_q", frame={"x": -9000, "y": -9000})
+        (self.stubs / "ask.err").write_text("unavailable: easld restarting")
+        self.board_cli("--seat", str(demo))
+        (self.stubs / "ask.err").unlink()
+        self.board_cli("--seat", str(demo))
+        self.assertEqual(self.obj("brd_d", "obj_q")["frame"],
+                         {"x": -9000, "y": -9000, "w": 460, "h": 200})
+        self.add("brd_d", self.tile("obj_q2", "question", 5000, 3600, status="open", question="And this?",
+                                   asker={"tile": "obj_dt"}))
+        self.board_cli("--seat", str(demo))
+        todo = self.obj("brd_d", "mc/todo")["frame"]
+        self.assertEqual(self.obj("brd_d", "obj_q2")["frame"],
+                         {"x": todo["x"] + todo["w"] + 40, "y": todo["y"], "w": 460, "h": 200})
+        self.put(demo, "panels/plan.html", "<p>Plan</p>")
+        self.put(demo, "panels/plan.json", json.dumps({"group": "you"}))
+        self.board_cli("--seat", str(demo))
+        self.put(demo, "todo.json", json.dumps({"items": [{"id": str(n), "body": "A longer body " * 20}
+                                                        for n in range(12)]}))
+        self.board_cli("--seat", str(demo))
+        todo = self.obj("brd_d", "mc/todo")["frame"]
+        self.assertEqual(self.obj("brd_d", "mc/panel/projects/demo/plan")["frame"]["y"], todo["y"] + todo["h"] + 40)
+
+    def test_remote_native_measurement_errors_are_not_misreported_as_no_app(self):
+        self.measuring_host()
+        (self.stubs / "no-app").touch()
+        (self.stubs / "app-render").touch()
+        for after, error in ((0, "not_found: no open board"), (1, "unavailable: cannot measure the page")):
+            with self.subTest(after=after, error=error):
+                initial = [self.tile("obj_t", "terminal", 0, 0, 800, 600)]
+                self.boards({"brd_a": initial}, [AGENT])
+                (self.stubs / "measure-render.json").write_text(json.dumps({"after": after, "error": error}))
+                result = self.cli("tstack", "board", check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(error, result.stderr)
+                self.assertNotIn("heights\testimated", result.stdout)
+                self.assertEqual(self.boards()["brd_a"], initial)
+
+    def test_a_new_project_card_does_not_require_done_to_exist(self):
+        self.board_cli()
+        self.drop("brd_a", "mc/done")
+        demo = self.project("demo")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_c"}))
+        self.add("brd_a", self.tile("obj_c", "terminal", 5000, 0, 800, 600))
+        out = self.board_cli()
+        card, terminal = self.frame("mc/project/projects/demo"), self.frame("obj_c")
+        self.assertEqual(terminal["x"], card["x"])
+        self.assertEqual(terminal["y"], card["y"] + card["h"] + 40)
+        self.assertIn("layout.check\tclean\n", out)
+
+    def test_a_late_default_width_coordinator_does_not_push_its_same_row_neighbor(self):
+        for n in range(2):
+            seat = self.project(f"p{n}")
+            self.put(seat, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": f"obj_c{n}"}))
+        self.board_cli()
+        right = self.frame("mc/project/projects/p1")
+        self.add("brd_a", self.tile("obj_c0", "terminal", 20000, 0, 1000, 620))
+        out = self.board_cli()
+        self.assertEqual(self.frame("mc/project/projects/p1"), right)
+        self.assertLessEqual(self.frame("obj_c0")["x"] + self.frame("obj_c0")["w"] + 40, right["x"])
+        self.assertIn("layout.check\tclean\n", out)

@@ -16,7 +16,8 @@ import json, os, subprocess, sys, time, uuid
 from pathlib import Path
 stubs, args = Path(__file__).resolve().parents[1], sys.argv[1:]
 with open(stubs / f"{Path(__file__).name}.log", "a") as log:
-    log.write(json.dumps({"args": args, "cwd": os.getcwd(), "lane": os.environ.get("TSTACK_LANE")}) + "\n")
+    log.write(json.dumps({"args": args, "cwd": os.getcwd(), "lane": os.environ.get("TSTACK_LANE"),
+                         "host": os.environ.get("TSTACK_TEST_SSH_HOST")}) + "\n")
 '''
 FAKES = {
     # A session event, then one assistant message after omp.json's sleep (60 s when the prompt says SLOW).
@@ -57,8 +58,8 @@ elif args[:2] == ["pr", "merge"] and "--auto" not in args:
     (stubs / "pr-view.json").write_text(json.dumps({**view, "state": "MERGED", "mergeCommit": {"oid": "f" * 40}}))
 ''',
     # A board store in easl-boards.json ({"boards": {id: [object]}, "agents": [...]}) with the methods tstack board
-    # calls. object.measure and size "fit" give h from the html's length, or fail like easld with no app when no-app
-    # exists. Like easl's RefitFrame, "fit" on an existing object without x/y may move it: here it grows upward.
+    # calls. object.measure and size "fit" give h from the html's length. no-app fails unless app-<host> names the
+    # rendering host. Like easl's RefitFrame, "fit" without x/y on an existing object grows it upward here.
     "easl": PRELUDE + r'''
 path = stubs / "easl-boards.json"
 store = json.loads(path.read_text()) if path.exists() else {"boards": {}, "agents": []}
@@ -78,7 +79,17 @@ def keyed(board, key):
 def hits(a, b):
     return a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"] and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"]
 def measured(html):
-    if (stubs / "no-app").exists():
+    remote = os.environ.get("TSTACK_TEST_SSH_HOST")
+    if (stubs / "measure.err").exists():
+        raise Refused((stubs / "measure.err").read_text())
+    if remote:
+        count = store.setdefault("remote_measures", {}).get(remote, 0)
+        store["remote_measures"][remote] = count + 1
+        config = stubs / f"measure-{remote}.json"
+        fault = json.loads(config.read_text()) if config.exists() else None
+        if fault and count >= fault.get("after", 0):
+            raise Refused(fault["error"])
+    if (stubs / "no-app").exists() and not (remote and (stubs / f"app-{remote}").exists()):
         raise Refused("invalid_params: an html page is measured by the app")
     return 100 + len(html) // 50
 def settle(obj, params, existed):
@@ -95,6 +106,8 @@ def apply(method, p, board):
     if method == "object.get":
         return {"object": locate(p["id"])[1]}
     if method == "object.measure":
+        if os.environ.get("TSTACK_TEST_SSH_HOST") and "board" in p and (stubs / "no-app").exists():
+            raise Refused("not_found: the headless board does not exist on the rendering host")
         return {"w": p["width"], "h": measured(p["props"].get("html", ""))}
     if method == "object.find" and sum(k in p for k in ("key", "keyPrefix", "type")) != 1:
         raise Refused("invalid_params: object.find takes one of key, keyPrefix, or type")
@@ -129,6 +142,10 @@ def apply(method, p, board):
         store["boards"][held].remove(obj)
         return {"id": p["id"]}
     if method == "object.batch":
+        if (stubs / "column-moves.err").exists() and any(
+                op["method"] == "object.update" and locate(op["params"]["id"])[1]["type"] == "terminal"
+                for op in p["ops"]):
+            raise Refused("unavailable: column move batch failed")
         results = []
         for n, op in enumerate(p["ops"]):
             try:
@@ -140,7 +157,7 @@ def apply(method, p, board):
         return {"objects": objects(board)}
     if method == "layout.check":
         # Like easl: every pair that involves at least one scoped id, against the whole board.
-        held = [o for o in objects(board) if o["type"] not in ("arrow", "group")]
+        held = [o for o in objects(board) if o["type"] not in ("arrow", "group") and not o["props"].get("archived")]
         pairs = [[a["id"], b["id"]] for n, a in enumerate(held) for b in held[n + 1:]
                  if (a["id"] in p["ids"] or b["id"] in p["ids"]) and hits(a["frame"], b["frame"])]
         return {"overlaps": pairs, "overflow": [], "truncated": [], "scrolls": [], "arrowCrossings": [],
@@ -170,7 +187,12 @@ print(json.dumps(out))
 i = 0
 while args[i].startswith("-"):
     i += 2 if args[i] == "-o" else 1
-subprocess.run(["sh", "-c", " ".join(args[i + 1:])], cwd=os.environ["HOME"])
+error = stubs / f"ssh-{args[i]}.err"
+if error.exists():
+    print(error.read_text(), file=sys.stderr)
+    sys.exit(255)
+subprocess.run(["sh", "-c", " ".join(args[i + 1:])], cwd=os.environ["HOME"],
+               env={**os.environ, "TSTACK_TEST_SSH_HOST": args[i]})
 ''',
     "bun": PRELUDE,
     # Starts the command detached with its --working-directory and --setenv, keeping its pid for systemctl.
@@ -247,7 +269,7 @@ class Sandbox(unittest.TestCase):
         return json.loads((self.seat / "state" / "lanes" / lane_id / "lane.json").read_text())
 
     def log(self, fake: str) -> list:
-        """Each call of `fake`: {"args", "cwd", "lane"}."""
+        """Each call of `fake`: {"args", "cwd", "lane", "host"}."""
         path = self.stubs / f"{fake}.log"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
