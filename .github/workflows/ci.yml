@@ -11,22 +11,21 @@ permissions:
 jobs:
   checks:
     name: Unit tests and setup check
-    runs-on: macos-latest
+    runs-on: [self-hosted, deckbox]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
-      - name: Unit tests
+      - name: Unit tests with system Python
         run: python3 -m unittest discover -s tests
-      - name: Setup into a temp HOME
+      - name: Setup into a temp HOME with the process launcher
         if: ${{ !cancelled() }}
+        env:
+          TSTACK_LAUNCHER: process
         run: |
           HOME="$(mktemp -d)"
           export HOME
