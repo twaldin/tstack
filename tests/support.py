@@ -33,13 +33,21 @@ message = {"role": "assistant", "content": content, "usage": {"cost": {"total": 
 print(json.dumps({"type": "message_end", "message": message}), flush=True)
 sys.exit(cfg.get("exit", 0))
 ''',
-    # pr list prints pr-list.json, or fails with pr-list.err; pr view prints its JSON file; pr merge fails with
-    # merge.err, else merges unless --auto.
+    # pr list prints pr-list-<owner>_<repo>.json or pr-list.json, or fails with pr-list-<owner>_<repo>.err or
+    # pr-list.err; api prints api.json's value for the path without its query, else [], and fails with a string value;
+    # pr view prints its JSON file;
+    # pr merge fails with merge.err, else merges unless --auto.
     "gh": PRELUDE + r'''
-if args[:2] == ["pr", "list"] and (stubs / "pr-list.err").exists():
-    sys.exit((stubs / "pr-list.err").read_text())
+def stub(name, default=None):
+    return (stubs / name).read_text() if (stubs / name).exists() else default
+repo = args[args.index("--repo") + 1].replace("/", "_") if "--repo" in args else ""
+if args[:2] == ["pr", "list"] and (stub(f"pr-list-{repo}.err") or stub("pr-list.err")):
+    sys.exit(stub(f"pr-list-{repo}.err") or stub("pr-list.err"))
 elif args[:2] == ["pr", "list"]:
-    print((stubs / "pr-list.json").read_text() if (stubs / "pr-list.json").exists() else "[]")
+    print(stub(f"pr-list-{repo}.json") or stub("pr-list.json", "[]"))
+elif args[0] == "api":
+    value = json.loads(stub("api.json", "{}")).get(args[1].split("?")[0], [])
+    sys.exit(value) if isinstance(value, str) else print(json.dumps(value))
 elif args[:2] == ["pr", "view"]:
     print((stubs / "pr-view.json").read_text())
 elif args[:2] == ["pr", "merge"] and (stubs / "merge.err").exists():
@@ -52,7 +60,6 @@ elif args[:2] == ["pr", "merge"] and "--auto" not in args:
     # calls. object.measure and size "fit" give h from the html's length, or fail like easld with no app when no-app
     # exists. Like easl's RefitFrame, "fit" on an existing object without x/y may move it: here it grows upward.
     "easl": PRELUDE + r'''
-import re
 path = stubs / "easl-boards.json"
 store = json.loads(path.read_text()) if path.exists() else {"boards": {}, "agents": []}
 store.setdefault("next", 100)
@@ -124,10 +131,8 @@ def apply(method, p, board):
     if method == "object.batch":
         results = []
         for n, op in enumerate(p["ops"]):
-            ref = lambda m: json.dumps(results[int(m.group(1))]["object"]["id"])
-            params = json.loads(re.sub(r'"\$(\d+)"', ref, json.dumps(op["params"])))
             try:
-                results.append(apply(op["method"], params, board))
+                results.append(apply(op["method"], op["params"], board))
             except Refused as error:
                 raise Refused(f"invalid_params: op {n} ({op['method']}): {error}")
         return {"results": results, "revision": 1}
@@ -210,7 +215,7 @@ class Sandbox(unittest.TestCase):
             (self.stubs / "bin" / name).chmod(0o755)
         self.omp(answer="done", cost=0.02)
         self.env = {"HOME": str(self.home), "PATH": f"{self.stubs / 'bin'}:{os.environ['PATH']}", "LANG": "C.UTF-8",
-                    "TSTACK_LAUNCHER": "process", "TSTACK_MACHINE": "box", "PYTHONDONTWRITEBYTECODE": "1"}
+                    "TSTACK_LAUNCHER": "process", "TSTACK_MACHINE": "box", "PYTHONDONTWRITEBYTECODE": "1", "TZ": "UTC"}
         self.brief = self.root / "brief.md"
         self.brief.write_text("Reply with the word done.\n")
 

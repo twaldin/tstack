@@ -35,11 +35,24 @@ You need git, Python 3.9 or newer, `gh` logged in, bun, omp and easl.
 
 ## Board
 
-`tstack board` draws mission control on the seat's board as five keyed HTML tiles: a summary, Needs Tim (every open question), lanes, queues (next, backlog, intake) and merged PRs. It reads lane records, tasks, intake, goals, open easl questions, terminal health and one cached `gh pr list` per repo. It writes nothing but the board and the gh cache. A failed read shows on the board as an error, never as zero. A redraw leaves unchanged tiles and moved tiles alone, and places each new question tile once. The assistant seat's board shows every seat. Any other seat's board shows that seat. `tstack board --print` prints what it read as JSON and draws nothing.
+`tstack board` draws mission control on the seat's board as keyed HTML tiles. A status strip on top counts open questions for the operator, the projects waiting on them, the lanes and agents running now, PRs waiting on them against PRs waiting on agents, and seats that are down. Below it sit a column of project tiles, one card each, the operator's to-do with its drafts, the native question tiles, a tile of what merged and deployed in the last 7 days, and the panels seats write. Every region names a project by `project` in its `status.json`, else by its seat directory's name. It writes nothing but the board and its gh caches. A failed read shows on the board as a problem, never as zero. A redraw leaves unchanged tiles and moved tiles alone, and places each new tile once. It places a new question beside the to-do only when the drawing seat asked it or its asker has no terminal on the board. A question asked from another terminal on the board stays under that terminal, and the to-do lists it under its project. `tstack board --print` prints what it read as JSON and draws nothing.
+
+A seat's board is the agents board, the one the assistant's `state/board.json` names, unless the seat's own `state/board.json` or `--board` names another. The assistant draws every project there. A project seat on the agents board draws nothing, so it never overwrites mission control. Its `tstack board` prints that the assistant's board draws it, then the `choice` and `note` lines left on its project tile. A seat on a board of its own gets that seat's mission control there, plus the same lines from the agents board. While the assistant's `board.json` is missing or unreadable, a project seat draws nothing and prints why.
+
+It reads these files from each seat's `state/`:
+
+| File | Holds | Written by |
+|---|---|---|
+| `status.json` | The project's status: `{project, repos[], where, what, recorded_goal, status, status_line, last_activity, drift, in_flight[], done_recent[], asks[], risks[], next_steps[], evidence[]}`. `status` is one of active, waiting-on-tim, stalled, parked, shipped or dormant. A `done_recent` entry with `kind` release or deploy counts as deployed. | the seat's coordinator, or the assistant |
+| `tasks.tsv`, `lanes/`, `intake.md` | Tasks, lane records and unhandled intake. | the seat |
+| `todo.json` | The drawing seat's to-do for the operator: `{sync: {date, title}, items: [{id, title, body, due, with[], steps[], links[{label, url}], drafts[{to, channel, text}], done}]}`. A `due` that is a date, an ISO time, today or tomorrow counts down on the board; other words show as written. | the assistant |
+| `panels/<id>.html` and `<id>.json` | Free-form HTML a seat shows on the board, with `{title, group, order, width}`. Group `you` sits under the to-do and every other group in the right column. | any seat |
+
+Each project card computes a six-stage pipeline. Backlog and Todo come from `tasks.tsv`. Build counts running lanes and in-flight agents. Review counts open PRs on the card's repos, and Merged counts merges in the last 14 days. Deployed counts production deployments and releases from GitHub, plus the `done_recent` releases and deploys whose `ref` GitHub does not list. A check that GitHub refused to start, with a "job was not started" annotation, shows as CI not run with GitHub's reason instead of as failing.
 
 The instance file `remote-seats` lists seats on other hosts, one per line: `<name> <ssh target> <seat dir>`. tstack reads each over ssh with `--redact`, so only counts, ids, states and PR links leave that host.
 
-Choices and notes left on the queues tile print as `choice` and `note` lines after the draw. The seat that owns the task acts on them.
+What the operator leaves on the board prints after the draw, one line each. The seat that owns it acts on it. `choice` and `note` lines come from the project tiles, and a choice prints until `tasks.tsv` reflects it. A `todo-done <id>` line comes from Mark done on the to-do and prints until `todo.json` marks that item done.
 
 ## Upstream
 

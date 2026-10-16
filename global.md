@@ -16,7 +16,7 @@ Agents here run pstack's playbooks and principles inside omp. Before engineering
 | Seat | Runs as | Role |
 |---|---|---|
 | Assistant | omp in `~/agents/assistant`, a tile on the agents board | `~/tstack/roles/assistant.md` |
-| Coordinator | omp in `~/agents/projects/<name>`, a tile on the project's board | `~/tstack/roles/coordinator.md` |
+| Coordinator | omp in `~/agents/projects/<name>`, a tile on the agents board beside its project's card | `~/tstack/roles/coordinator.md` |
 | Lane | a detached `omp -p` in `~/worktrees/<project>/<id>` | `~/tstack/roles/lane.md` plus its brief |
 | Subagent | omp `task` inside any of the above | its brief |
 
@@ -29,5 +29,5 @@ Agents here run pstack's playbooks and principles inside omp. Before engineering
 
 - `lane` starts, resumes, lists, shows, waits on, stops, merges and cleans lanes. `lane show <id>` prints a lane's exit, cost, PR and final answer.
 - `watch-pr <pr>` reports a PR's facts: head, checks, reviews, threads, mergeability, and after merge the runs and deploys that carry it. It decides nothing.
-- `tstack setup` links this host's skills, agent types and bins. `tstack update` pulls the engine and instance and reruns setup. `tstack board` draws mission control on the seat's board: lanes, open questions, next and backlog, PRs and seat health. It then prints the choices and notes the operator left there.
+- `tstack setup` links this host's skills, agent types and bins. `tstack update` pulls the engine and instance and reruns setup. `tstack board` draws mission control on the seat's board: a status strip, a card per project from its `state/status.json`, the operator's to-do from `state/todo.json`, open questions, what merged and deployed, and the panels in `state/panels/`. It then prints the choices, notes and Mark done clicks the operator left there.
 - `pstack-bump <sha>` brings an upstream pstack commit in on a branch, for a system PR.

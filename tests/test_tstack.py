@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import re
@@ -94,11 +95,34 @@ class Setup(Sandbox):
         self.assertEqual(os.readlink(self.home / ".omp/agent/skills/new"), str(self.instance / "skills" / "new"))
 
 
-CREATED = "".join(f"mc/{k}\tcreated\n" for k in ("summary", "questions", "lanes", "queues", "landed"))
-UNCHANGED = "".join(f"mc/{k}\tunchanged\n" for k in ("summary", "questions", "lanes", "queues", "landed"))
+
+REGIONS = ("mc/strip", "mc/project/assistant", "mc/todo", "mc/done")
+CREATED = "".join(f"{k}\tcreated\n" for k in REGIONS)
+UNCHANGED = "".join(f"{k}\tunchanged\n" for k in REGIONS)
+
+
+def created(*seats) -> str:
+    """The first draw's lines with a project tile per extra seat after the assistant's."""
+    return CREATED.replace("mc/todo", "".join(f"mc/project/{s}\tcreated\n" for s in seats) + "mc/todo")
+
+
 HEADER = "id\teffort\ttitle\tstate\tlane\tpr\tupdated\n"
 AGENT = {"tile": "obj_t", "board": "brd_a", "name": "assistant", "kind": "omp", "program": "omp", "open": True,
          "live": True, "lifecycle": {"state": "idle"}}
+BUTTON = "rounded border border-border px-2 py-0.5 text-xs aria-pressed:bg-accent aria-pressed:text-accent-foreground"
+FAILING = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}]
+
+
+def iso(days=0, **delta) -> str:
+    """A UTC time that long before now, as gh and lane write times."""
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days, **delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pr(number, repo="o/r", state="OPEN", **fields) -> dict:
+    """A row of `gh pr list --json`."""
+    return {"number": number, "url": f"https://github.com/{repo}/pull/{number}", "title": f"PR {number}", "state": state,
+            "isDraft": False, "headRefName": f"b{number}", "reviewDecision": "", "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN", "statusCheckRollup": [], "mergedAt": None, **fields}
 
 
 class Board(Sandbox):
@@ -107,6 +131,7 @@ class Board(Sandbox):
         self.instance = self.home / "agents"
         self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600)]}, [AGENT])
         self.put(self.seat, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_t"}))
+        self.api({})
 
     @staticmethod
     def tile(oid, kind, x, y, w=420, h=200, **props) -> dict:
@@ -126,17 +151,55 @@ class Board(Sandbox):
             obj[name] = {**obj[name], **value}
         (self.stubs / "easl-boards.json").write_text(json.dumps(store))
 
+    def drop(self, board, key) -> dict:
+        """Take an object off the fake board, as the operator deleting it would; return it."""
+        store = json.loads((self.stubs / "easl-boards.json").read_text())
+        obj = next(o for o in store["boards"][board] if o["id"] == key or o["props"].get("key") == key)
+        store["boards"][board].remove(obj)
+        (self.stubs / "easl-boards.json").write_text(json.dumps(store))
+        return obj
+
+    def add(self, board, *objects) -> None:
+        store = json.loads((self.stubs / "easl-boards.json").read_text())
+        store["boards"][board] += list(objects)
+        (self.stubs / "easl-boards.json").write_text(json.dumps(store))
+
     def obj(self, board, key) -> dict:
         return next(o for o in self.boards()[board] if o["props"].get("key") == key or o["id"] == key)
 
+    def frame(self, key) -> dict:
+        return self.obj("brd_a", key)["frame"]
+
     def html(self, key) -> str:
         return self.obj("brd_a", key)["props"]["html"]
+
+    def card(self, project: str) -> str:
+        pages = "".join(o["props"]["html"] for o in self.boards()["brd_a"] if o["props"].get("key", "").startswith("mc/project/"))
+        return re.search(rf'<section data-row data-project="{re.escape(project)}".*?</section>', pages, re.S).group(0)
+
+    def stages(self, seat: str) -> list:
+        return re.findall(r'data-stage="(\w+)" data-n="([^"]+)"', self.card(seat))
+
+    def count(self, key: str, name: str) -> str:
+        """The big value of a stat card."""
+        return re.search(rf'data-count="{name}".*?<div class="text-3xl font-semibold">(.*?)</div>', self.html(key),
+                         re.S).group(1)
 
     def put(self, seat: Path, name: str, text: str) -> Path:
         path = seat / "state" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
         return path
+
+    def status(self, seat: Path, **fields) -> None:
+        self.put(seat, "status.json", json.dumps(fields))
+
+    def api(self, paths: dict) -> None:
+        """What the fake `gh api` answers per path."""
+        (self.stubs / "api.json").write_text(json.dumps(paths))
+
+    def prs(self, repo: str, rows: list) -> None:
+        (self.stubs / f"pr-list-{repo.replace('/', '_')}.json").write_text(json.dumps(rows))
 
     def project(self, name: str) -> Path:
         seat = self.instance / "projects" / name
@@ -158,31 +221,368 @@ class Board(Sandbox):
         snap = json.loads(self.board_cli("--print"))
         return {seat["name"]: seat for seat in snap["seats"]}
 
+    def test_status_json_that_is_valid_broken_or_missing(self):
+        good, bad, none = (self.project(name) for name in ("good", "bad", "none"))
+        self.status(good, what="A demo app", status="active", status_line="Beta is out", repos=["o/app", "not a repo"],
+                    drift="None", last_activity={"at": "2026-10-14T10:00:00Z", "what": "merged #4"}, in_flight="x")
+        self.put(bad, "status.json", "{not json")
+        seats = self.snapshot()
+        self.assertEqual({name: seats[f"projects/{name}"]["status_file"] for name in ("good", "bad", "none")},
+                         {"good": "ok", "bad": "unreadable", "none": "missing"})
+        self.assertEqual(seats["projects/good"]["status"], {
+            "project": None, "repos": ["o/app"], "where": None, "what": "A demo app", "recorded_goal": None,
+            "status": "active", "status_line": "Beta is out", "drift": "None", "in_flight": [], "done_recent": [],
+            "last_activity": {"at": "2026-10-14T10:00:00Z", "what": "merged #4", "ref": None}, "asks": [], "risks": [],
+            "next_steps": [], "evidence": []})
+        self.assertEqual(seats["projects/good"]["errors"], [{"source": "status.json", "error": "repos[1]: not owner/name"},
+                                                            {"source": "status.json", "error": "in_flight: not a list"}])
+        self.assertEqual((seats["projects/bad"]["status"], seats["projects/bad"]["errors"]), (None, [
+            {"source": "status.json", "error": "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"}]))
+        self.assertEqual(seats["projects/none"]["errors"],
+                         [{"source": "status.json", "error": f"missing: write {none}/state/status.json"}])
+
+        self.board_cli()
+        card = self.card("good")
+        self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-sky-500/15 border border-sky-500/50 '
+                      'text-foreground">active</span>', card)
+        self.assertIn('<p class="text-muted-foreground">A demo app</p><p>Beta is out</p><p class="text-xs '
+                      'text-muted-foreground">last activity <time data-age="2026-10-14T10:00:00Z" '
+                      'datetime="2026-10-14T10:00:00Z">2026-10-14T10:00:00Z</time> · merged #4</p><div class="grid', card)
+        self.assertIn(f'<p class="text-warn">status.json unreadable: Expecting property name enclosed in double quotes: '
+                      f'line 1 column 2 (char 1). Fix {bad}/state/status.json</p>', self.card("bad"))
+        self.assertEqual(self.stages("bad"), [("backlog", "0"), ("todo", "0"), ("build", "?"), ("review", "?"),
+                                              ("merged", "?"), ("deployed", "?")])
+        self.assertIn(f'<p class="text-warn">status.json missing: write {none}/state/status.json</p>',
+                      self.card("none"))
+        self.assertEqual(re.findall(r'<section data-row data-project="([^"]+)" data-status="([^"]+)"',
+                                    "".join(self.html(f"mc/project/{s}") for s in
+                                            ("assistant", "projects/bad", "projects/good", "projects/none"))),
+                         [("assistant", "missing"), ("bad", "unreadable"), ("good", "active"), ("none", "missing")])
+
+    def test_the_pipeline_is_computed_from_tasks_lanes_prs_and_deploys(self):
+        app = self.project("app")
+        self.put(app, "tasks.tsv", HEADER + "".join(f"t{i}\t-\tTask {i}\ttodo\t-\t-\t-\n" for i in range(1, 6))
+                 + "t6\t-\tShipped\tdone\t-\t-\t-\n")
+        self.lane(app, "build-1", "running", [{"run": 1, "start": iso(hours=1)}], host="elsewhere")
+        self.status(app, repos=["o/app"], in_flight=[{"kind": "agent", "ref": "review-bot", "state": "working"},
+                                                     {"kind": "agent", "ref": "old-bot", "state": "done"},
+                                                     {"kind": "agent", "ref": "lead", "state": "Halted by Tim; was working"},
+                                                     {"kind": "pr", "ref": "#9", "state": "open"}],
+                    done_recent=[{"at": iso(3), "what": "Released v1.2", "ref": "v1.2", "kind": "release"},
+                                 {"at": iso(4), "what": "Shipped the beta", "ref": "beta-1", "kind": "deploy"},
+                                 {"at": iso(1), "what": "Fixed a typo", "ref": "t6"}])
+        self.prs("o/app", [pr(1, "o/app"), pr(2, "o/app", "MERGED", mergedAt=iso(2)),
+                           pr(3, "o/app", "MERGED", mergedAt=iso(30)), pr(4, "o/app", "CLOSED")])
+        deployed, released = iso(1), iso(3)
+        self.api({"repos/o/app/deployments": [
+            {"id": 11, "environment": "production", "production_environment": True, "created_at": deployed, "sha": "abc1234"},
+            {"id": 12, "environment": "staging", "production_environment": False, "created_at": iso(1), "sha": "def"},
+            {"id": 13, "environment": "prod-eu", "production_environment": False, "created_at": iso(20), "sha": "old"}],
+            "repos/o/app/deployments/11/statuses": [{"state": "success", "environment_url": "https://app.example.com"}],
+            "repos/o/app/releases": [
+                {"tag_name": "v1.2", "published_at": released, "draft": False,
+                 "html_url": "https://github.com/o/app/releases/tag/v1.2"},
+                {"tag_name": "v1.3", "published_at": iso(1), "draft": True, "html_url": "https://github.com/o/app/x"}]})
+        self.status(self.project("down"), repos=["o/down"])
+        (self.stubs / "pr-list-o_down.err").write_text("HTTP 502: Bad Gateway")
+
+        snap = json.loads(self.board_cli("--print"))
+        self.assertEqual(snap["deploys"], [
+            {"repo": "o/app", "kind": "deploy", "name": "production", "at": deployed, "sha": "abc1234", "state": "success",
+             "url": "https://app.example.com"},
+            {"repo": "o/app", "kind": "release", "name": "v1.2", "at": released, "sha": None, "state": None,
+             "url": "https://github.com/o/app/releases/tag/v1.2"}])
+        self.assertEqual(sorted(snap["prs"]), ["https://github.com/o/app/pull/1", "https://github.com/o/app/pull/2"])
+        self.assertEqual({repo: bool(at) for repo, at in snap["repos"].items()}, {"o/app": True, "o/down": False, "o/r": True})
+        self.assertIn({"source": "gh o/down", "error": "HTTP 502: Bad Gateway"}, snap["errors"])
+        self.assertEqual([c["args"][1] for c in self.log("gh") if "/statuses" in " ".join(c["args"])],
+                         ["repos/o/app/deployments/11/statuses?per_page=1"])
+
+        self.board_cli()
+        self.assertEqual(self.stages("app"), [("backlog", "2"), ("todo", "3"), ("build", "2"), ("review", "1"),
+                                              ("merged", "1"), ("deployed", "3")])
+        self.assertIn('<a class="inline-block max-w-full truncate rounded bg-muted px-1 font-mono text-[11px] underline" '
+                      'href="https://github.com/o/app/pull/1" title="o/app#1 PR 1">#1</a>', self.card("app"))
+        self.assertEqual(self.stages("down"), [("backlog", "0"), ("todo", "0"), ("build", "0"), ("review", "?"),
+                                               ("merged", "?"), ("deployed", "?")])
+        self.assertIn('<div class="text-xs text-warn">unknown</div>', self.card("down"))
+        done = self.html("mc/done")
+        self.assertIn('<span data-count="done" class="text-4xl font-semibold">≥4</span>', done)
+        self.assertEqual(re.findall(r'<li data-row data-project="([^"]*)".*?text-foreground">([^<]+)</span>', done),
+                         [("app", "deploy production"), ("app", "merged"), ("app", "release v1.2"), ("app", "deploy")])
+        self.assertEqual(re.findall(r'data-bar="([^"]+)".*?<span class="w-8 text-right">(\d+)</span>', done),
+                         [("assistant", "0"), ("app", "4"), ("down", "0")])
+
+    def test_the_strip_counts_questions_decisions_running_work_prs_and_seats_down(self):
+        shell = {**AGENT, "tile": "obj_bt", "name": "bot", "kind": "shell", "program": "zsh"}
+        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
+                               {**self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open"),
+                                "createdAt": 813000000}]}, [AGENT, shell])
+        self.lane(self.seat, "busy-1", "running", [{"run": 1, "start": iso(hours=1)}], host="elsewhere",
+                  pr="https://github.com/o/r/pull/1")
+        self.status(self.seat, project="system", repos=["o/r"],
+                    in_flight=[{"kind": "agent", "ref": "helper", "state": "working"}])
+        self.status(self.project("web"), project="Tim Waldin site", status="waiting-on-tim")
+        self.status(self.project("game"), status="active", asks=[{"id": "a1", "question": "Which map?", "stale": False}])
+        self.status(self.project("old"), status="parked", asks=[{"id": "a0", "question": "Done?", "stale": True}])
+        for name, tile in (("bot", "obj_bt"), ("shop", "obj_st")):
+            seat = self.project(name)
+            self.status(seat, status="active")
+            self.put(seat, "board.json", json.dumps({"host": "box", "board": f"brd_{name}", "tile": tile}))
+        refused = [{**FAILING[0], "detailsUrl": "https://github.com/o/r/actions/runs/1/job/99"}]
+        broke = [{**FAILING[0], "detailsUrl": "https://github.com/o/r/actions/runs/2/job/98"}]
+        running = refused + [{"__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": None}]
+        unread = [{**FAILING[0], "detailsUrl": "https://github.com/o/r/actions/runs/3/job/97"}]
+        self.api({"repos/o/r/check-runs/99/annotations": [
+            {"annotation_level": "failure", "message": "The job was not started because recent account payments have "
+             "failed or your spending limit needs to be increased. Please check the 'Billing & plans' section."}],
+            "repos/o/r/check-runs/98/annotations": [{"annotation_level": "notice", "message": "Queues are long."}],
+            "repos/o/r/check-runs/97/annotations": "HTTP 403: Resource not accessible by integration"})
+        self.prs("o/r", [pr(1), pr(2), pr(3, isDraft=True), pr(4, statusCheckRollup=broke),
+                         pr(5, statusCheckRollup=refused), pr(6, statusCheckRollup=running), pr(7, statusCheckRollup=unread)])
+        self.board_cli()
+        strip = self.html("mc/strip")
+        self.assertEqual([self.count("mc/strip", name) for name in ("questions", "decisions", "running", "prs", "down")],
+                         ["1", "3", "2", "2", "2"])
+        self.assertIn("could not read why 1 failed check(s) failed; they show as failing, though GitHub may have "
+                      "refused to start them</li>", strip)
+        prs = {p["number"]: p["checks"] for p in json.loads(self.board_cli("--print"))["prs"].values()}
+        self.assertEqual((prs[5], prs[6], prs[7]), ("not run", "pending", "failing"))
+        self.assertIn('oldest <time data-age="2026-10-06T17:20:00Z" datetime="2026-10-06T17:20:00Z">'
+                      '2026-10-06T17:20:00Z</time>', strip)
+        self.assertIn('<div class="text-xs text-muted-foreground">system, game, Tim Waldin site</div>', strip)
+        self.assertIn("1 lane(s) · 1 agent(s) · 0 seat(s) working", strip)
+        self.assertIn("5 on agents · 7 open", strip)
+        self.assertIn('<div class="text-xs text-muted-foreground">bot, shop</div>', strip)
+        self.assertNotIn("$", strip)
+        card = self.card("system")
+        self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-muted text-warn font-semibold">CI not run'
+                      '</span> <span class="text-xs text-muted-foreground">The job was not started because recent '
+                      'account payments have failed or your spending limit needs to be increased.</span>', card)
+        self.assertIn('checks failing: test</span>', card)
+        web = self.obj("brd_a", "mc/project/projects/web")
+        self.assertEqual(web["props"]["title"], "6 · Tim Waldin site")
+        self.assertIn('<h3 class="font-semibold">6 · Tim Waldin site</h3>', web["props"]["html"])
+
+    def test_todo_items_and_the_mark_done_round_trip(self):
+        today = dt.datetime.now(dt.timezone.utc).date()
+        sync = today + dt.timedelta(days=2)
+        todo = {"sync": {"date": sync.isoformat(), "title": "Weekly with Sam"}, "items": [
+            {"id": "call-bank", "title": "Call the bank", "body": "Ask about the <wire>.", "due": today.isoformat(),
+             "with": ["Sam"], "steps": ["Find the account number", "Call"],
+             "links": [{"label": "Statement", "url": "https://bank.example/s"}, {"label": "Bad", "url": "javascript:x()"}],
+             "drafts": [{"to": "Sam", "channel": "sms", "text": "On it <b>today</b>"}]},
+            {"id": "renew", "title": "Renew passport", "due": (today - dt.timedelta(days=2)).isoformat()},
+            {"id": "old", "title": "Old thing", "done": True}]}
+        path = self.put(self.seat, "todo.json", json.dumps(todo))
+        snap = json.loads(self.board_cli("--print"))
+        self.assertEqual((snap["todo_file"], snap["todo"]["items"][0]["links"]),
+                         ("ok", [{"label": "Statement", "url": "https://bank.example/s"}]))
+        self.assertIn({"source": "todo.json", "error": "items[0].links[1].url: not an http(s) URL"}, snap["errors"])
+
+        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
+        page = self.html("mc/todo")
+        self.assertIn('<li data-row data-item="call-bank" class="space-y-1"><div class="flex flex-wrap items-center gap-2">'
+                      '<span class="font-semibold">Call the bank</span><span class="inline-block rounded px-1.5 py-0.5 '
+                      'text-xs bg-orange-500/15 border border-orange-500/50 text-foreground">due today</span> <span '
+                      'class="inline-block rounded px-1.5 py-0.5 text-xs bg-slate-500/15 border border-slate-500/50 '
+                      'text-foreground">with Sam</span><button type="button" data-done="call-bank" aria-pressed="false" '
+                      f'class="ml-auto {BUTTON}">Mark done</button></div><div data-body class="space-y-1"><p>Ask about the '
+                      '&lt;wire&gt;.</p><ol class="list-decimal pl-5"><li>Find the account number</li><li>Call</li></ol>'
+                      '<div class="text-xs"><a class="underline" href="https://bank.example/s" rel="noreferrer">Statement'
+                      '</a></div><div data-draft class="rounded border border-border bg-muted p-2 space-y-1"><div '
+                      'class="text-xs font-semibold">sms → Sam</div><pre data-draft-text class="whitespace-pre-wrap '
+                      'font-sans text-sm">On it &lt;b&gt;today&lt;/b&gt;</pre><div class="flex items-center gap-2"><button '
+                      f'type="button" data-copy class="{BUTTON}">Copy</button><span data-copy-status aria-live="polite" '
+                      'class="text-xs text-muted-foreground"></span></div></div></div></li>', page)
+        self.assertIn('text-xs bg-muted text-warn font-semibold">overdue 2d</span>', page)
+        self.assertNotIn("javascript:", page)
+        self.assertEqual([self.count("mc/todo", name) for name in ("sync", "due", "open", "drafts")], ["in 2d", "2", "2", "1"])
+        self.assertIn('<details data-section="done"><summary class="cursor-pointer">Done (1)</summary>', page)
+        strip = self.html("mc/strip")
+        self.assertIn(f"next sync {sync:%a %m-%d} · Weekly with Sam · in 2d", strip)
+        self.assertIn('<span class="text-warn font-semibold">overdue 2d</span> · Renew passport', strip)
+
+        self.edit("brd_a", "mc/todo", props={"state": {"done:call-bank": True, "done:old": True, "done:ghost": True}})
+        self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\ntodo-done\tcall-bank\n")
+        todo["items"][0]["done"] = True
+        path.write_text(json.dumps(todo))
+        self.assertEqual(self.board_cli(), "mc/strip\tupdated\nmc/project/assistant\tunchanged\nmc/todo\tupdated\n"
+                         "mc/done\tunchanged\nlayout.check\tclean\n")
+        done = re.search(r'<details data-section="done">.*?</details>', self.html("mc/todo"), re.S).group(0)
+        self.assertIn('<summary class="cursor-pointer">Done (2)</summary>', done)
+        self.assertIn('<li data-row data-item="call-bank"', done)
+        self.assertNotIn('data-done="call-bank"', self.html("mc/todo"))
+
+    def test_a_missing_todo_json_says_where_to_write_it(self):
+        self.board_cli()
+        self.assertIn(f'<p class="text-muted-foreground">No todo.json yet: the assistant writes {self.seat}/state/todo.json.'
+                      '</p>', self.html("mc/todo"))
+
+    def test_todo_json_is_read_from_the_drawing_seat(self):
+        todo = {"sync": {"date": "2026-10-16", "title": "Weekly"}, "items": [
+            {"id": "call", "title": "Call", "due": "soon", "with": ["Sam"], "steps": ["Dial"],
+             "links": [{"label": "Doc", "url": "https://example.com/d"}, {"label": "Bad", "url": "javascript:x()"}],
+             "drafts": [{"to": "Sam", "channel": "sms", "text": "Hi"}]}, {"id": "old", "done": True}, "loose"]}
+        self.put(self.seat, "todo.json", json.dumps(todo))
+        self.put(self.project("demo"), "todo.json", "{broken")
+        snap = json.loads(self.board_cli("--print"))
+        self.assertEqual((snap["todo_file"], snap["todo"]), ("ok", {"sync": {"date": "2026-10-16", "title": "Weekly"}, "items": [
+            {"id": "call", "title": "Call", "body": None, "due": "soon", "people": ["Sam"], "steps": ["Dial"],
+             "links": [{"label": "Doc", "url": "https://example.com/d"}],
+             "drafts": [{"to": "Sam", "channel": "sms", "text": "Hi"}], "done": False},
+            {"id": "old", "title": None, "body": None, "due": None, "people": [], "steps": [], "links": [], "drafts": [],
+             "done": True}]}))
+        self.assertEqual([p for p in snap["errors"] if p["source"] == "todo.json"], [
+            {"source": "todo.json", "error": "items[0].links[1].url: not an http(s) URL"},
+            {"source": "todo.json", "error": "items[2]: not an object"}])
+        self.board_cli()
+        self.assertIn('text-muted-foreground">due soon</span>', self.html("mc/todo"))
+        self.assertEqual(self.count("mc/todo", "due"), "0")
+        self.put(self.seat, "todo.json", "[]")
+        snap = json.loads(self.board_cli("--print"))
+        self.assertEqual((snap["todo_file"], snap["todo"]), ("unreadable", None))
+        self.assertIn({"source": "todo.json", "error": "not a JSON object"}, snap["errors"])
+        self.board_cli()
+        self.assertIn(f'<p class="text-warn">todo.json unreadable: not a JSON object. Fix {self.seat}/state/todo.json</p>',
+                      self.html("mc/todo"))
+
+    def test_panels_are_read_with_their_settings(self):
+        self.put(self.seat, "panels/plan.html", "<p>Plan</p>")
+        self.put(self.seat, "panels/plan.json", json.dumps({"title": "Plan", "group": "you", "order": 2, "width": 4000}))
+        self.put(self.seat, "panels/health.html", "<p>Health</p>")
+        self.put(self.seat, "panels/health.json", json.dumps({"order": "first"}))
+        self.put(self.seat, "panels/blank.html", " \n")
+        self.put(self.seat, "panels/Bad Name.html", "x")
+        assistant = self.snapshot()["assistant"]
+        self.assertEqual(assistant["panels"], [
+            {"id": "blank", "seat": "assistant", "title": "blank", "group": "status", "order": 100, "width": 640,
+             "html": None, "error": "empty"},
+            {"id": "health", "seat": "assistant", "title": "health", "group": "status", "order": 100, "width": 640,
+             "html": "<p>Health</p>", "error": None},
+            {"id": "plan", "seat": "assistant", "title": "Plan", "group": "you", "order": 2, "width": 1600,
+             "html": "<p>Plan</p>", "error": None}])
+        self.assertEqual([p for p in assistant["errors"] if p["source"].startswith("panels/")], [
+            {"source": "panels/Bad Name.html", "error": "the id is not [a-z0-9][a-z0-9_-]{0,63}"},
+            {"source": "panels/blank.html", "error": "empty"},
+            {"source": "panels/health.json", "error": "order: not a whole number"}])
+
+    def test_panels_go_under_their_column_and_leave_with_their_files(self):
+        self.put(self.seat, "panels/plan.html", "<p>The plan</p>")
+        self.put(self.seat, "panels/plan.json", json.dumps({"title": "Plan", "group": "you"}))
+        health = self.put(self.seat, "panels/health.html", "<p>Health</p>")
+        self.put(self.seat, "panels/Bad Name.html", "x")
+        self.assertEqual(self.board_cli(), "mc/strip\tcreated\nmc/project/assistant\tcreated\nmc/todo\tcreated\n"
+                         "mc/panel/assistant/plan\tcreated\nmc/done\tcreated\nmc/panel/assistant/health\tcreated\n"
+                         "layout.check\tclean\n")
+        strip, todo, done = self.frame("mc/strip"), self.frame("mc/todo"), self.frame("mc/done")
+        top = strip["h"] + 40
+        self.assertEqual((strip["x"], strip["y"], strip["w"]), (-2840, 0, 1560))
+        self.assertEqual([(self.frame(k)["x"], self.frame(k)["y"]) for k in ("mc/project/assistant", "mc/todo", "mc/done")],
+                         [(-2840, top), (-1980, top), (-720, top)])
+        self.assertEqual(self.frame("mc/panel/assistant/plan"), {"x": -1980, "y": top + todo["h"] + 40, "w": 640, "h": 100})
+        self.assertEqual(self.frame("mc/panel/assistant/health"), {"x": -720, "y": top + done["h"] + 40, "w": 640, "h": 100})
+        self.assertEqual(self.obj("brd_a", "mc/panel/assistant/plan")["props"]["title"], "Plan")
+        self.assertIn('<span class="font-mono">assistant · panels/Bad Name.html</span>: the id is not '
+                      '[a-z0-9][a-z0-9_-]{0,63}</li>', self.html("mc/strip"))
+
+        health.unlink()
+        self.assertEqual(self.board_cli(), UNCHANGED.replace("mc/done", "mc/panel/assistant/plan\tunchanged\nmc/done")
+                         + "mc/panel/assistant/health\tdeleted\nlayout.check\tclean\n")
+        self.put(self.seat, "panels/plan.html", "")
+        out = self.board_cli()
+        self.assertIn("mc/todo\tunchanged\nmc/panel/assistant/plan\tkept (unreadable)\nmc/done\tunchanged\n", out)
+        self.assertEqual(self.html("mc/panel/assistant/plan"), "<p>The plan</p>")
+        self.assertIn('<span class="font-mono">assistant · panels/plan.html</span>: empty</li>', self.html("mc/strip"))
+        self.assertEqual({p["source"] for p in json.loads(self.board_cli("--print", "--redact"))["seats"][0]["errors"]},
+                         {"panels", "status.json"})
+
+        panels = self.seat / "state" / "panels"
+        panels.chmod(0)
+        try:
+            out = self.board_cli()
+        finally:
+            panels.chmod(0o755)
+        self.assertNotIn("deleted", out)
+        self.assertEqual(self.html("mc/panel/assistant/plan"), "<p>The plan</p>")
+
+    def test_the_digest_note_goes_once_a_digest_panel_exists(self):
+        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
+                               self.tile("obj_d", "note", 5000, 0, key="digest", markdown="today")]}, [AGENT])
+        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
+        self.assertEqual(self.obj("brd_a", "digest")["id"], "obj_d")
+        self.put(self.seat, "panels/digest.html", "<p>Digest</p>")
+        self.put(self.seat, "panels/digest.json", json.dumps({"title": "Digest 2026-10-15", "group": "status"}))
+        out = self.board_cli()
+        self.assertTrue(out.endswith("mc/panel/assistant/digest\tcreated\ndigest\tdeleted (old note)\n"
+                                     "layout.check\tclean\n"), out)
+        self.assertNotIn("obj_d", [o["id"] for o in self.boards()["brd_a"]])
+
+    def test_a_refused_ci_job_shows_as_not_run_and_its_reason_is_asked_once(self):
+        refused = [{**FAILING[0], "detailsUrl": "https://github.com/o/r/actions/runs/1/job/99"}]
+        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tFix\ttodo\t-\thttps://github.com/o/r/pull/7\t-\n")
+        self.prs("o/r", [pr(7, statusCheckRollup=refused)])
+        self.api({"repos/o/r/check-runs/99/annotations": [
+            {"annotation_level": "failure", "message": "The job was not started because your account is locked. "
+             "Please check billing."}]})
+        prs = json.loads(self.board_cli("--print"))["prs"]
+        self.assertEqual({k: prs["https://github.com/o/r/pull/7"][k] for k in ("checks", "failing", "reason")},
+                         {"checks": "not run", "failing": [],
+                          "reason": "The job was not started because your account is locked."})
+        cache = self.home / ".cache" / "tstack" / "gh" / "o_r.json"
+        cache.write_text(json.dumps({**json.loads(cache.read_text()), "at": iso(1)}))
+        self.board_cli()
+        self.assertEqual([c["args"] for c in self.log("gh") if "annotations" in " ".join(c["args"])],
+                         [["api", "repos/o/r/check-runs/99/annotations"]])
+        self.assertEqual(len([c for c in self.log("gh") if c["args"][:2] == ["pr", "list"]]), 2)
+        self.assertIn('CI not run</span> <span class="text-xs text-muted-foreground">The job was not started because '
+                      'your account is locked.</span>', self.card("assistant"))
+
+    def test_an_unchanged_second_draw_sends_no_writes(self):
+        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tFix\ttodo\tfix-1\thttps://github.com/o/r/pull/7\t-\n")
+        self.lane(self.seat, "fix-1", "exited", [{"run": 1, "start": "2026-10-14T00:00:00Z", "end": "2026-10-14T01:00:00Z",
+                                                   "exit": 0}], final="Done.\n", worktree=str(self.root))
+        (self.stubs / "pr-list.json").write_text(json.dumps([pr(7, headRefName="lane/fix-1", statusCheckRollup=FAILING)]))
+        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
+        self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-muted text-warn font-semibold">'
+                      'checks failing: test</span>', self.html("mc/project/assistant"))
+        easl, gh = len(self.log("easl")), len(self.log("gh"))
+        self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\n")
+        self.assertEqual({call["args"][0] for call in self.log("easl")[easl:]},
+                         {"agent.list", "ask", "layout.check", "object.find", "object.get"})
+        self.assertEqual(self.log("gh")[gh:], [])
+        self.assertEqual(sorted(c["args"][:2] for c in self.log("gh")), [
+            ["api", "repos/o/r/deployments?per_page=30"], ["api", "repos/o/r/releases?per_page=10"], ["pr", "list"]])
+
     def test_aggregates_every_seat_and_shows_a_broken_file_as_unreadable(self):
         self.put(self.seat, "tasks.tsv", HEADER + "a1\t-\tWire it\ttodo\t-\t-\t2026-10-01\n")
         self.project("area")
         self.put(self.project("area/sub"), "tasks.tsv", HEADER + "s1\tsub\tSub task\ttodo\t-\t-\t2026-10-02\n")
-        self.put(self.project("broken"), "tasks.tsv", HEADER + "b1\t-\tFine\ttodo\t-\t-\t-\nb2\ttoo\tfew\tcolumns\there\n")
+        broken = self.project("broken")
+        self.put(broken, "tasks.tsv", HEADER + "b1\t-\tFine\ttodo\t-\t-\t-\nb2\ttoo\tfew\tcolumns\there\n")
         seats = self.snapshot()
         self.assertEqual(list(seats), ["assistant", "projects/area", "projects/area/sub", "projects/broken"])
         self.assertEqual([t["id"] for t in seats["projects/area/sub"]["tasks"]], ["s1"])
         self.assertIsNone(seats["projects/broken"]["tasks"])
-        self.assertEqual(seats["projects/broken"]["errors"], [{"source": "tasks.tsv", "error": "line 3: 5 columns, want 7"}])
+        self.assertEqual(seats["projects/broken"]["errors"], [
+            {"source": "tasks.tsv", "error": "line 3: 5 columns, want 7"},
+            {"source": "status.json", "error": f"missing: write {broken}/state/status.json"}])
         self.assertEqual(seats["assistant"]["health"]["state"], "idle")
 
-        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
-        summary = self.html("mc/summary")
-        self.assertIn('<li class="text-warn"><span class="font-mono">projects/broken · tasks.tsv</span>: '
-                      'line 3: 5 columns, want 7</li>', summary)
-        self.assertIn('<div class="text-xs text-muted-foreground">Next</div><div class="text-2xl font-semibold">≥2</div>'
-                      '<div class="text-xs text-muted-foreground">tasks.tsv: first 3 todo rows per seat</div>'
-                      '<div class="text-xs text-warn">1 tasks.tsv unreadable</div>', summary)
-        self.assertIn("<details open><summary", summary)
-        queues = self.html("mc/queues")
-        self.assertIn('<div class="text-warn">tasks.tsv unreadable: line 3: 5 columns, want 7</div>', queues)
-        self.assertIn('<li data-task="s1" data-place="next" data-task-state="todo"', queues)
+        self.assertEqual(self.board_cli(), created("projects/area", "projects/area/sub", "projects/broken")
+                         + "layout.check\tclean\n")
+        strip = self.html("mc/strip")
+        self.assertIn('<li class="text-warn"><span class="font-mono">broken · tasks.tsv</span>: '
+                      'line 3: 5 columns, want 7</li>', strip)
+        self.assertIn('<details data-section="problems" open><summary class="cursor-pointer font-semibold">'
+                      'Problems (5)</summary>', strip)
+        self.assertIn('<p class="text-warn">tasks.tsv unreadable: line 3: 5 columns, want 7</p>',
+                      self.card("broken"))
+        self.assertEqual(self.stages("broken"), [("backlog", "?"), ("todo", "?"), ("build", "0"),
+                                                 ("review", "?"), ("merged", "?"), ("deployed", "0")])
+        self.assertIn('<li data-task="s1" data-place="next" data-task-state="todo"', self.card("sub"))
 
-    def test_a_question_on_another_board_is_indexed_with_where_it_is_not_placed(self):
+    def test_a_question_on_another_board_is_listed_in_the_todo_with_where_it_is(self):
         demo = self.project("demo")
         self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_d", "tile": "obj_dt"}))
         question = self.tile("obj_dq", "question", 10, 10, question="Merge the demo PR?", status="open",
@@ -195,158 +595,50 @@ class Board(Sandbox):
             "options": [{"id": "a", "label": "Merge"}, {"id": "b", "label": "Wait"}], "recommended": "a",
             "asked": "2026-10-06T17:20:00Z", "expires": None, "asker": "demo-coordinator",
             "frame": {"x": 10, "y": 10, "w": 420, "h": 200}}])
-        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
+        self.assertEqual(self.board_cli(), created("projects/demo") + "layout.check\tclean\n")
         self.assertEqual(self.obj("brd_d", "obj_dq")["frame"], {"x": 10, "y": 10, "w": 420, "h": 200})
-        questions = self.html("mc/questions")
-        self.assertIn('<div class="font-medium">Merge the demo PR?</div><div class="text-muted-foreground">'
-                      'a) Merge (recommended), b) Wait</div>', questions)
-        self.assertIn('board <span class="font-mono">brd_d</span> on box, tile <span class="font-mono">obj_dq</span>: '
-                      'open that board', questions)
-        self.assertNotIn("data-question=", questions)
-        self.assertIn('<div class="text-2xl font-semibold text-warn">1</div>', self.html("mc/summary"))
+        page = self.html("mc/todo")
+        self.assertIn('<li data-row data-project="demo" class="space-y-1"><div class="font-semibold">Merge the demo '
+                      'PR?</div><div class="text-muted-foreground">a) Merge (recommended), b) Wait</div>', page)
+        self.assertIn('Answer on board <span class="font-mono">brd_d</span> on box, tile <span class="font-mono">obj_dq'
+                      '</span>.</div></li>', page)
+        self.assertNotIn("data-question=", page)
+        self.assertEqual((self.count("mc/strip", "questions"), self.count("mc/todo", "open")), ("1", "1"))
+        self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-orange-500/15 border '
+                      'border-orange-500/50 text-foreground">1 open question(s)</span>', self.card("demo"))
 
-    def test_next_and_backlog_follow_file_order(self):
-        self.put(self.seat, "tasks.tsv", HEADER + "".join(f"{i}\t-\tTask {i}\t{state}\t-\t-\t{stamp}\n" for i, state, stamp in [
-            ("t5", "todo", "2026-10-09"), ("t1", "todo", "2026-10-01"), ("t9", "done", "2026-10-13"),
-            ("t2", "todo", "2026-10-12"), ("t7", "todo", "2026-09-01"), ("t3", "todo", "2026-10-13")]))
-        self.assertEqual([(t["id"], t["row"]) for t in self.snapshot()["assistant"]["tasks"]],
-                         [("t5", 1), ("t1", 2), ("t9", 3), ("t2", 4), ("t7", 5), ("t3", 6)])
-        self.board_cli()
-        queues = self.html("mc/queues")
-        self.assertEqual(re.findall(r'data-task="(\w+)" data-place="(\w+)"', queues),
-                         [("t5", "next"), ("t1", "next"), ("t2", "next"), ("t7", "backlog"), ("t3", "backlog")])
-        self.assertIn("Next candidates (first todo rows in tasks.tsv order)", queues)
-        self.assertIn('<summary class="cursor-pointer">Backlog: 2 more todo rows</summary>', queues)
-        self.assertIn("Other rows: done 1", queues)
+    def test_a_question_on_the_drawn_board_is_placed_once_beside_the_todo(self):
+        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
+                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open")]}, [AGENT])
+        self.assertEqual(self.board_cli(), CREATED + "question obj_q\tplaced\nlayout.check\tclean\n")
+        todo = self.frame("mc/todo")
+        self.assertEqual((todo["x"], todo["w"]), (-1900, 720))
+        self.assertEqual(self.frame("obj_q"), {"x": -1140, "y": todo["y"], "w": 460, "h": 200})
+        self.assertEqual(self.frame("mc/done")["x"], -640)
+        self.assertIn('data-question="obj_q"', self.html("mc/todo"))
+        self.assertIn('Answer on tile <span class="font-mono">obj_q</span>, beside this panel.', self.html("mc/todo"))
+        self.edit("brd_a", "obj_q", frame={"x": -9000, "y": -9000})
+        self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\n")
+        self.assertEqual(self.frame("obj_q"), {"x": -9000, "y": -9000, "w": 460, "h": 200})
 
-    def test_failed_and_unanswered_lanes_get_their_own_section(self):
-        start = {"run": 1, "start": "2026-10-14T00:00:00Z"}
-        ended = {**start, "end": "2026-10-14T00:10:00Z", "cost_usd": 0.5}
-        self.lane(self.seat, "busy-1", "running", [start], host="elsewhere")
-        self.lane(self.seat, "ready-1", "exited", [{**ended, "exit": 0}], final="Looked.\nPR opened.\n", worktree=str(self.root))
-        self.lane(self.seat, "broke-1", "exited", [{**ended, "exit": 1}])
-        self.lane(self.seat, "quiet-1", "exited", [{**ended, "exit": 0}])
-        lanes = {lane["id"]: lane["state"] for lane in self.snapshot()["assistant"]["lanes"]}
-        self.assertEqual(lanes, {"broke-1": "failed", "busy-1": "running", "quiet-1": "no-answer", "ready-1": "waiting"})
-        self.board_cli()
-        html = self.html("mc/lanes")
-        live = re.search(r'<section data-section="live".*?</section>', html).group(0)
-        attention = re.search(r'<section data-section="attention".*?</section>', html).group(0)
-        self.assertEqual(re.findall(r'data-state="([\w-]+)"', live), ["running", "waiting"])
-        self.assertEqual(re.findall(r'data-state="([\w-]+)"', attention), ["failed", "no-answer"])
-        self.assertIn("Needs attention (2)", attention)
-        self.assertIn('<span class="font-mono">broke-1</span> · Brief for broke-1</div>', attention)
-        self.assertIn("exit 1 · $0.50 recorded", attention)
-        self.assertIn(f'<canvas-link path="{self.seat / "state/lanes/ready-1/final.md"}">final.md</canvas-link>', live)
-        self.assertIn('<div class="text-xs text-muted-foreground">PR opened.</div>', live)
-        self.assertIn('<div class="text-2xl font-semibold text-warn">1</div>', self.html("mc/summary"))
-
-    def test_a_dangling_lane_record_is_a_problem_not_a_crash(self):
-        self.lane(self.seat, "ok-1", "running", [{"run": 1, "start": "2026-10-14T00:00:00Z"}], host="elsewhere")
-        (self.seat / "state" / "lanes" / "lost-1").mkdir()
-        (self.seat / "state" / "lanes" / "lost-1" / "lane.json").symlink_to(self.root / "nowhere.json")
-        assistant = self.snapshot()["assistant"]
-        self.assertEqual([lane["id"] for lane in assistant["lanes"]], ["ok-1"])
-        self.assertEqual([p["source"] for p in assistant["errors"]], ["lanes/lost-1/lane.json"])
-        self.assertIn("lanes", assistant["sources"])
-
-    def test_a_pr_of_a_running_lane_is_not_loose_when_a_task_names_it_too(self):
-        url = "https://github.com/o/r/pull/9"
-        self.lane(self.seat, "busy-1", "running", [{"run": 1, "start": "2026-10-14T00:00:00Z"}], host="elsewhere", pr=url)
-        self.put(self.seat, "tasks.tsv", HEADER + f"t1\t-\tShip\ttodo\t-\t{url}\t-\n")
-        (self.stubs / "pr-list.json").write_text(json.dumps([{
-            "number": 9, "url": url, "title": "Ship", "state": "OPEN", "isDraft": False, "headRefName": "lane/busy-1",
-            "reviewDecision": "", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "statusCheckRollup": [],
-            "mergedAt": None}]))
-        self.board_cli()
-        self.assertIn("Open PRs without a running lane (0)", self.html("mc/lanes"))
-
-    def test_a_pr_cell_that_is_not_a_github_url_is_text_not_a_link(self):
-        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tOdd\ttodo\t-\tjavascript:window.bad=2\t-\n")
-        self.board_cli()
-        queues = self.html("mc/queues")
-        self.assertNotIn('href="javascript:', queues)
-        self.assertIn('javascript:window.bad=2 <span class="inline-block rounded px-1.5 py-0.5 text-xs bg-muted text-warn '
-                      'font-semibold">not a GitHub PR URL</span>', queues)
-
-    def test_a_choice_on_a_task_that_left_the_queue_stays_visible(self):
-        tasks = self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tTask t1\ttodo\t-\t-\t-\n")
-        self.board_cli()
-        self.edit("brd_a", "mc/queues", props={"state": {"choice:assistant:t1": "drop", "choice:assistant:t9": "next"}})
-        tasks.write_text(HEADER + "t1\t-\tTask t1\tcancelled\t-\t-\t-\n")
-        out = self.board_cli()
-        self.assertNotIn("choice\tassistant\tt1", out)
-        queues = self.html("mc/queues")
-        self.assertIn("Your earlier choices", queues)
-        self.assertIn('<li data-task="t1" data-place="gone" data-task-state="cancelled" class="py-0.5">'
-                      '<span class="font-mono">t1</span> Task t1 <span class="inline-block rounded px-1.5 py-0.5 text-xs '
-                      'bg-muted text-muted-foreground">task cancelled</span>', queues)
-        self.assertIn('<select data-choice="assistant:t1"', queues)
-        self.assertIn('<li data-task="t9" data-place="gone" data-task-state="not in tasks.tsv"', queues)
-
-    def test_a_grown_region_keeps_its_origin_and_takes_its_measured_height(self):
-        self.board_cli()
-        before = self.obj("brd_a", "mc/queues")["frame"]
-        self.put(self.seat, "tasks.tsv", HEADER + "".join(f"t{i}\t-\tA longer task {i}\ttodo\t-\t-\t-\n" for i in range(9)))
-        self.assertIn("mc/queues\tupdated\n", self.board_cli())
-        queues = self.obj("brd_a", "mc/queues")
-        self.assertEqual(queues["frame"], {"x": before["x"], "y": before["y"], "w": 1440,
-                                           "h": 100 + len(queues["props"]["html"]) // 50})
-        self.assertGreater(queues["frame"]["h"], before["h"])
-        self.assertIn("object.measure", {c["args"][0] for c in self.log("easl")})
-
-    def test_an_unchanged_draw_reports_an_operator_overlap_without_moving_it(self):
-        self.board_cli()
-        summary = self.obj("brd_a", "mc/summary")
-        self.edit("brd_a", "mc/lanes", frame={"x": summary["frame"]["x"], "y": summary["frame"]["y"] + 10})
-        frames = {k: self.obj("brd_a", k)["frame"] for k in ("mc/summary", "mc/lanes", "mc/queues", "mc/landed")}
-        out = self.board_cli()
-        self.assertTrue(out.startswith(UNCHANGED + "layout.check\t{\"overlaps\": [["), out)
-        self.assertIn(f'"{summary["id"]}", "{self.obj("brd_a", "mc/lanes")["id"]}"', out)
-        self.assertEqual({k: self.obj("brd_a", k)["frame"] for k in frames}, frames)
-
-    def test_growth_pushes_every_region_below_it_down_in_order(self):
-        self.board_cli()
-        store = json.loads((self.stubs / "easl-boards.json").read_text())
-        store["boards"]["brd_a"] += [self.tile(f"obj_q{i}", "question", 9000, 400 * i, question="Ship this task?",
-                                               status="open") for i in range(40)]
-        (self.stubs / "easl-boards.json").write_text(json.dumps(store))
-        out = self.board_cli()
-        self.assertIn("mc/queues\tmoved down\nmc/landed\tmoved down\nlayout.check\tclean\n", out)
-        questions, queues, landed = (self.obj("brd_a", k)["frame"] for k in ("mc/questions", "mc/queues", "mc/landed"))
-        self.assertEqual((queues["y"], landed["y"]), (questions["y"] + questions["h"] + 40, queues["y"] + queues["h"] + 40))
-
-    def test_growth_leaves_an_overlap_the_operator_made(self):
-        self.board_cli()
-        queues = self.obj("brd_a", "mc/queues")["frame"]
-        self.edit("brd_a", "mc/landed", frame={"y": queues["y"] + 20})
-        self.put(self.seat, "tasks.tsv", HEADER + "".join(f"t{i}\t-\tA longer task {i}\ttodo\t-\t-\t-\n" for i in range(9)))
-        out = self.board_cli()
-        self.assertNotIn("moved down", out)
-        self.assertEqual(self.obj("brd_a", "mc/landed")["frame"]["y"], queues["y"] + 20)
-
-    def test_an_unreadable_lanes_dir_is_a_problem_for_that_seat_only(self):
-        lanes = self.seat / "state" / "lanes"
-        lanes.mkdir()
-        lanes.chmod(0)
-        self.addCleanup(lanes.chmod, 0o755)
-        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tStill read\ttodo\t-\t-\t-\n")
-        assistant = self.snapshot()["assistant"]
-        self.assertEqual((assistant["lanes"], [p["source"] for p in assistant["errors"]]), (None, ["lanes"]))
-        self.assertEqual([t["id"] for t in assistant["tasks"]], ["t1"])
-
-    def test_a_recreated_region_goes_where_nothing_else_is(self):
-        self.board_cli()
-        landed = self.obj("brd_a", "mc/landed")
-        store = json.loads((self.stubs / "easl-boards.json").read_text())
-        store["boards"]["brd_a"] = [o for o in store["boards"]["brd_a"] if o["id"] != landed["id"]]
-        store["boards"]["brd_a"].append(self.tile("obj_d", "note", landed["frame"]["x"], landed["frame"]["y"], 600, 300,
-                                                  key="digest", markdown="today"))
-        (self.stubs / "easl-boards.json").write_text(json.dumps(store))
-        out = self.board_cli()
-        self.assertIn("mc/landed\tcreated\n", out)
-        self.assertTrue(out.endswith("layout.check\tclean\n"), out)
-        self.assertEqual(self.obj("brd_a", "mc/landed")["frame"]["y"], landed["frame"]["y"] + 300 + 40)
+    def test_a_question_asked_from_a_terminal_on_the_board_keeps_its_frame(self):
+        demo = self.project("demo")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_ct"}))
+        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
+                               self.tile("obj_ct", "terminal", 5000, 0, 800, 600),
+                               self.tile("obj_cq", "question", 5000, 640, question="Which way?", status="open",
+                                         asker={"tile": "obj_ct", "name": "demo-coordinator"}),
+                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open",
+                                         asker={"tile": "obj_t"})]}, [AGENT])
+        self.assertEqual(self.board_cli(), created("projects/demo") + "question obj_q\tplaced\nlayout.check\tclean\n")
+        self.assertEqual(self.frame("obj_cq"), {"x": 5000, "y": 640, "w": 420, "h": 200})
+        self.assertIn('<li data-row data-project="demo" class="space-y-1"><div class="font-semibold">Which way?</div>',
+                      self.html("mc/todo"))
+        self.assertIn('Answer on tile <span class="font-mono">obj_cq</span>, under the terminal that asked it.',
+                      self.html("mc/todo"))
+        self.assertEqual(self.board_cli(), UNCHANGED.replace("mc/todo", "mc/project/projects/demo\tunchanged\nmc/todo")
+                         + "layout.check\tclean\n")
+        self.assertEqual(self.frame("obj_cq"), {"x": 5000, "y": 640, "w": 420, "h": 200})
 
     def test_a_placed_question_stays_placed_across_a_failed_question_read(self):
         self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
@@ -355,99 +647,272 @@ class Board(Sandbox):
         self.edit("brd_a", "obj_q", frame={"x": -9000, "y": -9000})
         (self.stubs / "ask.err").write_text("unavailable: easld restarting")
         self.board_cli()
-        self.assertIn('<span hidden data-question="obj_q"></span>', self.html("mc/questions"))
+        self.assertIn('<span hidden data-question="obj_q"></span>', self.html("mc/todo"))
         (self.stubs / "ask.err").unlink()
         self.assertNotIn("question obj_q\tplaced", self.board_cli())
-        self.assertEqual(self.obj("brd_a", "obj_q")["frame"], {"x": -9000, "y": -9000, "w": 420, "h": 200})
+        self.assertEqual(self.frame("obj_q"), {"x": -9000, "y": -9000, "w": 460, "h": 200})
 
-    def test_cleanup_deletes_stale_mc_tiles_and_old_seat_notes_only(self):
+    def test_a_question_new_since_the_last_draw_goes_below_the_placed_ones(self):
+        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
+                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open")]}, [AGENT])
+        self.board_cli()
+        self.add("brd_a", self.tile("obj_q2", "question", 3000, 3600, question="And this?", status="open"))
+        self.assertIn("mc/todo\tupdated\nmc/done\tunchanged\nquestion obj_q2\tplaced\n", self.board_cli())
+        first = self.frame("obj_q")
+        self.assertEqual(self.frame("obj_q2"), {"x": first["x"], "y": first["y"] + 240, "w": 460, "h": 200})
+
+    def test_cleanup_deletes_stale_mc_tiles_and_old_seat_notes_and_takes_their_place(self):
         self.boards({"brd_a": [
-            self.tile("obj_t", "terminal", 0, 0, 800, 600), self.tile("obj_g", "html", 5000, 0, key="mc/gone", html="x"),
+            self.tile("obj_t", "terminal", 0, 0, 800, 600), self.tile("obj_s", "html", -4000, 700, key="mc/summary", html="x"),
+            self.tile("obj_l", "html", -3000, 900, key="mc/lanes", html="x"),
+            self.tile("obj_n", "note", -2000, 800, 300, 300, markdown="mine"),
             self.tile("obj_s1", "note", 5000, 400, key="seat:assistant", markdown="old"),
             self.tile("obj_s2", "note", 5000, 800, key="seat:projects/old", markdown="old"),
             self.tile("obj_d", "note", 5000, 1200, key="digest", markdown="today"),
             self.tile("obj_old", "question", 5000, 1600, question="Done?", status="answered")]}, [AGENT])
-        self.assertEqual(self.board_cli(), CREATED + "mc/gone\tdeleted\nseat:assistant\tdeleted (old note)\n"
-                         "seat:projects/old\tdeleted (old note)\nlayout.check\tclean\n")
+        self.assertEqual(self.board_cli(), CREATED + "mc/lanes\tdeleted\nmc/summary\tdeleted\n"
+                         "seat:assistant\tdeleted (old note)\nseat:projects/old\tdeleted (old note)\nlayout.check\tclean\n")
         left = sorted(o["props"].get("key") or o["id"] for o in self.boards()["brd_a"])
-        self.assertEqual(left, ["digest", "mc/landed", "mc/lanes", "mc/questions", "mc/queues", "mc/summary", "obj_old", "obj_t"])
+        self.assertEqual(left, ["digest", "mc/done", "mc/project/assistant", "mc/strip", "mc/todo", "obj_n", "obj_old",
+                                "obj_t"])
+        self.assertEqual((self.frame("mc/strip")["x"], self.frame("mc/strip")["y"]), (-2000 - 80 - 2680, 700))
 
-    def test_a_question_on_the_drawn_board_is_placed_once(self):
-        self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600),
-                               self.tile("obj_q", "question", 3000, 3000, question="Ship it?", status="open")]}, [AGENT])
-        self.assertEqual(self.board_cli(), CREATED + "question obj_q\tplaced\nlayout.check\tclean\n")
-        index = self.obj("brd_a", "mc/questions")["frame"]
-        self.assertEqual(self.obj("brd_a", "obj_q")["frame"], {"x": index["x"] - 1000, "y": index["y"], "w": 420, "h": 200})
-        self.assertEqual(index["x"], -1520)
-        self.assertIn('data-question="obj_q"', self.html("mc/questions"))
-        self.edit("brd_a", "obj_q", frame={"x": -9000, "y": -9000})
-        self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\n")
-        self.assertEqual(self.obj("brd_a", "obj_q")["frame"], {"x": -9000, "y": -9000, "w": 420, "h": 200})
+    def test_choices_and_notes_left_on_the_board_are_printed_until_tasks_reflect_them(self):
+        rows = [("t1", "todo"), ("t2", "todo"), ("t3", "todo"), ("t4", "todo"), ("t5", "cancelled")]
+        tasks = self.put(self.seat, "tasks.tsv", HEADER + "".join(f"{i}\t-\tTask {i}\t{s}\t-\t-\t-\n" for i, s in rows))
+        self.board_cli()
+        state = {"choice:assistant:t1": "next", "choice:assistant:t4": "next", "choice:assistant:t2": "drop",
+                 "choice:assistant:t5": "drop", "choice:assistant:t3": None, "note:assistant": "Ship t4 first",
+                 "filter:seat": "assistant"}
+        self.edit("brd_a", "mc/project/assistant", props={"state": state})
+        tasks.write_text(tasks.read_text() + "t6\t-\tTask t6\ttodo\t-\t-\t-\n")
+        self.assertEqual(self.board_cli(), "mc/strip\tunchanged\nmc/project/assistant\tupdated\nmc/todo\tunchanged\n"
+                         "mc/done\tunchanged\nlayout.check\tclean\n"
+                         'choice\tassistant\tt2\tdrop\nchoice\tassistant\tt4\tnext\nnote\tassistant\t"Ship t4 first"\n')
+        self.assertEqual(self.obj("brd_a", "mc/project/assistant")["props"]["state"], state)
+        self.assertIn(f'<button type="button" data-choice="assistant:t4" value="next" aria-pressed="false" class="{BUTTON}">'
+                      'next</button>', self.html("mc/project/assistant"))
 
-    def test_an_unchanged_second_draw_sends_no_writes(self):
-        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tFix\ttodo\tfix-1\thttps://github.com/o/r/pull/7\t-\n")
-        self.lane(self.seat, "fix-1", "exited", [{"run": 1, "start": "2026-10-14T00:00:00Z", "end": "2026-10-14T01:00:00Z",
-                                                   "exit": 0}], final="Done.\n", worktree=str(self.root))
-        (self.stubs / "pr-list.json").write_text(json.dumps([{
-            "number": 7, "url": "https://github.com/o/r/pull/7", "title": "Fix", "state": "OPEN", "isDraft": False,
-            "headRefName": "lane/fix-1", "reviewDecision": "", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
-            "statusCheckRollup": [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}],
-            "mergedAt": None}]))
-        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
-        self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-muted text-warn font-semibold">'
-                      'checks failing: test</span>', self.html("mc/lanes"))
-        before = len(self.log("easl"))
-        self.assertEqual(self.board_cli(), UNCHANGED + "layout.check\tclean\n")
-        methods = {call["args"][0] for call in self.log("easl")[before:]}
-        self.assertEqual(methods, {"agent.list", "ask", "layout.check", "object.find", "object.get"})
-        self.assertEqual([c["args"][:4] for c in self.log("gh")], [["pr", "list", "--repo", "o/r"]])
+    def test_a_project_seat_reads_its_lines_from_the_assistant_board(self):
+        demo = self.project("demo")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_d", "tile": "obj_dt"}))
+        self.put(demo, "tasks.tsv", HEADER + "d1\t-\tDemo task\ttodo\t-\t-\t-\n")
+        self.board_cli()
+        self.edit("brd_a", "mc/project/projects/demo", props={"state": {"choice:projects/demo:d1": "drop"}})
+        self.edit("brd_a", "mc/project/assistant", props={"state": {"note:assistant": "mine"}})
+        out = self.board_cli("--seat", str(demo))
+        self.assertTrue(out.endswith("layout.check\tclean\nchoice\tprojects/demo\td1\tdrop\n"), out)
+
+    def test_a_coordinator_on_the_agents_board_leaves_mission_control_alone(self):
+        demo, lone = self.project("demo"), self.project("lone")
+        self.put(demo, "board.json", json.dumps({"host": "box", "board": "brd_a", "tile": "obj_dt"}))
+        self.put(demo, "tasks.tsv", HEADER + "d1\t-\tDemo task\ttodo\t-\t-\t-\n")
+        self.board_cli()
+        self.edit("brd_a", "mc/project/projects/demo", props={"state": {"choice:projects/demo:d1": "drop"}})
+        self.edit("brd_a", "mc/project/projects/lone", props={"state": {"note:projects/lone": "Park it"}})
+        drawn = self.boards()
+        self.assertEqual(self.board_cli("--seat", str(demo)),
+                         "board\tbrd_a is the assistant's board, whose tstack board draws projects/demo\n"
+                         "choice\tprojects/demo\td1\tdrop\n")
+        self.assertEqual(self.board_cli("--seat", str(lone)),
+                         "board\tbrd_a is the assistant's board, whose tstack board draws projects/lone\n"
+                         'note\tprojects/lone\t"Park it"\n')
+        self.put(self.seat, "board.json", "{")
+        self.assertTrue(self.board_cli("--seat", str(demo)).startswith(
+            f"requests\tunread: {self.seat}/state/board.json: "))
+        self.assertEqual(self.boards(), drawn)
+        (self.seat / "state" / "board.json").unlink()
+        self.assertEqual(self.board_cli("--seat", str(demo)), f"requests\tunread: no {self.seat}/state/board.json\n")
+        self.assertEqual(self.boards(), drawn)
+
+    def test_a_choice_on_a_task_that_left_the_queue_stays_visible(self):
+        tasks = self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tTask t1\ttodo\t-\t-\t-\n")
+        self.board_cli()
+        self.edit("brd_a", "mc/project/assistant",
+                  props={"state": {"choice:assistant:t1": "drop", "choice:assistant:t9": "next"}})
+        tasks.write_text(HEADER + "t1\t-\tTask t1\tcancelled\t-\t-\t-\n")
+        out = self.board_cli()
+        self.assertNotIn("choice\tassistant\tt1", out)
+        queue = self.html("mc/project/assistant")
+        self.assertIn("Your earlier choices", queue)
+        self.assertIn('<li data-task="t1" data-place="gone" data-task-state="cancelled" class="py-0.5">'
+                      '<span class="font-mono">t1</span> Task t1 <span class="inline-block rounded px-1.5 py-0.5 text-xs '
+                      'bg-muted text-muted-foreground">task cancelled</span>', queue)
+        self.assertIn('data-choice="assistant:t1" value="drop"', queue)
+        self.assertIn('<li data-task="t9" data-place="gone" data-task-state="not in tasks.tsv"', queue)
+
+    def test_next_and_backlog_follow_file_order(self):
+        self.put(self.seat, "tasks.tsv", HEADER + "".join(f"{i}\t-\tTask {i}\t{state}\t-\t-\t-\n" for i, state in [
+            ("t5", "todo"), ("t1", "todo"), ("t9", "done"), ("t2", "todo"), ("t7", "todo"), ("t3", "todo")]))
+        self.board_cli()
+        card = self.card("assistant")
+        self.assertEqual(re.findall(r'data-task="(\w+)" data-place="(\w+)"', card),
+                         [("t5", "next"), ("t1", "next"), ("t2", "next"), ("t7", "backlog"), ("t3", "backlog")])
+        self.assertIn('<summary class="cursor-pointer font-semibold">Queue: 3 next, 2 backlog</summary>', card)
+
+    def test_focus_rows_put_lanes_that_need_attention_first(self):
+        start = {"run": 1, "start": "2026-10-14T00:00:00Z"}
+        ended = {**start, "end": "2026-10-14T00:10:00Z", "cost_usd": 0.5}
+        self.lane(self.seat, "busy-1", "running", [start], host="elsewhere")
+        self.lane(self.seat, "ready-1", "exited", [{**ended, "exit": 0}], final="Looked.\nPR opened.\n", worktree=str(self.root))
+        self.lane(self.seat, "broke-1", "exited", [{**ended, "exit": 1}])
+        self.lane(self.seat, "quiet-1", "exited", [{**ended, "exit": 0}])
+        self.status(self.seat, repos=["o/r"], in_flight=[{"kind": "agent", "ref": "helper", "state": "working"}])
+        self.prs("o/r", [pr(5, statusCheckRollup=FAILING), pr(6)])
+        lanes = {lane["id"]: lane["state"] for lane in self.snapshot()["assistant"]["lanes"]}
+        self.assertEqual(lanes, {"broke-1": "failed", "busy-1": "running", "quiet-1": "no-answer", "ready-1": "waiting"})
+        self.board_cli()
+        card = self.card("assistant")
+        self.assertEqual(re.findall(r'<li data-(lane|pr|flight)(?:="([^"]*)")?', card), [
+            ("lane", "broke-1"), ("lane", "quiet-1"), ("pr", "https://github.com/o/r/pull/5"),
+            ("pr", "https://github.com/o/r/pull/6"), ("lane", "busy-1"), ("lane", "ready-1"), ("flight", "")])
+        self.assertIn('<details><summary class="cursor-pointer text-xs">+1 more</summary>', card)
+        self.assertIn('<div class="text-xs text-muted-foreground">started <time data-age="2026-10-14T00:00:00Z" '
+                      'datetime="2026-10-14T00:00:00Z">2026-10-14T00:00:00Z</time></div></li>', card)
+        self.assertIn('<div class="text-xs truncate">PR opened.</div>', card)
+
+    def test_a_grown_region_keeps_its_origin_and_takes_its_measured_height(self):
+        self.board_cli()
+        before = self.frame("mc/project/assistant")
+        self.put(self.seat, "tasks.tsv", HEADER + "".join(f"t{i}\t-\tA longer task {i}\ttodo\t-\t-\t-\n" for i in range(9)))
+        self.assertIn("mc/project/assistant\tupdated\n", self.board_cli())
+        projects = self.obj("brd_a", "mc/project/assistant")
+        self.assertEqual(projects["frame"], {"x": before["x"], "y": before["y"], "w": 820,
+                                             "h": 100 + len(projects["props"]["html"]) // 50})
+        self.assertGreater(projects["frame"]["h"], before["h"])
+        self.assertIn("object.measure", {c["args"][0] for c in self.log("easl")})
+
+    def test_growth_pushes_the_tiles_below_it_in_its_column_down(self):
+        self.put(self.seat, "panels/plan.html", "<p>Plan</p>")
+        self.put(self.seat, "panels/plan.json", json.dumps({"group": "you"}))
+        self.board_cli()
+        done = self.frame("mc/done")
+        items = [{"id": f"i{n}", "title": f"Item {n}", "body": "A longer body " * 8} for n in range(12)]
+        self.put(self.seat, "todo.json", json.dumps({"items": items}))
+        out = self.board_cli()
+        self.assertIn("mc/todo\tupdated\n", out)
+        self.assertTrue(out.endswith("mc/panel/assistant/plan\tmoved down\nlayout.check\tclean\n"), out)
+        todo = self.frame("mc/todo")
+        self.assertEqual(self.frame("mc/panel/assistant/plan")["y"], todo["y"] + todo["h"] + 40)
+        self.assertEqual(self.frame("mc/done"), done)
+
+    def test_growth_leaves_an_overlap_the_operator_made(self):
+        self.put(self.seat, "panels/plan.html", "<p>Plan</p>")
+        self.put(self.seat, "panels/plan.json", json.dumps({"group": "you"}))
+        self.board_cli()
+        todo = self.frame("mc/todo")
+        self.edit("brd_a", "mc/panel/assistant/plan", frame={"y": todo["y"] + 20})
+        items = [{"id": f"i{n}", "title": f"Item {n}", "body": "A longer body " * 8} for n in range(12)]
+        self.put(self.seat, "todo.json", json.dumps({"items": items}))
+        out = self.board_cli()
+        self.assertNotIn("moved down", out)
+        self.assertEqual(self.frame("mc/panel/assistant/plan")["y"], todo["y"] + 20)
+
+    def test_a_recreated_region_goes_to_its_column_below_what_is_there(self):
+        self.put(self.seat, "panels/health.html", "<p>Health</p>")
+        self.board_cli()
+        self.drop("brd_a", "mc/done")
+        health = self.frame("mc/panel/assistant/health")
+        below = health["y"] + health["h"] + 40
+        self.add("brd_a", self.tile("obj_n", "note", health["x"], below, 600, 300, markdown="mine"))
+        out = self.board_cli()
+        self.assertIn("mc/done\tcreated\n", out)
+        self.assertTrue(out.endswith("layout.check\tclean\n"), out)
+        done = self.frame("mc/done")
+        self.assertEqual((done["x"], done["y"], done["w"]), (health["x"], below + 300 + 40, 560))
+
+    def test_an_unchanged_draw_reports_an_operator_overlap_without_moving_it(self):
+        self.board_cli()
+        strip = self.obj("brd_a", "mc/strip")
+        self.edit("brd_a", "mc/done", frame={"x": strip["frame"]["x"], "y": strip["frame"]["y"] + 10})
+        frames = {k: self.frame(k) for k in REGIONS}
+        out = self.board_cli()
+        self.assertTrue(out.startswith(UNCHANGED + "layout.check\t{\"overlaps\": [["), out)
+        self.assertIn(f'"{strip["id"]}", "{self.obj("brd_a", "mc/done")["id"]}"', out)
+        self.assertEqual({k: self.frame(k) for k in REGIONS}, frames)
 
     def test_without_an_app_heights_are_estimated_and_the_draw_succeeds(self):
         (self.stubs / "no-app").touch()
         self.assertEqual(self.board_cli(), CREATED + "heights\testimated: no easl app is attached to measure the pages\n"
                          "layout.check\tclean\n")
-        summary, index = self.obj("brd_a", "mc/summary")["frame"], self.obj("brd_a", "mc/questions")["frame"]
-        self.assertEqual(index["y"], summary["y"] + summary["h"] + 40)
+        strip, todo = self.frame("mc/strip"), self.frame("mc/todo")
+        self.assertEqual(todo["y"], strip["y"] + strip["h"] + 40)
+
+    def test_an_unreadable_lanes_dir_is_a_problem_for_that_seat_only(self):
+        lanes = self.seat / "state" / "lanes"
+        lanes.mkdir()
+        lanes.chmod(0)
+        self.addCleanup(lanes.chmod, 0o755)
+        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tStill read\ttodo\t-\t-\t-\n")
+        assistant = self.snapshot()["assistant"]
+        self.assertEqual((assistant["lanes"], [p["source"] for p in assistant["errors"]]), (None, ["lanes", "status.json"]))
+        self.assertEqual([t["id"] for t in assistant["tasks"]], ["t1"])
+
+    def test_a_dangling_lane_record_is_a_problem_not_a_crash(self):
+        self.lane(self.seat, "ok-1", "running", [{"run": 1, "start": "2026-10-14T00:00:00Z"}], host="elsewhere")
+        (self.seat / "state" / "lanes" / "lost-1").mkdir()
+        (self.seat / "state" / "lanes" / "lost-1" / "lane.json").symlink_to(self.root / "nowhere.json")
+        assistant = self.snapshot()["assistant"]
+        self.assertEqual([lane["id"] for lane in assistant["lanes"]], ["ok-1"])
+        self.assertEqual([p["source"] for p in assistant["errors"]], ["lanes/lost-1/lane.json", "status.json"])
+
+    def test_a_pr_cell_that_is_not_a_github_url_is_text_not_a_link(self):
+        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tOdd\ttodo\t-\tjavascript:window.bad=2\t-\n")
+        self.board_cli()
+        projects = self.html("mc/project/assistant")
+        self.assertNotIn('href="javascript:', projects)
+        self.assertIn('javascript:window.bad=2 <span class="inline-block rounded px-1.5 py-0.5 text-xs bg-muted text-warn '
+                      'font-semibold">not a GitHub PR URL</span>', projects)
 
     def test_a_remote_seat_shows_counts_and_ids_but_no_content(self):
         remote = self.home / "sample-app" / "seat"
         self.put(remote, "board.json", json.dumps({"host": "box", "board": "brd_l", "tile": "obj_lt"}))
         self.put(remote, "tasks.tsv", HEADER + "L-1\tbilling\tSECRET-TASK\ttodo\t-\thttps://github.com/l/app/pull/3\t-\n")
         self.put(remote, "intake.md", "- [ ] 2026-10-13T10:00Z slack: SECRET-INTAKE\n- [x] 2026-10-12T10:00Z slack: done\n")
-        self.put(remote, "goal.md", "SECRET-GOAL\n")
+        self.status(remote, status="active", what="SECRET-WHAT", status_line="SECRET-LINE", repos=["l/app"],
+                    risks=["SECRET-RISK"], in_flight=[{"kind": "agent", "ref": "SECRET-AGENT", "state": "working"}])
+        self.put(remote, "panels/notes.html", "<p>SECRET-PANEL</p>")
         self.lane(remote, "l-fix-1", "exited", [{"run": 1, "start": "2026-10-14T00:00:00Z", "exit": 0,
-                                                 "end": "2026-10-14T00:10:00Z"}], final="SECRET-ANSWER\n")
+                                                 "end": "2026-10-14T00:10:00Z", "cost_usd": 0.3}], final="SECRET-ANSWER\n")
         (self.instance / "remote-seats").write_text("# name, ssh target, seat dir\nsample-app twaldin@work sample-app/seat\n")
-        (self.stubs / "pr-list.json").write_text(json.dumps([{
-            "number": 3, "url": "https://github.com/l/app/pull/3", "title": "SECRET-PR", "state": "OPEN", "isDraft": True,
-            "headRefName": "x", "reviewDecision": "", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
-            "statusCheckRollup": [], "mergedAt": None}]))
+        self.prs("l/app", [pr(3, "l/app", title="SECRET-PR", isDraft=True)])
+        self.api({"repos/l/app/deployments": [{"id": 5, "environment": "SECRET-ENV", "production_environment": True,
+                                               "created_at": iso(1), "sha": "SECRET-SHA"}],
+                  "repos/l/app/deployments/5/statuses": [{"state": "success", "log_url": "https://ci.example/SECRET"}]})
         self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600)],
                      "brd_l": [self.tile("obj_lq", "question", 0, 0, question="SECRET-QUESTION?", status="open",
                                          options=[{"id": "a", "label": "SECRET-OPTION"}], asker="SECRET-ASKER")]}, [AGENT])
         printed = self.board_cli("--print")
-        sample-app = {s["name"]: s for s in json.loads(printed)["seats"]}["sample-app"]
-        self.assertEqual({k: sample-app[k] for k in ("host", "remote", "redacted", "path", "goal", "board")},
-                         {"host": "twaldin@work", "remote": True, "redacted": True, "path": None, "goal": None,
-                          "board": {"host": "box", "board": "brd_l", "tile": "obj_lt"}})
+        snap = json.loads(printed)
+        sample-app = {s["name"]: s for s in snap["seats"]}["sample-app"]
+        self.assertEqual({k: sample-app[k] for k in ("host", "remote", "redacted", "path", "board", "status_file", "panels")},
+                         {"host": "twaldin@work", "remote": True, "redacted": True, "path": None, "status_file": "ok",
+                          "board": {"host": "box", "board": "brd_l", "tile": "obj_lt"}, "panels": []})
+        self.assertEqual({k: v for k, v in sample-app["status"].items() if v}, {"status": "active"})
         self.assertEqual(sample-app["tasks"], [{"id": "L-1", "effort": None, "title": None, "state": "todo", "lane": None,
                                            "pr": "https://github.com/l/app/pull/3", "updated": None, "row": 1}])
         self.assertEqual(sample-app["intake"], [{"at": None, "source": None, "text": None, "line": None}])
         self.assertEqual([(q["id"], q["question"], q["seat"]) for q in sample-app["questions"]], [("obj_lq", None, "sample-app")])
-        self.assertEqual([(lane["id"], lane["state"], lane["answer_tail"]) for lane in sample-app["lanes"]], [("l-fix-1", "done", None)])
+        self.assertEqual([(lane["id"], lane["state"], lane["answer_tail"]) for lane in sample-app["lanes"]],
+                         [("l-fix-1", "done", None)])
         self.assertEqual(sample-app["health"], {"state": "missing", "kind": None, "name": None, "live": None, "open": None, "detail": None})
-        self.assertEqual(json.loads(printed)["prs"]["https://github.com/l/app/pull/3"]["title"], None)
-        self.assertEqual(self.board_cli(), CREATED + "layout.check\tclean\n")
+        self.assertEqual(snap["prs"]["https://github.com/l/app/pull/3"]["title"], None)
+        self.assertEqual([{k: v for k, v in d.items() if k != "at"} for d in snap["deploys"]],
+                         [{"repo": "l/app", "kind": "deploy", "name": None, "sha": None, "state": "success", "url": None}])
+        self.assertEqual(self.board_cli(), created("sample-app") + "layout.check\tclean\n")
         drawn = json.dumps(self.boards()["brd_a"])
-        for secret in ("SECRET-TASK", "SECRET-INTAKE", "SECRET-GOAL", "SECRET-ANSWER", "SECRET-PR", "SECRET-QUESTION",
-                       "SECRET-OPTION", "SECRET-ASKER"):
+        for secret in ("SECRET-TASK", "SECRET-INTAKE", "SECRET-WHAT", "SECRET-LINE", "SECRET-RISK", "SECRET-AGENT",
+                       "SECRET-PANEL", "SECRET-ANSWER", "SECRET-PR", "SECRET-ENV", "SECRET-SHA", "SECRET-QUESTION",
+                       "SECRET-OPTION", "SECRET-ASKER", "ci.example"):
             self.assertNotIn(secret, printed)
             self.assertNotIn(secret, drawn)
-        self.assertIn('<span class="font-mono">sample-app</span>: 1 open on brd_l@box (kept there)', self.html("mc/questions"))
-        queues = self.html("mc/queues")
-        self.assertIn("<div>Unhandled intake: 1 items (kept on twaldin@work)</div>", queues)
-        self.assertIn('open the board <span class="font-mono">brd_l</span> on box.', queues)
-        self.assertIn('<a class="underline" href="https://github.com/l/app/pull/3">PR #3</a>', queues)
+        self.assertIn('sample-app: 1 open on brd_l@box (kept there)', self.html("mc/todo"))
+        card = self.card("sample-app")
+        self.assertIn('Content stays on twaldin@work: open the board <span class="font-mono">brd_l</span> on box.', card)
+        self.assertEqual(self.stages("sample-app"), [("backlog", "0"), ("todo", "1"), ("build", "0"), ("review", "1"),
+                                                ("merged", "0"), ("deployed", "1")])
+        self.assertIn('<span class="inline-block rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">'
+                      '1 unhandled intake</span>', card)
         self.assertEqual([c["args"] for c in self.log("ssh")], 2 * [["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                                                                    "twaldin@work", "python3 - board --print --redact --seat sample-app/seat"]])
 
@@ -460,30 +925,18 @@ class Board(Sandbox):
         for shown in (printed, json.dumps(self.boards()["brd_a"])):
             self.assertNotIn("SECRET-GH-ERROR", shown)
             self.assertNotIn(str(remote), shown)
+        self.assertEqual(self.stages("sample-app")[3:], [("review", "?"), ("merged", "?"), ("deployed", "?")])
 
     def test_an_unreachable_remote_seat_shows_its_error_not_zeros(self):
         (self.instance / "remote-seats").write_text("sample-app twaldin@work sample-app/missing\n")
         sample-app = {s["name"]: s for s in json.loads(self.board_cli("--print"))["seats"]}["sample-app"]
-        self.assertEqual({k: sample-app[k] for k in ("lanes", "questions", "tasks", "intake", "errors")}, {
-            "lanes": None, "questions": None, "tasks": None, "intake": None,
+        self.assertEqual({k: sample-app[k] for k in ("lanes", "questions", "tasks", "intake", "status", "panels", "errors")}, {
+            "lanes": None, "questions": None, "tasks": None, "intake": None, "status": None, "panels": None,
             "errors": [{"source": "ssh twaldin@work", "error": "no snapshot (ssh or tstack failed); run tstack board "
                         "--print --seat sample-app/missing on twaldin@work to see why"}]})
         self.board_cli()
         self.assertNotIn(str(self.home / "sample-app"), json.dumps(self.boards()["brd_a"]))
-        self.assertIn('<div class="text-xs text-warn">1 tasks.tsv unreadable</div>', self.html("mc/summary"))
-        self.assertIn('<div class="text-warn">unreachable; see Problems in Mission control.</div>', self.html("mc/queues"))
-
-    def test_choices_and_notes_left_on_the_board_are_printed_until_tasks_reflect_them(self):
-        rows = [("t1", "todo"), ("t2", "todo"), ("t3", "todo"), ("t4", "todo"), ("t5", "cancelled")]
-        tasks = self.put(self.seat, "tasks.tsv", HEADER + "".join(f"{i}\t-\tTask {i}\t{s}\t-\t-\t-\n" for i, s in rows))
-        self.board_cli()
-        state = {"choice:assistant:t1": "next", "choice:assistant:t4": "next", "choice:assistant:t2": "drop",
-                 "choice:assistant:t5": "drop", "choice:assistant:t3": None, "note:assistant": "Ship t4 first",
-                 "filter:seat": "assistant"}
-        self.edit("brd_a", "mc/queues", props={"state": state})
-        tasks.write_text(tasks.read_text() + "t6\t-\tTask t6\ttodo\t-\t-\t-\n")
-        self.assertEqual(self.board_cli(), "mc/summary\tupdated\nmc/questions\tunchanged\nmc/lanes\tunchanged\n"
-                         "mc/queues\tupdated\nmc/landed\tunchanged\nlayout.check\tclean\n"
-                         'choice\tassistant\tt2\tdrop\nchoice\tassistant\tt4\tnext\nnote\tassistant\t"Ship t4 first"\n')
-        self.assertEqual(self.obj("brd_a", "mc/queues")["props"]["state"], state)
-        self.assertIn('<select data-choice="assistant:t4"', self.html("mc/queues"))
+        self.assertEqual((self.count("mc/strip", "questions"), self.count("mc/strip", "running")), ("≥0", "≥0"))
+        self.assertIn('<div class="text-xs text-warn">1 board(s) unreadable</div>', self.html("mc/strip"))
+        self.assertIn('<p class="text-warn">unreachable; see Problems in Mission control.</p>', self.card("sample-app"))
+        self.assertEqual({n for _, n in self.stages("sample-app")}, {"?"})
