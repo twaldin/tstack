@@ -3,6 +3,7 @@
 
 setup  links skills, agent types and bins; writes the update units and ~/.omp/agent/AGENTS.md; installs orch.
 update git pull --ff-only on the engine and instance, then setup.
+commit pushes cwd/state and any --path paths through a private index, then safely refreshes local main.
 board  draws mission control on the seat's easl board as keyed HTML tiles: mc/strip (counts and problems),
        mc/project/<seat> (a card and a six-stage pipeline per project), mc/todo (the operator's to-do and every open
        question), mc/done (merged and deployed, last 7 days) and mc/panel/<seat>/<id> (the panels seats write).
@@ -17,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
+import fcntl
 import html as htmlib
 import json
 import os
@@ -24,8 +27,10 @@ import re
 import shlex
 import shutil
 import socket
+import stat as statlib
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
@@ -172,6 +177,288 @@ def update(name: str) -> int:
     setup_run = subprocess.run([sys.executable, str(ENGINE / "bin" / "tstack"), "setup", "--machine", name,
                                 "--instance", str(INSTANCE)])
     return setup_run.returncode or code
+
+
+@dataclass(frozen=True)
+class Change:
+    path: str
+    old_mode: str
+    new_mode: str
+    old_sha: str
+    new_sha: str
+
+
+def commit_git(root: Path, *args: str, env=None, stdin: bytes | None = None, check=True):
+    result = subprocess.run(["git", "-C", str(root), *args], input=stdin, capture_output=True,
+                            env={**os.environ, **env} if env is not None else None)
+    if check:
+        result.check_returncode()
+    if not result.returncode and result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+        sys.stderr.buffer.flush()
+    return result
+
+
+def commit_rev(root: Path, *args: str) -> str:
+    return os.fsdecode(commit_git(root, *args).stdout).rstrip("\n")
+
+
+def commit_fetch(root: Path, ref: str) -> str:
+    commit_git(root, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin",
+               f"+refs/heads/main:{ref}")
+    return commit_rev(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+
+
+def commit_ancestor(root: Path, old: str, new: str) -> bool:
+    result = commit_git(root, "merge-base", "--is-ancestor", old, new, check=False)
+    if result.returncode not in (0, 1):
+        result.check_returncode()
+    return result.returncode == 0
+
+
+def commit_changes(root: Path, old: str, new: str) -> list[Change]:
+    records = commit_git(root, "diff-tree", "-r", "-z", "--no-renames", "--no-abbrev",
+                         "--no-commit-id", old, new).stdout.split(b"\0")
+    changes = []
+    for header, path in zip(records[::2], records[1::2]):
+        old_mode, new_mode, old_sha, new_sha, _ = header.split()
+        changes.append(Change(os.fsdecode(path), old_mode[1:].decode(), new_mode.decode(),
+                              old_sha.decode(), new_sha.decode()))
+    return changes
+
+
+def commit_push_moved(result, sha: str) -> bool:
+    for line in result.stdout.splitlines():
+        fields = line.split(b"\t", 2)
+        if len(fields) != 3 or fields[:2] != [b"!", f"{sha}:refs/heads/main".encode()]:
+            continue
+        summary = fields[2]
+        if summary in (b"[rejected] (fetch first)", b"[rejected] (non-fast-forward)"):
+            return True
+        if summary.startswith(b"[remote rejected]"):
+            return (summary == b"[remote rejected] (failed to update ref)"
+                    or re.search(rb"cannot lock ref[^\n]*expected", summary + result.stderr) is not None)
+    return False
+
+
+def commit_file_version(entry: os.stat_result | None):
+    if entry is None:
+        return None
+    return entry.st_dev, entry.st_ino, entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns
+
+
+def commit_sync_path(root: Path, change: Change, prune: set[str]) -> str:
+    supported = {"000000", "100644", "100755", "120000"}
+    if change.old_mode not in supported or change.new_mode not in supported:
+        return "unsupported gitlink" if "160000" in (change.old_mode, change.new_mode) else "unsupported type"
+    parts, fds, temporary = change.path.split("/"), [], None
+    old = (change.old_mode, change.old_sha) if change.old_mode != "000000" else ("000000", "")
+    new = (change.new_mode, change.new_sha) if change.new_mode != "000000" else ("000000", "")
+    try:
+        fds.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        for part in parts[:-1]:
+            try:
+                fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
+            except FileNotFoundError:
+                break
+            except OSError as error:
+                if error.errno not in (errno.ENOTDIR, errno.ELOOP):
+                    raise
+                entry = os.stat(part, dir_fd=fds[-1], follow_symlinks=False)
+                return "symlink parent" if statlib.S_ISLNK(entry.st_mode) else "non-directory parent"
+        observed, current = None, ("000000", "")
+        if len(fds) == len(parts):
+            try:
+                observed = os.stat(parts[-1], dir_fd=fds[-1], follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            if observed is not None:
+                if statlib.S_ISREG(observed.st_mode):
+                    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fds[-1])
+                    with os.fdopen(fd, "rb") as source:
+                        opened = os.fstat(source.fileno())
+                        if not statlib.S_ISREG(opened.st_mode) or commit_file_version(opened) != commit_file_version(observed):
+                            return "local edit"
+                        data = source.read()
+                    mode = "100755" if observed.st_mode & statlib.S_IXUSR else "100644"
+                    sha = commit_git(root, "hash-object", "--stdin", f"--path={change.path}", stdin=data)
+                    current = mode, sha.stdout.decode().strip()
+                elif statlib.S_ISLNK(observed.st_mode):
+                    data = os.fsencode(os.readlink(parts[-1], dir_fd=fds[-1]))
+                    sha = commit_git(root, "hash-object", "--stdin", stdin=data)
+                    current = "120000", sha.stdout.decode().strip()
+                else:
+                    current = None
+        if current == new and change.new_mode != "000000":
+            return "already current"
+        if current not in (old, new):
+            return "local edit"
+        if change.new_mode == "000000":
+            if current != new:
+                latest = os.stat(parts[-1], dir_fd=fds[-1], follow_symlinks=False)
+                if commit_file_version(latest) != commit_file_version(observed):
+                    return "local edit"
+                os.unlink(parts[-1], dir_fd=fds[-1])
+            for depth in range(len(fds) - 1, 0, -1):
+                if "/".join(parts[:depth]) not in prune:
+                    break
+                try:
+                    os.rmdir(parts[depth - 1], dir_fd=fds[depth - 1])
+                except OSError as error:
+                    if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                        break
+                    raise
+            return "already current" if current == new else ""
+        data = commit_git(root, "cat-file", *(
+            ("blob", change.new_sha) if change.new_mode == "120000"
+            else ("--filters", f"--path={change.path}", change.new_sha))).stdout
+        for part in parts[len(fds) - 1:-1]:
+            try:
+                os.mkdir(part, dir_fd=fds[-1])
+            except FileExistsError:
+                pass
+            fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
+        candidate = ".tstack-" + os.urandom(12).hex()
+        if change.new_mode == "120000":
+            os.symlink(os.fsdecode(data), candidate, dir_fd=fds[-1])
+            temporary = candidate
+        else:
+            permissions = 0o777 if change.new_mode == "100755" else 0o666
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, permissions, dir_fd=fds[-1])
+            temporary = candidate
+            with os.fdopen(fd, "wb") as target:
+                target.write(data)
+        try:
+            latest = os.stat(parts[-1], dir_fd=fds[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            latest = None
+        if commit_file_version(latest) != commit_file_version(observed):
+            return "local edit"
+        os.replace(temporary, parts[-1], src_dir_fd=fds[-1], dst_dir_fd=fds[-1])
+        temporary = None
+        return ""
+    except OSError as error:
+        raise Fail(f"{change.path}: {error}") from error
+    finally:
+        if temporary is not None and fds:
+            try:
+                os.unlink(temporary, dir_fd=fds[-1])
+            except FileNotFoundError:
+                pass
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def commit_sync(root: Path, target: str) -> None:
+    common = Path(commit_rev(root, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = root / common
+    fd = os.open(common / "tstack-sync.flock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        refs = commit_rev(root, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main")
+        old = next((line.split()[1] for line in refs.splitlines() if line.startswith("refs/heads/main ")), None)
+        if old is None:
+            print("skipped main: no local main", flush=True)
+            return
+        if old == target:
+            return
+        if not commit_ancestor(root, old, target):
+            reason = "local commits beyond origin tip" if commit_ancestor(root, target, old) else "unpushed local commits"
+            print(f"skipped main: {reason}", flush=True)
+            return
+        head = commit_git(root, "symbolic-ref", "-q", "HEAD", check=False)
+        if head.returncode not in (0, 1):
+            head.check_returncode()
+        if head.stdout.rstrip(b"\n") == b"refs/heads/main":
+            changes = sorted(commit_changes(root, old, target), key=lambda c: (c.new_mode != "000000", c.path))
+            replacements = {c.path for c in changes if c.new_mode != "000000"}
+            prune = set()
+            for change in changes:
+                if change.new_mode == "000000":
+                    parents = change.path.split("/")[:-1]
+                    for depth in range(1, len(parents) + 1):
+                        if "/".join(parents[:depth]) in replacements:
+                            prune.update("/".join(parents[:n]) for n in range(depth, len(parents) + 1))
+            entries = b"".join(f"{c.new_mode} {c.new_sha}\t".encode() + os.fsencode(c.path) + b"\0"
+                               for c in changes)
+            if entries:
+                commit_git(root, "update-index", "-z", "--index-info", stdin=entries)
+            for change in changes:
+                reason = ("state" if "state" in change.path.split("/")
+                          else commit_sync_path(root, change, prune))
+                print(f"skipped {change.path}: {reason}" if reason else f"synced {change.path}", flush=True)
+        else:
+            print("skipped checkout: HEAD is not main", flush=True)
+        # A failed refresh leaves main at the old tip.
+        commit_git(root, "update-ref", "-m", "tstack commit: fast-forward", "refs/heads/main", target, old)
+        print(f"main {old}..{target}", flush=True)
+
+
+def commit(message: str, paths: list[str], max_size: int) -> int:
+    root = Path(commit_rev(Path.cwd(), "rev-parse", "--show-toplevel"))
+    prefix = commit_rev(Path.cwd(), "rev-parse", "--show-prefix")
+    specs = [prefix + "state", *paths]
+    limit = "1MB" if max_size == 1048576 else f"{max_size} bytes"
+    with tempfile.TemporaryDirectory(prefix="tstack-commit-") as private:
+        ref = f"refs/tstack/commit/{Path(private).name}"
+        env = {"GIT_INDEX_FILE": str(Path(private) / "index")}
+        try:
+            base = commit_fetch(root, ref)
+            for attempt in range(1, 4):
+                commit_git(root, "read-tree", base, env=env)
+                commit_git(root, "--literal-pathspecs", "add", "-A", "--", *specs, env=env)
+                tree = commit_rev(root, "rev-parse", f"{base}^{{tree}}")
+                built = commit_git(root, "write-tree", env=env).stdout.decode().strip()
+                files = [change for change in commit_changes(root, base, built)
+                         if change.new_mode in ("100644", "100755", "120000")]
+                if files:
+                    sizes = commit_git(root, "cat-file", "--batch-check=%(objectsize)",
+                                       stdin="".join(f"{change.new_sha}\n" for change in files).encode())
+                    restore = []
+                    for change, size in zip(files, map(int, sizes.stdout.splitlines())):
+                        if size > max_size:
+                            print(f"skipped >{limit}: {change.path} ({size} bytes)", flush=True)
+                            restore.append(f"{change.old_mode} {change.old_sha}\t".encode()
+                                           + os.fsencode(change.path) + b"\0")
+                    if restore:
+                        commit_git(root, "update-index", "-z", "--index-info", stdin=b"".join(restore), env=env)
+                        built = commit_git(root, "write-tree", env=env).stdout.decode().strip()
+                if built == tree:
+                    commit_sync(root, base)
+                    print("tstack commit: nothing to commit", flush=True)
+                    return 0
+                sha = commit_rev(root, "commit-tree", built, "-p", base, "-m", message)
+                pushed = commit_git(root, "push", "--porcelain", "origin", f"{sha}:refs/heads/main", check=False)
+                target = sha
+                if pushed.returncode:
+                    if not commit_push_moved(pushed, sha):
+                        pushed.check_returncode()
+                    tip = commit_fetch(root, ref)
+                    if tip == base:
+                        pushed.check_returncode()
+                    if not commit_ancestor(root, sha, tip):
+                        if attempt == 3:
+                            pushed.check_returncode()
+                        base = tip
+                        print(f"retry {attempt + 1}/3: origin/main moved", flush=True)
+                        continue
+                    target = tip
+                for change in commit_changes(root, base, sha):
+                    print(f"committed {change.path}", flush=True)
+                print(f"pushed {sha}", flush=True)
+                commit_sync(root, target)
+                print(f"tstack commit: pushed {sha}", flush=True)
+                return 0
+        finally:
+            cleanup = commit_git(root, "update-ref", "-d", ref, check=False)
+            if cleanup.returncode:
+                if sys.exc_info()[0] is None:
+                    cleanup.check_returncode()
+                sys.stdout.buffer.write(cleanup.stdout)
+                sys.stdout.buffer.flush()
+                sys.stderr.buffer.write(cleanup.stderr)
+                sys.stderr.buffer.flush()
 
 
 EASL_APP = "/Applications/easl.app/Contents/Resources/bin"
@@ -2382,6 +2669,14 @@ def main(argv) -> int:
     sub = top.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup", parents=[common])
     sub.add_parser("update", parents=[common])
+    text = ("Push cwd/state and any additional repo-root-relative paths to origin main using a private index. "
+            "Retry push races, fast-forward local main when safe, and refresh unchanged non-state files. "
+            "Never rewrite state files, stash, check out, reset or rebase.")
+    p = sub.add_parser("commit", help=text, description=text)
+    p.add_argument("message", help="commit message")
+    p.add_argument("--path", action="append", default=[], help="another literal repo-root-relative path to commit")
+    p.add_argument("--max-size", type=int, default=1048576, metavar="BYTES",
+                   help="skip added or changed files larger than this many bytes (default: 1048576, 1 MiB)")
     text = ("Draw mission control on the seat's easl board as keyed HTML tiles: mc/strip (counts and problems), "
             "mc/project/<seat> per project (a card and pipeline), mc/todo (the to-do and open questions), mc/done (merged and "
             "deployed, 7 days) and mc/panel/<seat>/<id> per panel. Reads each seat's state/status.json, tasks.tsv, "
@@ -2400,6 +2695,8 @@ def main(argv) -> int:
     p.add_argument("--redact", action="store_true",
                    help="keep only counts, ids, states and PR links (how remote seats are read)")
     a = top.parse_args(argv)
+    if a.cmd == "commit":
+        return commit(a.message, a.path, a.max_size)
     if a.instance:
         INSTANCE = Path(a.instance).expanduser().resolve()
     if a.machine:
@@ -2414,6 +2711,12 @@ def main(argv) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
+    except subprocess.CalledProcessError as error:
+        sys.stdout.buffer.write(error.stdout or b"")
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(error.stderr or b"")
+        sys.stderr.buffer.flush()
+        sys.exit(error.returncode)
     except Fail as error:
         sys.exit(f"tstack: {error}")
     except FileNotFoundError as error:

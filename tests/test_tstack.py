@@ -3,6 +3,10 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 from support import CODE, Sandbox, git
@@ -93,6 +97,454 @@ class Setup(Sandbox):
         self.assertTrue(result.stdout.startswith(f"engine: pull failed at {engine}: "))
         self.assertIn(f"\ninstance: {old}..{new}\n", result.stdout)
         self.assertEqual(os.readlink(self.home / ".omp/agent/skills/new"), str(self.instance / "skills" / "new"))
+
+
+class Commit(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.instance, self.remote = self.home / "agents", self.root / "agents.git"
+        shutil.rmtree(self.instance)
+        self.clone(self.remote, self.instance, {
+            ".gitignore": "*.ignored\n",
+            "AGENTS.md": "old instructions\n",
+            "orders.md": "old orders\n",
+            "staged.md": "old staged\n",
+            "assistant/state/status.md": "old status\n",
+            "assistant/state/lanes/live/events.jsonl": "before\n",
+            "projects/other/state/status.md": "old other state\n",
+            "machines/box/config": "old config\n",
+        })
+        self.peer = self.root / "peer"
+        git(self.root, "clone", "--quiet", str(self.remote), str(self.peer))
+        for repo in (self.instance, self.peer):
+            git(repo, "config", "user.name", "Commit Test")
+            git(repo, "config", "user.email", "commit@example.invalid")
+
+    def put(self, name, text, repo=None):
+        path = (repo or self.instance) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def upstream(self, files):
+        for name, text in files.items():
+            self.put(name, text, self.peer)
+        git(self.peer, "add", "-A")
+        git(self.peer, "commit", "--quiet", "-m", "merged upstream")
+        git(self.peer, "push", "--quiet", "origin", "main")
+        return git(self.peer, "rev-parse", "HEAD")
+
+    def hook(self, name, body):
+        path = self.instance / ".git" / "hooks" / name
+        path.write_text(f"#!{sys.executable}\n" + body)
+        path.chmod(0o755)
+        return path
+
+    def assert_published(self, result, message):
+        tip = git(self.remote, "rev-parse", "main")
+        self.assertIn(f"pushed {tip}", result.stdout.splitlines())
+        self.assertEqual(git(self.remote, "log", "-1", "--format=%s", "main"), message)
+        return tip
+
+    def test_open_lane_writer_keeps_inode_and_writes_during_and_after_commit(self):
+        path = self.instance / "assistant/state/lanes/live/events.jsonl"
+        inode = path.stat().st_ino
+        self.put("assistant/state/status.md", "ready\n")
+        server = socket.socket()
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(15)
+        finished, errors = threading.Event(), []
+        self.hook("post-index-change", f"""
+import pathlib, socket
+marker = pathlib.Path({str(self.root / 'writer-hook')!r})
+if not marker.exists():
+    marker.touch()
+    with socket.create_connection({server.getsockname()!r}, timeout=15) as connection:
+        connection.sendall(b'append')
+        assert connection.recv(1) == b'1'
+""")
+        with path.open("a", buffering=1) as writer:
+            def append():
+                try:
+                    with server.accept()[0] as connection:
+                        connection.settimeout(15)
+                        self.assertEqual(connection.recv(6), b"append")
+                        writer.write("during\n")
+                        connection.sendall(b"1")
+                    if not finished.wait(60):
+                        raise AssertionError("commit did not finish")
+                    writer.write("after\n")
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=append)
+            thread.start()
+            try:
+                result = self.cli("tstack", "commit", "assistant: live writer")
+            finally:
+                finished.set()
+                thread.join(20)
+            self.assertFalse(thread.is_alive(), "writer thread did not stop")
+            if errors:
+                raise errors[0]
+            self.assertEqual(os.fstat(writer.fileno()).st_ino, inode)
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertEqual(path.read_text(), "before\nduring\nafter\n")
+        self.assert_published(result, "assistant: live writer")
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/status.md"), "ready")
+        self.assertEqual(git(self.instance, "stash", "list"), "")
+
+    def test_push_race_rebuilds_on_the_other_seats_commit(self):
+        self.put("assistant/state/status.md", "assistant update\n")
+        self.put("projects/other/state/status.md", "other seat update\n", self.peer)
+        git(self.peer, "add", "-A")
+        git(self.peer, "commit", "--quiet", "-m", "other seat")
+        peer_tip = git(self.peer, "rev-parse", "HEAD")
+        self.hook("post-index-change", f"""
+import os, pathlib, subprocess
+marker = pathlib.Path({str(self.root / 'race-hook')!r})
+if not marker.exists():
+    marker.touch()
+    env = dict(os.environ)
+    for key in ('GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE'):
+        env.pop(key, None)
+    subprocess.run(['git', '-C', {str(self.peer)!r}, 'push', '--quiet', 'origin', 'main'],
+                   env=env, check=True)
+""")
+        result = self.cli("tstack", "commit", "assistant: raced")
+        tip = self.assert_published(result, "assistant: raced")
+        self.assertEqual(git(self.remote, "rev-parse", f"{tip}^"), peer_tip)
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/status.md"), "assistant update")
+        self.assertEqual(git(self.remote, "show", "main:projects/other/state/status.md"), "other seat update")
+        self.assertIn("retry 2/3: origin/main moved", result.stdout.splitlines())
+        self.assertEqual((self.instance / "projects/other/state/status.md").read_text(), "old other state\n")
+        self.assertIn("skipped projects/other/state/status.md: state", result.stdout.splitlines())
+        self.assertEqual(git(self.instance, "rev-parse", "main"), tip)
+
+    def test_size_limit_skips_two_megabyte_files_but_publishes_small_and_boundary_files(self):
+        large = self.put("assistant/state/rows.jsonl", "x" * 2000000)
+        inode = large.stat().st_ino
+        self.put("external.bin", "x" * 2000000)
+        self.put("assistant/state/status.md", "ready\n")
+        self.put("assistant/state/boundary.bin", "b" * 1048576)
+        result = self.cli("tstack", "commit", "assistant: bounded files", "--path", "external.bin")
+        self.assert_published(result, "assistant: bounded files")
+        self.assertIn("skipped >1MB: assistant/state/rows.jsonl (2000000 bytes)", result.stdout.splitlines())
+        self.assertIn("skipped >1MB: external.bin (2000000 bytes)", result.stdout.splitlines())
+        self.assertEqual(git(self.remote, "ls-tree", "main", "assistant/state/rows.jsonl", "external.bin"), "")
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/status.md"), "ready")
+        self.assertEqual(git(self.remote, "cat-file", "-s", "main:assistant/state/boundary.bin"), "1048576")
+        self.assertEqual((large.stat().st_ino, large.stat().st_size), (inode, 2000000))
+
+    def test_size_limit_restores_oversized_changes_without_blocking_deletions(self):
+        self.put("assistant/state/status.md", "x" * 2000000)
+        (self.instance / "assistant/state/lanes/live/events.jsonl").unlink()
+        self.put("assistant/state/small.md", "small\n")
+        result = self.cli("tstack", "commit", "assistant: bounded changes")
+        self.assert_published(result, "assistant: bounded changes")
+        self.assertIn("skipped >1MB: assistant/state/status.md (2000000 bytes)", result.stdout.splitlines())
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/status.md"), "old status")
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/small.md"), "small")
+        self.assertEqual(git(self.remote, "ls-tree", "main", "assistant/state/lanes/live/events.jsonl"), "")
+        self.assertEqual((self.instance / "assistant/state/status.md").stat().st_size, 2000000)
+
+    def test_max_size_override_accepts_larger_files_and_smaller_thresholds(self):
+        self.put("assistant/state/rows.jsonl", "x" * 2000000)
+        result = self.cli("tstack", "commit", "assistant: larger limit", "--max-size", "2000000")
+        self.assert_published(result, "assistant: larger limit")
+        self.assertEqual(git(self.remote, "cat-file", "-s", "main:assistant/state/rows.jsonl"), "2000000")
+        self.put("assistant/state/over.txt", "123456")
+        self.put("assistant/state/equal.txt", "12345")
+        self.put("assistant/state/under.txt", "1234")
+        result = self.cli("tstack", "commit", "assistant: smaller limit", "--max-size", "5")
+        self.assert_published(result, "assistant: smaller limit")
+        self.assertIn("skipped >5 bytes: assistant/state/over.txt (6 bytes)", result.stdout.splitlines())
+        self.assertEqual(git(self.remote, "ls-tree", "main", "assistant/state/over.txt"), "")
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/equal.txt"), "12345")
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/under.txt"), "1234")
+        self.assertEqual(git(self.remote, "cat-file", "-s", "main:assistant/state/rows.jsonl"), "2000000")
+
+    def test_only_oversized_files_leave_origin_unchanged_and_report_nothing_to_commit(self):
+        before = git(self.remote, "rev-parse", "main")
+        self.put("assistant/state/rows.jsonl", "x" * 2000000)
+        result = self.cli("tstack", "commit", "assistant: large only")
+        self.assertEqual(result.stdout, "skipped >1MB: assistant/state/rows.jsonl (2000000 bytes)\n"
+                                       "tstack commit: nothing to commit\n")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), before)
+        self.assertEqual((self.instance / "assistant/state/rows.jsonl").stat().st_size, 2000000)
+
+    def test_nothing_to_commit_does_not_create_a_commit(self):
+        before = git(self.remote, "rev-parse", "main")
+        result = self.cli("tstack", "commit", "assistant: unchanged")
+        self.assertEqual(result.stdout, "tstack commit: nothing to commit\n")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), before)
+        self.assertEqual(git(self.instance, "status", "--porcelain"), "")
+
+    def test_nothing_to_commit_recovers_lagging_main_and_root_files(self):
+        tip = self.upstream({"AGENTS.md": "recovered instructions\n",
+                             "projects/other/state/status.md": "upstream state\n"})
+        result = self.cli("tstack", "commit", "assistant: already published")
+        self.assertIn("tstack commit: nothing to commit", result.stdout.splitlines())
+        self.assertIn("synced AGENTS.md", result.stdout.splitlines())
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "recovered instructions\n")
+        self.assertEqual((self.instance / "projects/other/state/status.md").read_text(), "old other state\n")
+        self.assertIn("skipped projects/other/state/status.md: state", result.stdout.splitlines())
+        self.assertEqual(git(self.instance, "rev-parse", "main"), tip)
+        self.assertEqual(git(self.instance, "show", ":projects/other/state/status.md"), "upstream state")
+        self.assertEqual(git(self.remote, "rev-parse", "main"), tip)
+
+    def test_state_deletions_are_published_and_removed_from_shared_index(self):
+        path = self.instance / "assistant/state/status.md"
+        path.unlink()
+        result = self.cli("tstack", "commit", "assistant: deleted")
+        self.assert_published(result, "assistant: deleted")
+        self.assertIn("committed assistant/state/status.md", result.stdout.splitlines())
+        self.assertEqual(git(self.remote, "ls-tree", "main", "assistant/state/status.md"), "")
+        self.assertEqual(git(self.instance, "ls-files", "assistant/state/status.md"), "")
+        self.assertFalse(path.exists())
+
+    def test_merged_root_file_refreshes_but_local_edit_is_preserved_and_reported(self):
+        self.upstream({"AGENTS.md": "merged instructions\n", "orders.md": "merged orders\n"})
+        self.put("orders.md", "local orders\n")
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: refresh")
+        self.assert_published(result, "assistant: refresh")
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "merged instructions\n")
+        self.assertEqual((self.instance / "orders.md").read_text(), "local orders\n")
+        self.assertEqual(git(self.instance, "show", ":orders.md"), "merged orders")
+        self.assertIn("synced AGENTS.md", result.stdout.splitlines())
+        self.assertIn("skipped orders.md: local edit", result.stdout.splitlines())
+        self.assertEqual(git(self.remote, "show", "main:orders.md"), "merged orders")
+
+    def test_unpushed_main_and_its_index_are_left_alone_and_reported(self):
+        self.put("AGENTS.md", "unpushed instructions\n")
+        git(self.instance, "commit", "--quiet", "-am", "local only")
+        local = git(self.instance, "rev-parse", "main")
+        self.put("staged.md", "staged local\n")
+        git(self.instance, "add", "staged.md")
+        index = git(self.instance, "write-tree")
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: divergent")
+        self.assert_published(result, "assistant: divergent")
+        self.assertEqual(git(self.instance, "rev-parse", "main"), local)
+        self.assertEqual(git(self.instance, "write-tree"), index)
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "unpushed instructions\n")
+        self.assertEqual(git(self.remote, "show", "main:AGENTS.md"), "old instructions")
+        self.assertIn("skipped main: unpushed local commits", result.stdout.splitlines())
+
+
+    def test_literal_paths_are_additive_ignore_rules_apply_and_other_staging_survives(self):
+        self.put("assistant/state/status.md", "ready\n")
+        self.put("assistant/state/private.ignored", "ignored\n")
+        self.put("notes[1].md", "literal brackets\n")
+        self.put("notes1.md", "not selected\n")
+        self.put("orders.md", "selected orders\n")
+        self.put("staged.md", "staged local\n")
+        git(self.instance, "add", "staged.md")
+        result = self.cli("tstack", "commit", "assistant: selected",
+                          "--path", "notes[1].md", "--path", "orders.md")
+        self.assert_published(result, "assistant: selected")
+        self.assertEqual(git(self.remote, "diff-tree", "--no-commit-id", "--name-only", "-r", "main"),
+                         "assistant/state/status.md\nnotes[1].md\norders.md")
+        self.assertEqual(git(self.remote, "show", "main:notes[1].md"), "literal brackets")
+        self.assertEqual(git(self.remote, "show", "main:orders.md"), "selected orders")
+        self.assertEqual(git(self.remote, "ls-tree", "main", "notes1.md", "assistant/state/private.ignored"), "")
+        self.assertEqual(git(self.instance, "diff", "--cached", "--name-only"), "staged.md")
+        self.assertEqual(git(self.instance, "show", ":staged.md"), "staged local")
+        self.assertEqual(git(self.remote, "show", "main:staged.md"), "old staged")
+
+    def test_pre_push_hook_failure_is_native_and_not_retried(self):
+        self.put("assistant/state/status.md", "ready\n")
+        before = git(self.remote, "rev-parse", "main")
+        attempts = self.root / "push-attempts"
+        self.hook("pre-push", f"""
+import pathlib, sys
+with pathlib.Path({str(attempts)!r}).open('a') as output:
+    output.write('attempt\\n')
+print('seat policy denied push', file=sys.stderr)
+sys.exit(23)
+""")
+        result = self.cli("tstack", "commit", "assistant: denied", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("seat policy denied push", result.stderr)
+        self.assertEqual(attempts.read_text(), "attempt\n")
+        self.assertNotIn("retry ", result.stdout)
+        self.assertEqual(git(self.remote, "rev-parse", "main"), before)
+        self.assertEqual((self.instance / "assistant/state/status.md").read_text(), "ready\n")
+
+    def test_sync_does_not_follow_a_symlink_parent(self):
+        self.upstream({"machines/box/config": "merged config\n"})
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "config").write_text("outside config\n")
+        shutil.rmtree(self.instance / "machines/box")
+        (self.instance / "machines/box").symlink_to(outside, target_is_directory=True)
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: symlink guard")
+        self.assert_published(result, "assistant: symlink guard")
+        self.assertEqual((outside / "config").read_text(), "outside config\n")
+        self.assertEqual(os.readlink(self.instance / "machines/box"), str(outside))
+        self.assertEqual(git(self.instance, "show", ":machines/box/config"), "merged config")
+        self.assertIn("skipped machines/box/config: symlink parent", result.stdout.splitlines())
+
+    def test_sync_preserves_a_local_executable_bit_change(self):
+        self.upstream({"AGENTS.md": "merged instructions\n"})
+        (self.instance / "AGENTS.md").chmod(0o755)
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: preserve mode")
+        self.assert_published(result, "assistant: preserve mode")
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "old instructions\n")
+        self.assertEqual((self.instance / "AGENTS.md").stat().st_mode & 0o777, 0o755)
+        self.assertIn("skipped AGENTS.md: local edit", result.stdout.splitlines())
+
+    def test_sync_applies_executable_and_symlink_changes_without_following_targets(self):
+        self.put("bin/tool", "#!/bin/sh\nexit 0\n", self.peer).chmod(0o755)
+        (self.peer / "instructions").symlink_to("AGENTS.md")
+        git(self.peer, "add", "-A")
+        git(self.peer, "commit", "--quiet", "-m", "merged executable and link")
+        git(self.peer, "push", "--quiet", "origin", "main")
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: types")
+        self.assert_published(result, "assistant: types")
+        self.assertEqual((self.instance / "bin/tool").read_text(), "#!/bin/sh\nexit 0\n")
+        self.assertTrue(os.access(self.instance / "bin/tool", os.X_OK))
+        self.assertEqual(os.readlink(self.instance / "instructions"), "AGENTS.md")
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "old instructions\n")
+        self.assertIn("synced bin/tool", result.stdout.splitlines())
+        self.assertIn("synced instructions", result.stdout.splitlines())
+
+    def test_sync_handles_root_deletion_and_file_directory_transitions(self):
+        (self.peer / "orders.md").unlink()
+        (self.peer / "machines/box/config").unlink()
+        (self.peer / "machines/box/config").mkdir()
+        self.put("machines/box/config/default", "nested config\n", self.peer)
+        git(self.peer, "add", "-A")
+        git(self.peer, "commit", "--quiet", "-m", "merged layout")
+        git(self.peer, "push", "--quiet", "origin", "main")
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: layout")
+        self.assert_published(result, "assistant: layout")
+        self.assertFalse((self.instance / "orders.md").exists())
+        self.assertEqual((self.instance / "machines/box/config/default").read_text(), "nested config\n")
+        self.assertEqual(git(self.instance, "ls-files", "orders.md", "machines/box/config"),
+                         "machines/box/config/default")
+        self.assertIn("synced orders.md", result.stdout.splitlines())
+        self.assertIn("synced machines/box/config/default", result.stdout.splitlines())
+
+    def test_sync_preserves_an_untracked_file_at_an_upstream_addition(self):
+        self.upstream({"new-orders.md": "upstream orders\n"})
+        self.put("new-orders.md", "untracked local orders\n")
+        self.put("assistant/state/status.md", "ready\n")
+        result = self.cli("tstack", "commit", "assistant: preserve untracked")
+        self.assert_published(result, "assistant: preserve untracked")
+        self.assertEqual((self.instance / "new-orders.md").read_text(), "untracked local orders\n")
+        self.assertEqual(git(self.instance, "show", ":new-orders.md"), "upstream orders")
+        self.assertIn("skipped new-orders.md: local edit", result.stdout.splitlines())
+
+    def test_index_lock_failure_leaves_root_files_for_the_next_sync(self):
+        old = git(self.instance, "rev-parse", "main")
+        self.upstream({"AGENTS.md": "merged instructions\n"})
+        self.put("assistant/state/status.md", "ready\n")
+        lock = self.instance / ".git/index.lock"
+        lock.touch()
+        try:
+            result = self.cli("tstack", "commit", "assistant: locked index", check=False)
+            self.assertEqual(result.returncode, 128)
+            self.assertIn("index.lock", result.stderr)
+            self.assertEqual(git(self.instance, "rev-parse", "main"), old)
+            self.assertEqual((self.instance / "AGENTS.md").read_text(), "old instructions\n")
+        finally:
+            lock.unlink()
+        self.cli("tstack", "commit", "assistant: recover index")
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "merged instructions\n")
+        self.assertEqual(git(self.instance, "rev-parse", "main"), git(self.remote, "rev-parse", "main"))
+
+    def test_refresh_io_failure_is_an_error_and_the_next_call_retries(self):
+        old = git(self.instance, "rev-parse", "main")
+        self.upstream({"AGENTS.md": "merged instructions\n"})
+        self.put("assistant/state/status.md", "ready\n")
+        permissions = self.instance.stat().st_mode & 0o777
+        self.instance.chmod(0o555)
+        try:
+            result = self.cli("tstack", "commit", "assistant: read only", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Permission denied", result.stderr)
+            self.assertEqual(git(self.instance, "rev-parse", "main"), old)
+            self.assertEqual((self.instance / "AGENTS.md").read_text(), "old instructions\n")
+        finally:
+            self.instance.chmod(permissions)
+        self.cli("tstack", "commit", "assistant: recover write")
+        self.assertEqual((self.instance / "AGENTS.md").read_text(), "merged instructions\n")
+        self.assertEqual(git(self.instance, "rev-parse", "main"), git(self.remote, "rev-parse", "main"))
+
+    def test_empty_path_is_a_native_error_not_a_whole_repo_selection(self):
+        before = git(self.remote, "rev-parse", "main")
+        self.put("assistant/state/status.md", "ready\n")
+        self.put("orders.md", "not selected\n")
+        result = self.cli("tstack", "commit", "assistant: empty path", "--path", "", check=False)
+        self.assertEqual(result.returncode, 128)
+        self.assertIn("empty string is not a valid pathspec", result.stderr)
+        self.assertEqual(git(self.remote, "rev-parse", "main"), before)
+
+    def test_two_seats_racing_in_the_shared_clone_keep_both_commits(self):
+        self.put("assistant/state/status.md", "assistant update\n")
+        self.put("projects/other/state/status.md", "other seat update\n")
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(2)
+            server.settimeout(15)
+            self.hook("post-index-change", f"""
+import os, pathlib, socket
+marker = pathlib.Path({str(self.root)!r}) / os.environ['TSTACK_TEST_CALLER']
+if not marker.exists():
+    marker.touch()
+    with socket.create_connection({server.getsockname()!r}, timeout=30) as connection:
+        connection.sendall(b'ready')
+        assert connection.recv(1) == b'1'
+""")
+            processes, connections = [], []
+            try:
+                for name, seat in (("assistant", self.seat), ("other", self.instance / "projects/other")):
+                    processes.append(subprocess.Popen(
+                        [sys.executable, str(CODE / "bin/tstack"), "commit", name + ": shared race"],
+                        cwd=seat, env={**self.env, "TSTACK_TEST_CALLER": name},
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                    connection = server.accept()[0]
+                    connections.append(connection)
+                    connection.settimeout(15)
+                    self.assertEqual(connection.recv(5), b"ready")
+                connections[0].sendall(b"1")
+                first_out, first_err = processes[0].communicate(timeout=60)
+                self.assertEqual(processes[0].returncode, 0, first_out + first_err)
+                first = git(self.remote, "rev-parse", "main")
+                connections[1].sendall(b"1")
+                second_out, second_err = processes[1].communicate(timeout=60)
+                self.assertEqual(processes[1].returncode, 0, second_out + second_err)
+            finally:
+                for connection in connections:
+                    connection.close()
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+        self.assertIn("retry 2/3: origin/main moved", second_out.splitlines())
+        self.assertEqual(git(self.remote, "rev-parse", "main^"), first)
+        self.assertEqual(git(self.remote, "show", "main:assistant/state/status.md"), "assistant update")
+        self.assertEqual(git(self.remote, "show", "main:projects/other/state/status.md"), "other seat update")
+        self.assertEqual(git(self.instance, "rev-parse", "main"), git(self.remote, "rev-parse", "main"))
+
+    def test_git_identity_failure_preserves_native_exit_status(self):
+        self.put("assistant/state/status.md", "ready\n")
+        git(self.instance, "config", "user.name", "")
+        git(self.instance, "config", "user.email", "")
+        before = git(self.remote, "rev-parse", "main")
+        result = self.cli("tstack", "commit", "assistant: missing identity", check=False)
+        self.assertEqual(result.returncode, 128)
+        self.assertIn("empty ident name", result.stderr)
+        self.assertNotIn("retry ", result.stdout)
+        self.assertEqual(git(self.remote, "rev-parse", "main"), before)
 
 
 

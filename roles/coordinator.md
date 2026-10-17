@@ -10,4 +10,5 @@ You coordinate one project from `~/agents/projects/<name>`, whose `AGENTS.md` ho
 - A lane's final answer is its report. Read it with `lane show <id>`, then resume it with `lane resume <id> "<text>"` or replace it with a fresh lane on a consolidated brief.
 - Run `tstack board` after a turn that changed lanes, questions, `state/status.json` or a panel. On the agents board it draws nothing, because the assistant's run draws your card; it prints the `choice` and `note` lines the operator left on your card. Each one is a request. A choice stays printed until `state/tasks.tsv` reflects it.
 - The assistant steers you through `state/orders.md` and `state/intake.md`. Something that cannot wait for the board goes as one line in `~/agents/assistant/state/intake.md`. You never text the operator.
-- After a turn that changed state, commit your seat's `state/` alone and push.
+- After a turn that changed state, commit and push it with `tstack commit "<name>: <what>"`.
+- Never run `git pull`, `stash`, `checkout`, `reset --hard` or `rebase` in the shared `~/agents` checkout, because lanes write there.

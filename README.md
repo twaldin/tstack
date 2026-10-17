@@ -33,6 +33,10 @@ You need git, Python 3.9 or newer, `gh` logged in, bun, omp and easl.
 
 `lane start <name> --repo <owner/repo or path> --brief <file>` makes `~/worktrees/<project>/<id>` on branch `lane/<id>` and runs `omp -p --mode json` there, under `systemd-run --user` on Linux, with `roles/lane.md` appended and the brief as the prompt. A lane's record, brief and final answer live in `<seat>/state/lanes/<id>/`. Each run's json stream, stderr and exit code live in `<seat>/state/run/lanes/<id>/`. `lane wait <id>...` exits when a run ends and prints its final answer, so a seat runs it as a background job to wake on it.
 
+## Commit seat state
+
+Run `tstack commit "<seat>: <what>"` from a seat's directory to commit its `state/` and push to `main`. Each `--path P` adds a path relative to the repo root, such as another seat's intake file. The command builds from `origin/main` in a private index, includes deletions, respects `.gitignore` and retries rejected pushes when origin moves. It skips added or changed files over 1 MiB and prints each path and staged size. `--max-size BYTES` overrides the limit. It never stashes or rewrites state files. After a push it fast-forwards local `main` when possible, refreshes only changed index entries and writes changed upstream files outside every `state/` only when they still match old `main`. It reports committed, synced and skipped paths, and leaves an unpushed local `main` alone.
+
 ## Board
 
 `tstack board` draws mission control on the seat's board as keyed HTML tiles. A status strip on top counts open questions for the operator, the projects waiting on them, the lanes and agents running now, PRs waiting on them against PRs waiting on agents, and seats that are down. Below it sit project cards, the operator's to-do with its drafts, a Done tile of what merged and deployed in the last 7 days, and the panels seats write. Every region names a project by `project` in its `status.json`, else by its seat directory's name. It writes nothing but the board and its gh caches. A failed read shows on the board as a problem, never as zero. `tstack board --print` prints what it read as JSON and draws nothing.

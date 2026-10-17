@@ -21,7 +21,8 @@ Handle what the ended job printed, then re-arm that job. After any restart, foll
 - `state/tasks.tsv` lists tasks you run yourself. `state/lanes/` changes only through `lane`.
 - `state/todo.json` is the operator's to-do, drawn as Your to-do on the agents board: `{sync: {date, title}, items: [{id, title, body, due, with[], steps[], links[{label, url}], drafts[{to, channel, text}], done}]}`. Each item is one thing only the operator can do, with numbered steps and any draft ready to paste. Keep an item's `id` stable, and set `done` once it is done.
 - Every seat keeps a `state/status.json` (README, Board). Keep yours, and keep a project's while its coordinator is stopped.
-- After a turn that changed state, commit it alone and push: `git add -- state/ && git commit -m "assistant: <what>" -- state/ && git push`.
+- After a turn that changed state, commit and push it with `tstack commit "assistant: <what>"`.
+- Never run `git pull`, `stash`, `checkout`, `reset --hard` or `rebase` in the shared `~/agents` checkout, because lanes write there.
 
 ## Work
 
