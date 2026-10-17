@@ -6,12 +6,13 @@ update git pull --ff-only on the engine and instance, then setup.
 commit pushes cwd/state and any --path paths through a private index, then safely refreshes local main.
 board  draws mission control on the seat's easl board as keyed HTML tiles: mc/strip (counts and problems),
        mc/project/<seat> (a card and a six-stage pipeline per project), mc/todo (the operator's to-do and every open
-       question), mc/done (merged and deployed, last 7 days) and mc/panel/<seat>/<id> (the panels seats write).
-       It reads each seat's state/status.json, tasks.tsv, lanes/, intake.md and panels/, the drawing seat's
-       state/todo.json, the open questions on the seats' easl boards, and from gh the PRs, production deployments
-       and releases on their repos. Then it prints the choice, note and todo-done lines left on it. The assistant
-       seat's board shows every project, the remote ones in <instance>/remote-seats included; any other seat's
-       board shows that seat.
+       question) and mc/done (merged and deployed, last 7 days), and lays the board out in horizontal bands: the
+       operator's on top, then one per project with its terminal, card, open questions, its show/<project>/<slug>
+       tiles and the objects its terminal made. It reads each seat's state/status.json, tasks.tsv, lanes/ and
+       intake.md, the drawing seat's state/todo.json, the open questions on the seats' easl boards, and from gh the
+       PRs, production deployments and releases on their repos. Then it prints the choice, note and todo-done lines
+       left on it. The assistant seat's board shows every project, the remote ones in <instance>/remote-seats
+       included; any other seat's board shows that seat.
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
-from itertools import combinations
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -523,7 +523,6 @@ STATUS_SHAPE = {
 TODO_SHAPE = {"sync": {"date": DATE, "title": str}, "items": [{
     "id": str, "title": str, "body": str, "due": str, "with": [str], "steps": [str],
     "links": [{"label": str, "url": URL}], "drafts": [{"to": str, "channel": str, "text": str}], "done": bool}]}
-PANEL_SHAPE = {"title": str, "group": str, "order": int, "width": int}
 WANTED = {str: "a string", bool: "true or false", int: "a whole number", REPO: "owner/name", URL: "an http(s) URL",
           DATE: "a YYYY-MM-DD date or ISO time"}
 
@@ -619,18 +618,6 @@ class Status:
 
 
 @dataclass
-class Panel:
-    id: str
-    seat: str
-    title: str
-    group: str
-    order: int
-    width: int
-    html: str | None
-    error: str | None
-
-
-@dataclass
 class TodoItem:
     id: str | None
     title: str | None
@@ -693,7 +680,6 @@ class Seat:
     intake: list | None = None
     status: Status | None = None
     status_file: str | None = None
-    panels: list | None = None
     errors: list = field(default_factory=list)
 
 
@@ -719,7 +705,7 @@ def load_snapshot(data: dict) -> Snapshot:
         seat = Seat(**raw)
         seat.health = Health(**raw["health"]) if raw.get("health") else None
         seat.lanes, seat.questions = many(Lane, raw["lanes"]), many(Question, raw["questions"])
-        seat.tasks, seat.intake, seat.panels = many(Task, raw["tasks"]), many(Intake, raw["intake"]), many(Panel, raw["panels"])
+        seat.tasks, seat.intake = many(Task, raw["tasks"]), many(Intake, raw["intake"])
         seat.status = Status(**raw["status"]) if raw.get("status") else None
         seat.errors = many(Problem, raw["errors"])
         seats.append(seat)
@@ -737,8 +723,6 @@ NEXT = 3
 APPLE_EPOCH = 978307200
 LEGACY = {"waiting": "waiting", "done": "done", "cancelled": "done", "stuck": "failed", "failed": "failed"}
 READ_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
-PANEL_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-PANEL_BYTES = 512 * 1024
 WEEK, FORTNIGHT = dt.timedelta(days=7), dt.timedelta(days=14)
 
 
@@ -855,52 +839,6 @@ def read_status(path: Path, problems: list) -> Status:
     return status
 
 
-def panel_meta(path: Path, problems: list) -> dict:
-    """<id>.json's fields; {} when there is none or it is broken."""
-    if not path.is_file():
-        return {}
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, ValueError) as error:
-        problems.append(one_line(error))
-        return {}
-    if not isinstance(raw, dict):
-        problems.append("not a JSON object")
-        return {}
-    return shape(raw, PANEL_SHAPE, "", problems)
-
-
-def panel_html(path: Path):
-    """(html, None), or (None, why it can't be drawn)."""
-    try:
-        if path.stat().st_size > PANEL_BYTES:
-            return None, "larger than 512 KiB"
-        text = path.read_text()
-    except (OSError, ValueError) as error:
-        return None, one_line(error)
-    return (text, None) if text.strip() else (None, "empty")
-
-
-def read_panels(folder: Path, seat: Seat) -> list:
-    """Each panels/<id>.html with its <id>.json; a page that can't be drawn has html None."""
-    panels = []
-    for page in sorted(p for p in folder.iterdir() if p.suffix == ".html") if folder.is_dir() else []:
-        if not PANEL_ID.fullmatch(page.stem):
-            seat.errors.append(Problem(f"panels/{page.name}", f"the id is not {PANEL_ID.pattern}"))
-            continue
-        problems = []
-        meta = panel_meta(page.with_suffix(".json"), problems)
-        seat.errors += [Problem(f"panels/{page.stem}.json", p) for p in problems]
-        html, error = panel_html(page)
-        if error:
-            seat.errors.append(Problem(f"panels/{page.name}", error))
-        order, width = meta.get("order"), meta.get("width")
-        panels.append(Panel(page.stem, seat.name, meta.get("title") or page.stem, meta.get("group") or "status",
-                            100 if order is None else order, 640 if width is None else min(1600, max(320, width)),
-                            html, error))
-    return panels
-
-
 def read_todo(path: Path, problems: list) -> Todo:
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
@@ -987,7 +925,6 @@ def read_seat(path: Path, here: str) -> Seat:
     else:
         seat.status_file = "missing"
         seat.errors.append(Problem("status.json", f"missing: write {status}"))
-    seat.panels = attempt(seat, "panels", lambda: read_panels(state / "panels", seat))
     return seat
 
 
@@ -1112,7 +1049,7 @@ def redact(snap: Snapshot) -> None:
     snap.errors = [Problem(p.source, hidden) for p in snap.errors]
     for seat in snap.seats:
         seat.redacted, seat.path = True, None
-        seat.errors = [Problem("panels" if p.source.startswith("panels/") else p.source, hidden) for p in seat.errors]
+        seat.errors = [Problem(p.source, hidden) for p in seat.errors]
         seat.health = seat.health and Health(seat.health.state)
         if seat.lanes is not None:
             seat.lanes = [replace(lane, task=None, repo=None, branch=None, worktree=None, brief=None, final=None,
@@ -1127,8 +1064,6 @@ def redact(snap: Snapshot) -> None:
         if seat.status:
             word = seat.status.status if seat.status.status in STATUSES else None
             seat.status = Status(**shape({"status": word}, STATUS_SHAPE, "", []))
-        if seat.panels is not None:
-            seat.panels = []
     snap.prs = {url: replace(pr, title=None, failing=[], reason=None) for url, pr in snap.prs.items()}
     snap.deploys = [replace(d, name=None, sha=None, url=None) for d in snap.deploys]
     snap.todo = None
@@ -1355,8 +1290,7 @@ class Region:
     key: str
     title: str
     width: int
-    html: str | None  # None: a panel that can't be read, whose tile stays as it is
-    column: str       # strip, left, centre or right
+    html: str
 
 
 @dataclass
@@ -1370,6 +1304,7 @@ class Stage:
 LIVE = ("running", "waiting")
 ATTENTION = ("failed", "no-answer", "gone", "unrecorded", "stopped")
 DOWN = ("shell", "missing", "unread", "unreachable", "blocked")
+STOPPED = ("done", "missing", "shell", "no board.json", "no tile")
 RUNNING_WORDS = ("running", "working", "active", "busy")
 COLOURS = ("slate", "sky", "violet", "amber", "teal", "emerald", "orange", "red")
 TONES = {"muted": "bg-muted text-muted-foreground", "warn": "bg-muted text-warn font-semibold", "ok": "bg-muted text-ok",
@@ -1550,6 +1485,15 @@ def health_label(seat: Seat) -> str:
 
 def health_tone(label: str) -> str:
     return "warn" if label in DOWN else "ok" if label in ("working", "idle", "done") else "muted"
+
+
+def collapsed(seat: Seat):
+    """Why a project band holds a one-line card: "parked", or "no coordinator" when its terminal is known to run no
+    omp; None otherwise. A health that could not be read keeps the band open."""
+    if seat.status and seat.status.status == "parked":
+        return "parked"
+    stopped = seat.health and seat.health.live is False
+    return "no coordinator" if stopped or health_label(seat) in STOPPED else None
 
 
 def page(head: str, body: str, frame: str = "") -> str:
@@ -1739,7 +1683,7 @@ def strip(snap: Snapshot) -> Region:
     body = (f'<div class="grid grid-cols-5 gap-3">{"".join(cards)}</div>{date_chips(snap, at.date())}'
             f'<details data-section="problems"{" open" if problems else ""}><summary class="cursor-pointer font-semibold">'
             f'Problems ({len(problems)})</summary><ul class="text-xs space-y-1">{listed}</ul></details>')
-    return Region("mc/strip", "Mission control", 1560, page(head, body), "strip")
+    return Region("mc/strip", "Mission control", 1560, page(head, body))
 
 
 def stages(seat: Seat, snap: Snapshot) -> list:
@@ -1934,7 +1878,8 @@ def status_warning(seat: Seat) -> str:
     return f'<p class="text-warn">status.json unreadable: {e(problem_of(seat, "status.json"))}. Fix {e(path)}</p>'
 
 
-def project_card(n: int, seat: Seat, snap: Snapshot, choices: dict) -> str:
+def project_card(n: int, seat: Seat, snap: Snapshot, choices: dict, compact: bool = False) -> str:
+    """A project's card. A compact one, on a project band, folds its work lists and note box under Details."""
     status, state, label = seat.status, seat_state(seat), health_label(seat)
     chips = [badge(state, STATUS_TONES.get(state, "muted")),
              badge(label if label.startswith("no ") else f"seat {label}", health_tone(label)),
@@ -1959,11 +1904,20 @@ def project_card(n: int, seat: Seat, snap: Snapshot, choices: dict) -> str:
                      f'{e(b.get("board"))}</span> on {e(b.get("host"))}.</p>' if b else
                      '<p class="text-warn">unreachable; see Problems in Mission control.</p>')
     else:
-        parts += [focus(seat, snap), queue(seat, snap.prs, choices), *more(seat)]
-        parts.append(f'<label class="block text-xs text-muted-foreground">Notes for {e(project_name(seat))} <textarea '
-                     f'data-note="{e(seat.name)}" rows="2" class="w-full {FIELD}"></textarea></label>')
+        detail = [focus(seat, snap), queue(seat, snap.prs, choices), *more(seat),
+                  f'<label class="block text-xs text-muted-foreground">Notes for {e(project_name(seat))} <textarea '
+                  f'data-note="{e(seat.name)}" rows="2" class="w-full {FIELD}"></textarea></label>']
+        parts += ([f'<details data-section="detail"><summary class="cursor-pointer text-xs">Details</summary>'
+                   f'<div class="space-y-2">{"".join(detail)}</div></details>'] if compact else detail)
     return (f'<section data-row data-project="{e(project_name(seat))}" data-status="{e(state)}" class="bg-card border '
             f'border-border rounded-lg p-3 space-y-2">{"".join(parts)}</section>')
+
+
+def parked_card(n: int, seat: Seat, why: str) -> str:
+    """The one-line card of a project band that is parked or has no coordinator."""
+    return (f'<section data-row data-project="{e(project_name(seat))}" data-status="{e(seat_state(seat))}" '
+            f'class="bg-card border border-border rounded-lg p-3"><div class="flex flex-wrap items-center gap-2">'
+            f'<h3 class="font-semibold">{n} · {e(project_name(seat))}</h3>{badge(why)}</div></section>')
 
 
 def project_key(seat: Seat) -> str:
@@ -1971,26 +1925,28 @@ def project_key(seat: Seat) -> str:
 
 
 def projects(snap: Snapshot, choices: dict) -> list:
-    """One tile per project, numbered in seat order. `choices` is every project tile's saved state, merged."""
-    return [Region(project_key(s), f"{n} · {project_name(s)}", 820, page("", project_card(n, s, snap, choices)),
-                   "project" if snap.scope == "all" and n > 1 else "left")
-            for n, s in enumerate(snap.seats, 1)]
+    """One tile per project, numbered in seat order: the drawing seat's full card, then each project's compact card,
+    or its one-line card while collapsed. `choices` is every project tile's saved state, merged."""
+    tiles = []
+    for n, s in enumerate(snap.seats, 1):
+        why = collapsed(s) if n > 1 else None
+        card = parked_card(n, s, why) if why else project_card(n, s, snap, choices, compact=n > 1)
+        tiles.append(Region(project_key(s), f"{n} · {project_name(s)}", LEFT_W, page("", card)))
+    return tiles
 
 
-def question_item(q: Question, board_id: str, project: str, stays: bool, beside: bool) -> str:
+def question_item(q: Question, board_id: str, project: str, stays: bool) -> str:
     here = q.board == board_id
     options = ", ".join(f"{o['id']}) {o['label']}" + (" (recommended)" if o["id"] == q.recommended else "")
                         for o in q.options or [])
     tile = f'tile <span class="font-mono">{e(q.id)}</span>'
-    where = (f"{tile}, under the terminal that asked it" if here and stays else
-             f"{tile}, beside this panel" if here and beside else tile if here else
+    where = (f"{tile}, under the terminal that asked it" if here and stays else tile if here else
              f'board <span class="font-mono">{e(q.board)}</span> on {e(q.host)}, {tile}')
     expires = local(q.expires)
     chips = [pill(e(project)), pill(f"asked {age_tag(q.asked, '?')}")]
     chips += [pill(e(f"expires {expires:%a %H:%M}"))] if expires else []
     chips += [pill(e(f"asked by {q.asker}"))] if q.asker else []
-    mark = f' data-question="{e(q.id)}"' if here and not stays else ""
-    return (f'<li data-row data-project="{e(project)}"{mark} class="space-y-1"><div class="font-semibold">{e(q.question)}</div>'
+    return (f'<li data-row data-project="{e(project)}" class="space-y-1"><div class="font-semibold">{e(q.question)}</div>'
             + (f'<div class="text-muted-foreground">{e(options)}</div>' if options else "")
             + f'<div class="flex flex-wrap gap-1">{"".join(chips)}</div><div class="text-xs">Answer on {where}.</div></li>')
 
@@ -2028,8 +1984,9 @@ def todo_item(item: TodoItem, today: dt.date, done: bool = False) -> str:
             f'<div data-body class="space-y-1">{"".join(body)}</div></li>')
 
 
-def todo_page(snap: Snapshot, board_id: str, placed: set, stay: set) -> Region:
-    """Every open question, oldest first, then the open items of todo.json; done items folded at the end."""
+def todo_page(snap: Snapshot, board_id: str, stay: set) -> Region:
+    """Every open question, oldest first, then the open items of todo.json; done items folded at the end. `stay` is the
+    questions held under the terminal that asked them."""
     today = local(snap.at).date()
     items = snap.todo.items if snap.todo else []
     open_items, done = [i for i in items if not i.done], [i for i in items if i.done]
@@ -2052,7 +2009,7 @@ def todo_page(snap: Snapshot, board_id: str, placed: set, stay: set) -> Region:
     asked = sorted((q for s in snap.seats if not s.redacted for q in s.questions or []),
                    key=lambda q: (parse_iso(q.asked) is None, q.asked or ""))
     project = names(snap)
-    entries = [question_item(q, board_id, project.get(q.seat, q.seat), q.id in stay, snap.scope != "all") for q in asked]
+    entries = [question_item(q, board_id, project.get(q.seat, q.seat), q.id in stay) for q in asked]
     for s in snap.seats:
         b = s.board or {}
         if s.questions is None:
@@ -2076,13 +2033,8 @@ def todo_page(snap: Snapshot, board_id: str, placed: set, stay: set) -> Region:
     folded_done = (f'<details data-section="done"><summary class="cursor-pointer">Done ({len(done)})</summary>'
                    f'<ol class="list-decimal pl-6 space-y-2 text-muted-foreground">'
                    f'{"".join(todo_item(i, today, True) for i in done)}</ol></details>') if done else ""
-    # The data-question ids are the placement memory: while this board's questions are unreadable, keep the old ones.
-    unread = any(s.questions is None and (s.board or {}).get("board") == board_id for s in snap.seats)
-    memory = "".join(f'<span hidden data-question="{e(i)}"></span>' for i in sorted(placed)) if unread else ""
-    body = (f'<div class="grid grid-cols-4 gap-3">{"".join(cards)}</div>' + filters() + note + listed + folded_done
-            + memory)
-    return Region("mc/todo", "Your to-do", 720, page(heading("Your to-do"), body, " border-2 border-orange-500 rounded"),
-                  "centre")
+    body = f'<div class="grid grid-cols-4 gap-3">{"".join(cards)}</div>' + filters() + note + listed + folded_done
+    return Region("mc/todo", "Your to-do", 720, page(heading("Your to-do"), body, " border-2 border-orange-500 rounded"))
 
 
 def pr_owner(snap: Snapshot, pr: PR) -> str:
@@ -2138,30 +2090,21 @@ def done_page(snap: Snapshot) -> Region:
             f'<ul>{"".join(lines[20:])}</ul></details>') if len(lines) > 20 else ""
     body = (head + filters(("project", "Project", projects), ("kind", "Kind", ("merged", "deploy", "release")))
             + f'<div class="space-y-1">{bars}</div>' + shown + rest)
-    return Region("mc/done", "Done, last 7 days", 560, page(heading("Done, last 7 days"), body), "right")
+    return Region("mc/done", "Done, last 7 days", 560, page(heading("Done, last 7 days"), body))
 
 
-def panel_region(panel: Panel, column: str) -> Region:
-    return Region(f"mc/panel/{panel.seat}/{panel.id}", panel.title, panel.width, panel.html, column)
+def regions(snap: Snapshot, board_id: str, choices: dict, stay: set) -> list:
+    """The mission-control tiles: strip, project cards in seat order, to-do, done. `choices` is the project tiles' saved
+    state; `stay`, the questions held under the terminal that asked them."""
+    return [strip(snap), *projects(snap, choices), todo_page(snap, board_id, stay), done_page(snap)]
 
 
-def regions(snap: Snapshot, board_id: str, choices: dict, placed: set, stay: set) -> list:
-    """The tiles in column order. `choices` is the project tiles' saved state; `placed`, the question ids the drawn
-    mc/todo page holds; `stay`, the questions left under the terminal that asked them."""
-    panels = [p for s in snap.seats for p in s.panels or []]
-    mine = sorted((p for p in panels if p.group == "you"), key=lambda p: (p.order, p.seat, p.id))
-    rest = sorted((p for p in panels if p.group != "you"), key=lambda p: (p.group == "docs", p.group, p.order, p.seat, p.id))
-    return ([strip(snap), *projects(snap, choices), todo_page(snap, board_id, placed, stay)]
-            + [panel_region(p, "centre") for p in mine] + [done_page(snap)] + [panel_region(p, "right") for p in rest])
+# Drawing: lay mission control and every band's objects out on the board.
 
-
-# Drawing: reconcile regions and project columns with the board.
-
-GAP, QUESTIONS, BATCH = 40, 460, 50
-COORDINATOR_WIDTH = 1000
+GAP, BATCH, HISTORY = 40, 50, 2000
+LEFT_W, SHOW_W = 1000, 4000
 NO_APP = "measured by the app"
 REGION_KEYS = ("mc/strip", "mc/todo", "mc/done")
-COLUMNS = ("left", "centre", "questions", "right")
 
 
 def mask(page_html: str) -> str:
@@ -2214,139 +2157,135 @@ def estimate(page_html: str) -> int:
     return 120 + 28 * visible.rows
 
 
-def below(frame: dict, taken: list) -> dict:
-    """`frame`, moved down past everything in `taken` it overlaps."""
-    while True:
-        hits = [o for o in taken if overlaps(frame, o)]
-        if not hits:
-            return frame
-        frame["y"] = max(o["y"] + o["h"] for o in hits) + GAP
+@dataclass
+class Band:
+    seat: Seat
+    operator: bool
+    parked: bool = False
+    terminal: str | None = None
+    digest: str | None = None
+    questions: list = field(default_factory=list)
+    show: list = field(default_factory=list)
+    owned: list = field(default_factory=list)
+    tail: list = field(default_factory=list)
+
+    @property
+    def card(self) -> str:
+        return project_key(self.seat)
+
+    def showcase(self) -> list:
+        return ([self.digest] if self.digest else []) + self.show + self.owned if self.operator else self.show
+
+    def blocks(self, dims: dict) -> list:
+        left = ([self.terminal] if self.terminal else []) + [self.card] + self.questions
+        if not self.operator:
+            return [(left, LEFT_W, LEFT_W), (self.show, SHOW_W, 0 if self.parked else SHOW_W), (self.owned, SHOW_W, 0),
+                    (self.tail, SHOW_W, 0)]
+        mc = max(dims["mc/strip"]["w"], dims["mc/todo"]["w"] + GAP + dims["mc/done"]["w"])
+        return [(left, LEFT_W, LEFT_W), (list(REGION_KEYS), mc, 0), (self.showcase(), SHOW_W, 0), (self.tail, SHOW_W, 0)]
+
+    def members(self) -> list:
+        return [i for i in (self.terminal, self.digest) if i] + self.questions + self.show + self.owned + self.tail
 
 
-def project_columns(snap: Snapshot, where: dict, board_id: str, objects: dict, own_tile) -> dict:
-    columns, claimed = {}, {own_tile}
-    if snap.scope != "all":
-        return columns
-    for seat in snap.seats[1:]:
-        members = []
-        pointer = seat.board or {}
-        terminal = pointer.get("tile")
-        if (pointer.get("board") == board_id
-                and (pointer.get("host") or snap.machine) == (where.get("host") or snap.machine)
-                and terminal not in claimed
-                and objects.get(terminal, {}).get("type") == "terminal"):
-            members.append(terminal)
-            claimed.add(terminal)
-            members += [i for i, obj in sorted(objects.items(), key=lambda item: (item[1].get("createdAt") or 0, item[0]))
-                        if obj.get("type") == "question"
-                        and read_question(obj, board_id, snap.machine, seat.name).asker == terminal
-                        and not (obj.get("props") or {}).get("archived")]
-        columns[project_key(seat)] = members
-    return columns
-
-
-def column_size(card: dict, members: list, objects: dict) -> dict:
-    frames = [card, *[frame_of(objects[i]) for i in members]]
-    return {"w": max(f["w"] for f in frames), "h": sum(f["h"] for f in frames) + GAP * (len(frames) - 1)}
-
-
-def column_grid(columns: dict, sizes: dict, objects: dict) -> dict:
-    dimensions = {key: column_size(sizes[key], members, objects) for key, members in columns.items()}
-    keys = list(columns)
-    widths = [max(COORDINATOR_WIDTH, *(dimensions[k]["w"] for k in keys[n::4])) for n in range(min(4, len(keys)))]
-    positions, y = {}, 0
-    for start in range(0, len(keys), 4):
-        row, x = keys[start:start + 4], 0
-        for n, key in enumerate(row):
-            positions[key] = {"x": x, "y": y}
-            x += widths[n] + GAP
-        y += max(dimensions[k]["h"] for k in row) + GAP
-    return {"positions": positions, "w": sum(widths) + GAP * (len(widths) - 1), "h": max(0, y - GAP)}
-
-
-def stack_columns(columns: dict, frames: dict, before: dict, objects: dict) -> dict:
-    bounds = {key: {**frames[key], **column_size(frames[key], members, objects)}
-              for key, members in columns.items() if key in frames}
-    previous = {}
-    for key in bounds:
-        if key not in before:
+def classify(snap: Snapshot, where: dict, board_id: str, objects: dict, own) -> tuple:
+    here = where.get("host") or snap.machine
+    bands, makers = [], {}
+    for n, seat in enumerate(snap.seats):
+        pointer, band = (seat.board if n else own) or {}, Band(seat, n == 0, parked=n > 0 and bool(collapsed(seat)))
+        tile = pointer.get("tile")
+        if tile and tile not in makers:
+            makers[tile] = band
+            if (pointer.get("board") == board_id and (pointer.get("host") or snap.machine) == here
+                    and objects.get(tile, {}).get("type") == "terminal"):
+                band.terminal = tile
+        bands.append(band)
+    terminals = {band.terminal: band for band in bands if band.terminal}
+    named = {}
+    for band in bands:
+        named.setdefault(band.seat.name.rsplit("/", 1)[-1], band)
+    follow = []
+    for i, obj in sorted(objects.items(), key=lambda item: (item[1].get("createdAt") or 0, item[0])):
+        props, key, kind = obj.get("props") or {}, key_of(obj) or "", obj.get("type")
+        project, _, slug = key[len("show/"):].partition("/") if key.startswith("show/") else ("", "", "")
+        open_question = kind == "question" and props.get("status") == "open"
+        asker = read_question(obj, board_id, here, "").asker if open_question else None
+        maker = makers.get((obj.get("createdBy") or {}).get("tile"))
+        if kind == "code" and props.get("followOf") in terminals:
+            follow.append(i)
+        elif kind == "terminal" or key.startswith("mc/"):
             continue
-        card, members = before[key], columns[key]
-        height, width = card["h"], card["w"]
-        if members:
-            first = frame_of(objects[members[0]])
-            if first["x"] == card["x"] and card["y"] + GAP <= first["y"] < card["y"] + height + GAP:
-                height = first["y"] - card["y"] - GAP
-        for oid in members:
-            member = frame_of(objects[oid])
-            if member["x"] != card["x"] or member["y"] != card["y"] + height + GAP:
-                break
-            height += GAP + member["h"]
-            width = max(width, member["w"])
-        previous[key] = {**card, "h": height, "w": width}
-    taken, moves = [], {}
-    owned = {i for members in columns.values() for i in members}
-    unrelated = [frame_of(obj) for i, obj in objects.items()
-                 if i not in owned and key_of(obj) not in {*columns, "mc/strip"}
-                 and not (obj.get("props") or {}).get("archived")]
-    for key in sorted(bounds, key=lambda k: ((before.get(k) or frames[k])["y"], frames[k]["x"])):
-        frame = bounds[key]
-        blockers = [bounds[k] for k in taken
-                    if key not in previous or k not in previous or not overlaps(previous[k], previous[key])]
-        if "mc/strip" in frames and (key not in previous or "mc/strip" not in before
-                                    or not overlaps(before["mc/strip"], previous[key])):
-            blockers.append(frames["mc/strip"])
-        below(frame, blockers)
-        if frame["y"] != frames[key]["y"]:
-            below(frame, blockers + unrelated)
-        frames[key]["y"] = frame["y"]
-        y = frame["y"] + frames[key]["h"] + GAP
-        for oid in columns[key]:
-            current = frame_of(objects[oid])
-            if current["x"] != frame["x"] or current["y"] != y:
-                moves[oid] = {"x": frame["x"], "y": y}
-            y += current["h"] + GAP
-        taken.append(key)
-    return moves
+        elif asker in terminals:
+            terminals[asker].questions.append(i)
+        elif slug and project in named:
+            named[project].show.append(i)
+        elif key == "digest" and not bands[0].digest:
+            bands[0].digest = i
+        elif maker and not key.startswith("show/"):
+            (maker.owned if key else maker.tail).append(i)
+    for band in bands:
+        band.show.sort(key=lambda i: key_of(objects[i]))
+        band.owned.sort(key=lambda i: key_of(objects[i]))
+    return bands, sorted(follow)
 
 
-def first_layout(drawn: list, sizes: dict, stale: list, term: dict, others: list, grid=None, questions=True) -> dict:
-    """Place the strip, left block and optional project grid clear of unrelated objects."""
-    stacks = {c: [sizes[r.key] for r in drawn if r.column == c] for c in ("left", "centre", "right")}
-    width = {c: max(f["w"] for f in stack) for c, stack in stacks.items()}
-    if questions:
-        width["questions"] = QUESTIONS
-    order = [c for c in COLUMNS if c in width]
-    offset, x = {}, 0
-    for column in order:
-        offset[column], x = x, x + width[column] + GAP
-    top = sizes["mc/strip"]["h"] + GAP
-    block = {"w": max(sizes["mc/strip"]["w"], x - GAP),
-             "h": top + max(sum(f["h"] + GAP for f in stack) - GAP for stack in stacks.values())}
-    if grid:
-        block["w"] = max(block["w"], x + grid["w"])
-        block["h"] = max(block["h"], top + grid["h"])
-    if stale:
-        x, y = min(f["x"] for f in stale), min(f["y"] for f in stale)
-    else:
-        x, y = term["x"] - 80 - block["w"], term["y"]
-    while True:
-        hits = [o for o in others if overlaps({"x": x, "y": y, **block}, o)]
-        if not hits:
-            break
-        x = min(o["x"] for o in hits) - 80 - block["w"]
-    return {"strip": {"x": x, "y": y}, "projects": {"x": x + sum(width.values()) + GAP * len(order), "y": y + top},
-            **{c: {"x": x + offset[c], "y": y + top} for c in order}}
+def band_order(bands: list, cards: dict) -> list:
+    def rank(item):
+        n, band = item
+        card = cards.get(band.card)
+        return (0, card["y"], card["x"], n) if card else (1, 0, 0, n)
+    return bands[:1] + [band for _, band in sorted(enumerate(bands[1:]), key=rank)]
 
 
-def spot(region: Region, planned: dict, order: list) -> dict:
-    """Where a tile new to a drawn board starts: its column's x, below that column's lowest tile; with none of its
-    column on the board, below the lowest mc tile at the strip's x."""
-    mine = [r.key for r in order if r.column == region.column and r.key in planned]
-    if mine:
-        return {"x": planned[mine[0]]["x"], "y": max(planned[k]["y"] + planned[k]["h"] for k in mine) + GAP}
-    left = planned.get("mc/strip") or min(planned.values(), key=lambda f: f["x"])
-    return {"x": left["x"], "y": max(f["y"] + f["h"] for f in planned.values()) + GAP}
+def flow(members: list, dims: dict, left, top, wrap, avoid: list) -> tuple:
+    spots, x, y, right, bottom, used = {}, left, top, left, top, False
+    for m in members:
+        w, h = dims[m]["w"], dims[m]["h"]
+        if used and x + w > left + wrap:
+            x, y, used = left, bottom + GAP, False
+        while hits := [o for o in avoid if overlaps({"x": x, "y": y, "w": w, "h": h}, o)]:
+            x = max(o["x"] + o["w"] for o in hits) + GAP
+            if x + w > left + wrap:
+                # Past the row's width: a used row wraps; an empty one drops below the first object in the way to end.
+                x, y = left, (bottom if used else min(o["y"] + o["h"] for o in hits)) + GAP
+                used = False
+        spots[m] = {"x": x, "y": y}
+        x, right, bottom, used = x + w + GAP, max(right, x + w), max(bottom, y + h), True
+    return spots, right, bottom
+
+
+def plan(bands: list, dims: dict, kept: dict, obstacles: list, origin: dict) -> dict:
+    avoid, spots, top = obstacles + list(kept.values()), {}, origin["y"]
+    for band in bands:
+        x = origin["x"]
+        bottom = max([top] + [kept[i]["y"] + kept[i]["h"] for i in band.show if i in kept])
+        for members, wrap, reserve in band.blocks(dims):
+            members = [m for m in members if m not in kept]
+            if members or reserve:
+                placed, right, low = flow(members, dims, x, top, wrap, avoid)
+                spots.update(placed)
+                x, bottom = max(x + reserve, right) + GAP, max(bottom, low)
+        top = bottom + GAP
+    return spots
+
+
+def read_layout(state: dict) -> tuple:
+    layout = state.get("layout") if isinstance(state.get("layout"), dict) else {}
+    origin = layout.get("origin")
+    return (({"x": origin[0], "y": origin[1]} if origin else None), set(layout.get("kept") or []),
+            layout.get("show") or {}, layout.get("own") or [])
+
+
+def movers(entries: list, own: set) -> dict:
+    ignored = own | {entry.get("rev") for entry in entries
+                     if entry.get("actor") == "system"
+                     and str(entry.get("summary") or "").startswith("reverted (batch failed): ")}
+    found = {}
+    for entry in entries:
+        clauses = str(entry.get("summary") or "").rpartition(": ")[2].split("; ")
+        if entry.get("rev") not in ignored and any(clause.startswith("moved (") for clause in clauses):
+            found[entry.get("id")] = entry.get("actor")
+    return found
 
 
 def applied(choice: str, place, state) -> bool:
@@ -2384,61 +2323,29 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
     def call(method, **params):
         return easl(where, method, params=params)
 
-    def batch(ops):
-        """object.batch, BATCH ops at a time."""
-        results = []
-        for start in range(0, len(ops), BATCH):
-            chunk = [{"method": m, "params": p} for m, p in ops[start:start + BATCH]]
-            results += call("object.batch", board=board_id, ops=chunk).get("results") or []
-        return results
-
-    seen = None
-
-    def on_board():
-        """The board's objects before this draw writes, arrows and groups aside; read at most once."""
-        nonlocal seen
-        if seen is None:
-            seen = {o["id"]: o for o in call("board.get", board=board_id).get("objects") or []
-                    if o.get("type") not in ("arrow", "group") and not (o.get("props") or {}).get("archived")}
-        return seen
+    # Over ssh EASL_TILE_ID stays behind, so the calling tile is named outright for history to credit the writes to it.
+    caller = {"caller": os.environ["EASL_TILE_ID"]} if os.environ.get("EASL_TILE_ID") else {}
 
     found = call("object.find", board=board_id, keyPrefix="mc/").get("objects") or []
     existing = {key_of(o): o for o in found if str(key_of(o)).startswith("mc/")}
-    panel_keys = [f"mc/panel/{p.seat}/{p.id}" for s in snap.seats for p in s.panels or []]
     old = {k: call("object.get", id=existing[k]["id"]).get("object") or {}
-           for k in (*REGION_KEYS, *map(project_key, snap.seats), *panel_keys) if k in existing}
+           for k in (*REGION_KEYS, *map(project_key, snap.seats)) if k in existing}
 
     def props(key):
         return (old.get(key) or {}).get("props") or {}
 
     choices = {k: v for s in snap.seats for k, v in (props(project_key(s)).get("state") or {}).items()}
     marks = props("mc/todo").get("state") or {}
-    placed = set(re.findall(r'data-question="([^"]+)"', props("mc/todo").get("html") or ""))
-    asked = [q for s in snap.seats if not s.redacted for q in s.questions or [] if q.board == board_id]
-    # A question asked from a terminal on this board, other than the drawing seat's own, stays under that terminal.
-    columns = project_columns(snap, where, board_id, on_board(), (pointer or {}).get("tile")) if snap.scope == "all" else {}
-    terminals = {i for members in columns.values() for i in members if on_board()[i].get("type") == "terminal"}
-    if snap.scope != "all" and any(q.id not in placed for q in asked):
-        terminals = {i for i, o in on_board().items() if o.get("type") == "terminal"} - {(pointer or {}).get("tile")}
-    stay = {q.id for q in asked if q.asker in terminals}
-    wanted = regions(snap, board_id, choices, placed, stay)
-    column = {r.key: r.column for r in wanted}
+    objects = {o["id"]: o for o in call("board.get", board=board_id).get("objects") or []
+               if o.get("type") not in ("arrow", "group") and not (o.get("props") or {}).get("archived")}
+    bands, follow = classify(snap, where, board_id, objects, pointer)
+    wanted = regions(snap, board_id, choices, {q for band in bands for q in band.questions})
     ids = {k: o["id"] for k, o in old.items()}
     frames = {k: frame_of(o) for k, o in old.items()}
-    before = {k: dict(f) for k, f in frames.items()}
-    planned = {k: dict(f) for k, f in frames.items()}
-    # A seat whose panels/ could not be listed keeps its panel tiles until a listing shows their files gone.
-    unlisted = tuple(f"mc/panel/{s.name}/" for s in snap.seats if s.panels is None)
-    stale = {k: o for k, o in existing.items() if k not in {r.key for r in wanted if r.html is not None or r.key in old}
-             and not (unlisted and k.startswith(unlisted))}
-    new = [q for q in asked if q.id not in placed and q.id not in stay] if snap.scope != "all" else []
 
     out, sizes, estimated = [], {}, False
     measuring, measure_board, remote_host, remote_measured = where, board_id, None, False
     for region in wanted:
-        if region.html is None:
-            out += [f"{region.key}\tkept (unreadable)"] if region.key in old else []
-            continue
         drawn = props(region.key)
         if region.key in old and drawn.get("title") == region.title and mask(drawn.get("html") or "") == mask(region.html):
             out.append(f"{region.key}\tunchanged")
@@ -2476,134 +2383,80 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
         sizes[region.key] = size
         out.append(f"{region.key}\t{'updated' if region.key in old else 'created'}")
 
-    def upsert(region, frame):
-        # No size "fit": easl refits an update without x/y from wherever fits, which can move the origin.
-        return "object.upsert", {"key": region.key, "type": "html", "props": {"html": region.html, "title": region.title},
-                                 "frame": frame}
+    def at(frame: dict) -> list:
+        return [frame["x"], frame["y"]]
 
-    changed, ops = [r for r in wanted if r.key in sizes], []
-    if not old:
-        objects = on_board()
-        skip = {o["id"] for o in stale.values()} | {q.id for q in new} | {i for members in columns.values() for i in members}
-        grid = column_grid(columns, sizes, objects) if columns else None
-        origin = first_layout([r for r in changed if r.key not in columns], sizes, [frame_of(o) for o in stale.values()],
-                              frame_of(objects.get((pointer or {}).get("tile")) or {}),
-                              [frame_of(o) for i, o in objects.items() if i not in skip], grid, snap.scope != "all")
-        y = {c: at["y"] for c, at in origin.items()}
-        for r in changed:
-            if r.key in columns:
-                at = grid["positions"][r.key]
-                frame = {"x": origin["projects"]["x"] + at["x"], "y": origin["projects"]["y"] + at["y"], **sizes[r.key]}
-            else:
-                frame = {"x": origin[r.column]["x"], "y": y[r.column], **sizes[r.key]}
-                y[r.column] += sizes[r.key]["h"] + GAP
-            ops.append(upsert(r, frame))
-    else:
-        taken = None
-        for region in changed:
-            if region.key in old:
-                planned[region.key].update(sizes[region.key])
-                ops.append(upsert(region, sizes[region.key]))
-                continue
-            if taken is None:
-                taken = [frame_of(o) for o in on_board().values()]
-            if region.key in columns:
-                existing_columns = [k for k in columns if k in planned]
-                if existing_columns:
-                    x = planned[existing_columns[0]]["x"]
-                    y = max(planned[k]["y"] + column_size(planned[k], columns[k], on_board())["h"]
-                            for k in existing_columns) + GAP
-                else:
-                    edge = max(planned.values(), key=lambda f: f["x"] + f["w"])
-                    x, y = edge["x"] + edge["w"] + GAP, edge["y"]
-                owned = {i for members in columns.values() for i in members}
-                blockers = [frame_of(o) for i, o in on_board().items() if i not in owned]
-                whole = below({"x": x, "y": y, **column_size(sizes[region.key], columns[region.key], on_board())},
-                              blockers + list(planned.values()))
-                planned[region.key] = {**whole, **sizes[region.key]}
-            else:
-                planned[region.key] = below({**spot(region, planned, wanted), **sizes[region.key]}, taken)
-            taken.append(planned[region.key])
-            ops.append(upsert(region, planned[region.key]))
-    for key, obj in sorted(stale.items()):
-        ops.append(("object.delete", {"id": obj["id"]}))
-        out.append(f"{key}\tdeleted")
-    notes = []
-    if any(p.id == "digest" for p in snap.seats[0].panels or []):
-        try:
-            digest = call("object.find", board=board_id, key="digest").get("object") or {}
-        except Fail as error:
-            if "not_found" not in str(error):
-                raise
-            digest = {}
-        if digest.get("type") == "note":
-            ops.append(("object.delete", {"id": digest["id"]}))
-            notes.append("digest\tdeleted (old note)")
-    for obj in call("object.find", board=board_id, keyPrefix="seat:").get("objects") or []:
-        if obj.get("type") == "note" and str(key_of(obj)).startswith("seat:"):
-            ops.append(("object.delete", {"id": obj["id"]}))
-            notes.append(f"{key_of(obj)}\tdeleted (old note)")
+    state = props("mc/strip").get("state") or {}
+    origin, pinned, accepted, own = read_layout(state)
+    shows = [i for band in bands for i in band.show]
+    doubtful = [i for i in shows if i in pinned or (i in accepted and at(frame_of(objects[i])) not in accepted[i])]
+    history = []
+    if doubtful:
+        history = call("board.history", board=board_id, kinds=["updated"], limit=HISTORY).get("entries") or []
+    moved_by = movers(history, set(own))
+    replaced = [i for i in doubtful if str(moved_by.get(i)).startswith("agent:")]
+    kept = {i: frame_of(objects[i]) for i in doubtful if i not in replaced}
+    start = objects.get(bands[0].terminal) or old.get("mc/strip")
+    origin = origin or ({"x": frame_of(start)["x"], "y": frame_of(start)["y"]} if start else {"x": 0, "y": 0})
+    placed, mine = {i for band in bands for i in band.members()}, set(ids.values())
+    still = [frame_of(o) for i, o in objects.items() if i not in placed and i not in mine and i not in follow]
+    order = band_order(bands, frames)
+    spots = plan(order, {**{i: frame_of(o) for i, o in objects.items()}, **frames, **sizes}, kept, still, origin)
 
-    moves, placing = {}, []
+    def accept(i) -> list:
+        current_position = at(frame_of(objects[i]))
+        planned_position = at(spots[i])
+        if current_position == planned_position and planned_position in accepted.get(i, []):
+            return accepted[i]
+        return [current_position] if current_position == planned_position else [current_position, planned_position]
 
-    def place(todo: dict, tiles) -> None:
-        """This board's new questions, once each, down the column right of the to-do from its top."""
-        objects, moving = on_board(), {q.id for q in new}
-        mine = set(ids.values()) | {o["id"] for o in stale.values()}
-        taken = list(tiles) + [frame_of(o) for i, o in objects.items() if i not in moving and i not in mine]
-        for q in new:
-            if q.id in objects:
-                frame = below({"x": todo["x"] + todo["w"] + GAP, "y": todo["y"], "w": QUESTIONS,
-                               "h": frame_of(objects[q.id])["h"]}, taken)
-                moves[q.id] = {"x": frame["x"], "y": frame["y"], "w": QUESTIONS}
-                taken.append(frame)
-                placing.append(f"question {q.id}\tplaced")
-
-    # With the to-do already drawn, its new questions move in the same batch, so a failed write places none of them
-    # and records none.
-    early = "mc/todo" in old
-    if early and new:
-        place(planned["mc/todo"], planned.values())
-        ops += [("object.update", {"id": i, "frame": f}) for i, f in moves.items()]
-    for (method, params), result in zip(ops, batch(ops)):
+    layout = {"origin": at(origin), "kept": sorted(kept), "show": {i: accept(i) for i in shows if i not in kept},
+              "own": own}
+    # The memory is the first op, so a batch that fails part way leaves no unapplied move looking like the user's.
+    memory = {"state": {**state, "layout": layout}} if layout != state.get("layout") else {}
+    ops = []
+    for region in wanted:
+        key, spot = region.key, spots[region.key]
+        extra = memory if key == "mc/strip" else {}
+        if key in sizes:
+            ops.append(("object.upsert", {"key": key, "type": "html", "frame": {**spot, **sizes[key]},
+                                          "props": {"html": region.html, "title": region.title, **extra}}))
+        elif extra or at(frames[key]) != at(spot):
+            ops.append(("object.update", {"id": ids[key], "frame": spot, **({"props": extra} if extra else {})}))
+    for band in bands:
+        for i in band.members():
+            change = {"frame": spots[i]} if i in spots and at(frame_of(objects[i])) != at(spots[i]) else {}
+            if i in shows and "frame" in change:
+                change["rev"] = objects[i]["rev"]
+            if i == band.terminal and (objects[i].get("props") or {}).get("follow") is not False:
+                change["props"] = {"follow": False}
+            ops += [("object.update", {"id": i, **change})] if change else []
+    # Follow tiles go only after their terminals stop following, so none is made again behind the delete.
+    ops += [("object.delete", {"id": i}) for i in follow]
+    results, revisions = [], []
+    for n in range(0, len(ops), BATCH):
+        chunk = ops[n:n + BATCH]
+        done = call("object.batch", board=board_id, ops=[{"method": m, "params": p} for m, p in chunk], **caller)
+        results += done.get("results") or []
+        if any(p.get("id") in shows and "frame" in p for _, p in chunk):
+            revisions.append(done["revision"])
+    for (method, params), result in zip(ops, results):
         if method == "object.upsert":
-            ids[params["key"]], frames[params["key"]] = result["object"]["id"], frame_of(result["object"])
-    if new and not early and "mc/todo" in frames:
-        place(frames["mc/todo"], frames.values())
-        batch([("object.update", {"id": i, "frame": f}) for i, f in moves.items()])
-
-    order = [r.key for r in wanted if r.key in frames]
-
-    def rank(key):
-        return (before.get(key) or frames[key])["y"], order.index(key)
-
-    # Only an overlap this draw made is repaired, in the order the tiles had before it, and a tile only goes below one
-    # of its own column or the strip; an overlap already there is the operator's to keep.
-    kept = {frozenset(pair) for pair in combinations(before, 2) if overlaps(before[pair[0]], before[pair[1]])}
-    pushed = {}
-    for _ in range(len(order) ** 2):
-        clash = next((pair for pair in combinations(sorted(order, key=rank), 2)
-                      if frozenset(pair) not in kept and column[pair[0]] in (column[pair[1]], "strip")
-                      and pair[0] not in columns and pair[1] not in columns
-                      and (snap.scope != "all" or pair[1] in (*REGION_KEYS, project_key(snap.seats[0])))
-                      and overlaps(frames[pair[0]], frames[pair[1]])), None)
-        if not clash:
-            break
-        upper, lower = clash
-        frames[lower]["y"] = pushed[lower] = frames[upper]["y"] + frames[upper]["h"] + GAP
-    batch([("object.update", {"id": ids[k], "frame": {"y": y}}) for k, y in pushed.items()])
-    column_moves = stack_columns(columns, frames, before, on_board())
-    card_moves = {key: {"y": frames[key]["y"]} for key in columns if key in frames
-                  and frames[key]["y"] != (planned.get(key) or frames[key])["y"]}
-    batch([("object.update", {"id": ids[k], "frame": f}) for k, f in card_moves.items()]
-          + [("object.update", {"id": oid, "frame": f}) for oid, f in column_moves.items()])
-    moves.update(column_moves)
-    keys = {i: k for k, i in ids.items()}
-    check = call("layout.check", board=board_id, ids=list(ids.values()) + [i for i in moves if i not in keys])
+            ids[params["key"]] = result["object"]["id"]
+    if revisions:
+        # History logs a batch's changes under the revision it returned, and revisions carry on across the app
+        # restarts that start seq numbers over. One older than every entry history still holds is done with, and
+        # each logged at least one entry, so a log of HISTORY entries shows no more than the newest HISTORY of them.
+        floor = min((entry["rev"] for entry in history), default=0)
+        journal = {**layout, "own": ([r for r in own if r >= floor] + revisions)[-HISTORY:]}
+        call("object.update", id=ids["mc/strip"], props={"state": {**state, "layout": journal}}, **caller)
+    check = call("layout.check", board=board_id, ids=list(ids.values()) + sorted(placed))
     findings = {k: v for k, v in check.items() if v and k not in ("hints", "approximate")}
-    return (out + notes + placing + ["heights\testimated: no easl app is attached to measure the pages"] * estimated
+    return (out + [f"follow {i}\tdeleted" for i in follow] + [f"{key_of(objects[i])}\tre-placed" for i in replaced]
+            + [f"band\t{band.seat.name}\tshowcase {len(band.showcase())}\ttail {len(band.tail)}\t"
+               f"kept {sum(i in kept for i in band.show)}" for band in order]
+            + ["heights\testimated: no easl app is attached to measure the pages"] * estimated
             + [f"heights\tmeasured on {remote_host}"] * remote_measured
-            + [f"{k}\tmoved down" for k in (*pushed, *card_moves)]
             + ["layout.check\t" + (json.dumps(findings, sort_keys=True) if findings else "clean")]
             + pending(choices, snap.seats) + todo_done(marks, snap))
 
@@ -2678,13 +2531,17 @@ def main(argv) -> int:
     p.add_argument("--max-size", type=int, default=1048576, metavar="BYTES",
                    help="skip added or changed files larger than this many bytes (default: 1048576, 1 MiB)")
     text = ("Draw mission control on the seat's easl board as keyed HTML tiles: mc/strip (counts and problems), "
-            "mc/project/<seat> per project (a card and pipeline), mc/todo (the to-do and open questions), mc/done (merged and "
-            "deployed, 7 days) and mc/panel/<seat>/<id> per panel. Reads each seat's state/status.json, tasks.tsv, "
-            "lanes/, intake.md and panels/, the drawing seat's state/todo.json, the easl questions, and from gh the "
-            "PRs, why a refused CI job never started, deployments and releases. Unchanged tiles are left alone, "
-            "moved tiles stay put, and stale mc/ tiles, old seat:<name> notes and, once a digest panel exists, the "
-            "digest note are deleted. "
-            "Prints one line per action, then the choice, note and todo-done lines left on the board.")
+            "mc/project/<seat> per project (a card and pipeline), mc/todo (the to-do and open questions) and mc/done "
+            "(merged and deployed, 7 days). Reads each seat's state/status.json, tasks.tsv, lanes/ and intake.md, the "
+            "drawing seat's state/todo.json, the easl questions, and from gh the PRs, why a refused CI job never "
+            "started, deployments and releases. Lays the board out in bands, the operator's on top and one per "
+            "project below in card order: terminal, card and open questions, then the show/<project>/<slug> tiles "
+            "(a one-line card and no empty showcase reserve while parked or without a running coordinator), then the other "
+            "objects its terminal made. Sets follow off on those terminals and deletes their follow tiles; deletes "
+            "nothing else. Unchanged tiles are not rewritten. A show tile the user moved keeps its spot; one an agent "
+            "moved last, by board.history, goes back to its band with a re-placed line; tiles keep the size their seat "
+            "gave them. Prints one line per tile and per band, then the choice, note and "
+            "todo-done lines left on the board.")
     p = sub.add_parser("board", parents=[common], help=text, description=text)
     p.add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/, else "
                                   "<instance>/assistant, whose board shows every seat)")
