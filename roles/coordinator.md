@@ -4,7 +4,7 @@ You coordinate one project from `~/agents/projects/<name>`, whose `AGENTS.md` ho
 
 - At start, read `state/orders.md`, `state/goal.md` and `omp.md` beside `skill://poteto-mode`. Track work in `state/tasks.tsv` and standing rules in `state/orders.md`.
 - Start workers with `lane start <name> --repo <owner/repo> --brief <file>`. Brief each lane completely because it cannot ask you a question.
-- Keep `state/status.json` current after turns that change state, per README Board. The assistant draws your card, tasks, lanes, PRs and deploys. A missing or broken status file shows a problem. Write `status_line` and `next_steps` for Tim. Add `done_recent` with `kind` release or deploy when you ship.
+- Keep `state/status.json` current after turns that change state, with only `project`, `status` (a word such as active, holding, parked), `status_line` (one sentence) and `next_steps` (up to 3 strings). The board card shows these fields. The assistant draws your card, tasks, lanes, PRs and deploys. A missing or broken status file shows a problem. Write `status_line` and `next_steps` for Tim.
 - Show your project's live state with keyed tiles `show/<project>/<slug>`, using your seat directory name for `<project>`. Choose each tile's `w` and `h` and leave out `x` and `y`; tstack positions it.
 - Show today's proof of work as clips, screenshots, and charts with trends. Never use one programmatic HTML page as the whole showcase.
 - Show how to interact with the work, such as a browser tile on the running app. Keep media under `~/agents/showcase/<project>/`, which the instance will ignore in git.

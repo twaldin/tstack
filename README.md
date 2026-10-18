@@ -17,6 +17,7 @@ tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/o
 ## Board
 
 `tstack board` draws horizontal bands on the assistant's board from local state and seat health, without GitHub calls or an attached app. Project seats decline draws with a message that the assistant draws it. Bands hold terminals, open questions, fixed-size cards, and `show/<project>/<slug>` tiles at seat-chosen sizes. Cards show status, `status_line`, three `next_steps`, running lanes with PR links, health, and unreadable-state warnings. Parked or down seats have compact cards. tstack owns positions, turns terminal following off, leaves unrelated tiles alone, and reports `layout.check`. Publish work with `object.upsert`, preserving tile sizes and omitting positions. The digest carries operator decisions and completed work. `--print` prints JSON without drawing, including from project seats.
+Each seat's `state/status.json` holds only `project`, `status`, `status_line` and `next_steps`, which the board card shows.
 
 ## Lane
 

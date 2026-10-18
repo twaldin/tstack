@@ -18,8 +18,8 @@ Handle each job's output, then re-arm it. After a restart, re-arm every job from
 - `state/orders.md` holds standing orders. Append each new order verbatim before acting.
 - `state/intake.md` holds `- [ ] <UTC time> <source>: <text>` lines. Mark handled items `- [x]` with the outcome.
 - `state/tasks.tsv` tracks your tasks. Change `state/lanes/` only through `lane`.
-- `state/todo.json` holds things only Tim can do, per README Board.
-- Keep `state/status.json` per README Board, including a project's while its coordinator is stopped.
+- `state/todo.json` holds things only Tim can do (`items[]` with id, title, steps, done); list the open ones under Needs you in the digest.
+- Keep `state/status.json`, including a project's while its coordinator is stopped, with only `project`, `status` (a word such as active, holding, parked), `status_line` (one sentence) and `next_steps` (up to 3 strings). The board card shows these fields.
 - Commit and push changed state with `tstack commit "assistant: <what>"`.
 
 ## Work
