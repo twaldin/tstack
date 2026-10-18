@@ -24,6 +24,16 @@ skills/poteto-mode/scripts/worktree-audit.sh
 skills/poteto-mode/playbooks/multi-phase-plan.md
 skills/poteto-mode/playbooks/worktree-cleanup.md
 
+# Playbooks no seat routes to
+skills/poteto-mode/playbooks/hillclimb.md
+skills/poteto-mode/playbooks/runtime-forensics.md
+skills/poteto-mode/playbooks/trace-forensics.md
+skills/poteto-mode/playbooks/eval.md
+skills/poteto-mode/playbooks/autonomous-run.md
+skills/poteto-mode/playbooks/autopilot-full.md
+skills/poteto-mode/playbooks/autopilot-stack.md
+skills/poteto-mode/playbooks/pause-safely.md
+
 # Skills no seat routes to; omp model roles replace setup-pstack
 skills/setup-pstack/*
 skills/poteto-help/*
