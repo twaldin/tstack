@@ -385,9 +385,11 @@ def commit_sync(root: Path, target: str) -> None:
             if entries:
                 commit_git(root, "update-index", "-z", "--index-info", stdin=entries)
             for change in changes:
-                reason = ("state" if "state" in change.path.split("/")
-                          else commit_sync_path(root, change, prune))
-                print(f"skipped {change.path}: {reason}" if reason else f"synced {change.path}", flush=True)
+                if "state" in change.path.split("/"):
+                    print(f"checkout: left {change.path}: state file, never rewritten", flush=True)
+                else:
+                    reason = commit_sync_path(root, change, prune)
+                    print(f"skipped {change.path}: {reason}" if reason else f"synced {change.path}", flush=True)
         else:
             print("skipped checkout: HEAD is not main", flush=True)
         # A failed refresh leaves main at the old tip.
@@ -2104,6 +2106,7 @@ def regions(snap: Snapshot, board_id: str, choices: dict, stay: set) -> list:
 GAP, BATCH, HISTORY = 40, 50, 2000
 LEFT_W, SHOW_W = 1000, 4000
 NO_APP = "measured by the app"
+APP_UNAVAILABLE = (NO_APP, "exists but connecting to it failed (ENOENT)", "connect ECONNREFUSED")
 REGION_KEYS = ("mc/strip", "mc/todo", "mc/done")
 
 
@@ -2368,14 +2371,18 @@ def draw(snap: Snapshot, where: dict, board_id: str, pointer) -> list:
                         try:
                             got = easl(measuring, "object.measure", params=params)
                         except Fail as remote_error:
-                            if not isinstance(remote_error, ConnectionFail) and NO_APP not in str(remote_error):
+                            if not isinstance(remote_error, ConnectionFail) and not any(
+                                    message in str(remote_error) for message in APP_UNAVAILABLE):
                                 raise
+                            out.append(f"heights\t{remote_host}: {remote_error}")
                             estimated = True
                     else:
                         estimated = True
                 else:
-                    if not isinstance(error, ConnectionFail) and NO_APP not in str(error):
+                    if not isinstance(error, ConnectionFail) and not any(
+                            message in str(error) for message in APP_UNAVAILABLE):
                         raise
+                    out.append(f"heights\t{remote_host}: {error}")
                     estimated = True
             if not estimated:
                 size = {"w": got["w"], "h": got["h"]}

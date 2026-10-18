@@ -220,7 +220,8 @@ if not marker.exists():
         self.assertEqual(git(self.remote, "show", "main:projects/other/state/status.md"), "other seat update")
         self.assertIn("retry 2/3: origin/main moved", result.stdout.splitlines())
         self.assertEqual((self.instance / "projects/other/state/status.md").read_text(), "old other state\n")
-        self.assertIn("skipped projects/other/state/status.md: state", result.stdout.splitlines())
+        self.assertIn("checkout: left projects/other/state/status.md: state file, never rewritten",
+                      result.stdout.splitlines())
         self.assertEqual(git(self.instance, "rev-parse", "main"), tip)
 
     def test_size_limit_skips_two_megabyte_files_but_publishes_small_and_boundary_files(self):
@@ -290,7 +291,8 @@ if not marker.exists():
         self.assertIn("synced AGENTS.md", result.stdout.splitlines())
         self.assertEqual((self.instance / "AGENTS.md").read_text(), "recovered instructions\n")
         self.assertEqual((self.instance / "projects/other/state/status.md").read_text(), "old other state\n")
-        self.assertIn("skipped projects/other/state/status.md: state", result.stdout.splitlines())
+        self.assertIn("checkout: left projects/other/state/status.md: state file, never rewritten",
+                      result.stdout.splitlines())
         self.assertEqual(git(self.instance, "rev-parse", "main"), tip)
         self.assertEqual(git(self.instance, "show", ":projects/other/state/status.md"), "upstream state")
         self.assertEqual(git(self.remote, "rev-parse", "main"), tip)
@@ -1787,6 +1789,7 @@ class Board(Sandbox):
         (self.stubs / "no-app").touch()
         (self.stubs / "ssh-render.err").write_text("ssh: could not resolve hostname render")
         out = self.board_cli()
+        self.assertIn("heights\trender: easl object.measure: ssh: could not resolve hostname render\n", out)
         self.assertIn("heights\testimated: no easl app is attached to measure the pages\n", out)
         self.assertNotIn("heights\tmeasured on", out)
         self.assertEqual(len(self.log("ssh")), 1)
@@ -1795,9 +1798,31 @@ class Board(Sandbox):
         self.measuring_host()
         (self.stubs / "no-app").touch()
         out = self.board_cli()
+        self.assertIn("heights\trender: easl object.measure: invalid_params: an html page is measured by the app\n", out)
         self.assertIn("heights\testimated: no easl app is attached to measure the pages\n", out)
         self.assertNotIn("heights\tmeasured on", out)
         self.assertEqual(len(self.log("ssh")), 1)
+
+    def test_a_stale_measuring_socket_draws_with_estimates_and_reports_the_host_error(self):
+        self.measuring_host()
+        (self.stubs / "no-app").touch()
+        (self.stubs / "app-render").touch()
+        for code in ("ENOENT", "ECONNREFUSED"):
+            for after in (0, 1):
+                with self.subTest(code=code, after=after):
+                    self.boards({"brd_a": [self.tile("obj_t", "terminal", 0, 0, 800, 600)]}, [AGENT])
+                    error = ("unavailable: easl socket /tmp/easl.sock exists but connecting to it failed (ENOENT): "
+                             "a sandbox may be blocking Unix-socket connections (object.measure was not sent)"
+                             if code == "ENOENT" else
+                             "unavailable: easl socket /tmp/easl.sock: connect ECONNREFUSED /tmp/easl.sock "
+                             "after waiting 15s for the app (object.measure was not sent)")
+                    (self.stubs / "measure-render.json").write_text(json.dumps({"after": after, "error": error}))
+                    out = self.board_cli()
+                    self.assertIn(f"heights\trender: easl object.measure: {error}\n", out)
+                    self.assertIn("heights\testimated: no easl app is attached to measure the pages\n", out)
+                    self.assertEqual({o["props"].get("key") for o in self.boards()["brd_a"]},
+                                     {None, *REGIONS})
+                    self.assertIn("layout.check\tclean\n", out)
 
     def test_a_native_measurement_error_other_than_no_app_is_not_hidden_by_remote_fallback(self):
         self.measuring_host()
@@ -1921,7 +1946,8 @@ class Board(Sandbox):
         self.measuring_host()
         (self.stubs / "no-app").touch()
         (self.stubs / "app-render").touch()
-        for after, error in ((0, "not_found: no open board"), (1, "unavailable: cannot measure the page")):
+        for after, error in ((0, "not_found: no open board"), (1, "unavailable: cannot measure the page"),
+                             (0, "unavailable: the page is busy")):
             with self.subTest(after=after, error=error):
                 initial = [self.tile("obj_t", "terminal", 0, 0, 800, 600)]
                 self.boards({"brd_a": initial}, [AGENT])
