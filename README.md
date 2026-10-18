@@ -1,76 +1,31 @@
 # tstack
 
-tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/oh-my-pi) on easl boards. Three small CLIs do what agents repeat: `lane` runs one task as a detached omp session in its own worktree, `watch-pr` reports a PR's facts through merge and deploy, and `tstack` sets a host up and draws mission control on a seat's board. None of them refuses, demands proof or blocks an agent. Errors from gh, git and systemd pass through as errors.
+tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/oh-my-pi) on easl boards. The engine lives in `~/tstack`, the instance and seat state in `~/agents`, and project clones and lane worktrees in `~/worktrees`. Commands use Python's standard library and pass through errors from git, gh, and systemd. Each command has `--help`.
 
-| Path | Holds |
-|---|---|
-| `pstack/` | The pstack fork. Branch `pstack-upstream` holds unchanged upstream snapshots, `pstack/DROPPED` lists what we leave out, and `git diff pstack-upstream main -- pstack/` lists our edits. |
-| `bin/` | `lane`, `watch-pr`, `tstack` and `pstack-bump`. Each takes `--help`. |
-| `global.md`, `roles/` | Rules every agent loads, and the assistant, coordinator and lane roles. |
-| `agents/` | omp agent types, one model binding each. |
-| `systemd/`, `launchd/` | Hourly `tstack update`. |
+## Setup
 
-An instance repo at `~/agents` holds one operator's rules, machines, projects and seat state. Project code lives in `~/worktrees/<project>/main`, with each lane's worktree beside it.
+`tstack setup` links the engine and instance skills, agent types, and commands, writes `~/.omp/agent/AGENTS.md` and the systemd update units, and installs orch's dependencies. It replaces only its own links and files. Install git, Python 3.10 or newer, authenticated `gh`, bun, omp, and easl, then clone the engine to `~/tstack` and the instance to `~/agents`. Run `~/tstack/bin/tstack setup`, with `--machine <name>` if needed. Enable hourly updates with `systemctl --user enable --now tstack-update.timer`. `TSTACK_HOME`, `TSTACK_INSTANCE`, `TSTACK_MACHINE`, and `TSTACK_WORKTREES` override the engine, instance, machine, and worktree locations. `TSTACK_SEAT` selects a seat instead of the nearest ancestor directory with `state/`.
 
-## Install
+## Update
 
-You need git, Python 3.9 or newer, `gh` logged in, bun, omp and easl.
+`tstack update` pulls the engine with `git pull --ff-only`, fetches the instance, syncs upstream files without overwriting changed local files or seat state, and reruns setup. The hourly systemd timer runs the same command.
 
-1. Clone this repo to `~/tstack` and the instance to `~/agents`.
-2. Run `~/tstack/bin/tstack setup`, adding `--machine <name>` when the host name differs from the instance's machine directory. It links pstack's skills, the instance's skills, the agent types and the bins. It writes the update units, which carry the engine, instance and machine it ran with, and `~/.omp/agent/AGENTS.md` from the `global.md` files, then installs orch's dependencies. It replaces only its own links and files and reports anything else in the way.
-3. Turn on hourly updates once: `systemctl --user enable --now tstack-update.timer` on Linux, or `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tstack.update.plist` on macOS.
+## Commit
 
-| Variable | Default | Sets |
-|---|---|---|
-| `TSTACK_HOME` | the checkout the CLI runs from | the engine |
-| `TSTACK_INSTANCE` | `~/agents` | the instance |
-| `TSTACK_MACHINE` | the instance machine directory matching `hostname -s` | the machine |
-| `TSTACK_WORKTREES` | `~/worktrees` | where project clones and lane worktrees live |
-| `TSTACK_SEAT` | the nearest ancestor of the cwd with `state/` | the seat `lane` acts on |
-| `TSTACK_LAUNCHER` | `systemd` on Linux, `process` on macOS | how `lane` starts a run, and whether setup writes systemd or launchd units |
-
-## Lanes
-
-`lane start <name> --repo <owner/repo or path> --brief <file>` makes `~/worktrees/<project>/<id>` on branch `lane/<id>` and runs `omp -p --mode json` there, under `systemd-run --user` on Linux, with `roles/lane.md` appended and the brief as the prompt. A lane's record, brief and final answer live in `<seat>/state/lanes/<id>/`. Each run's json stream, stderr and exit code live in `<seat>/state/run/lanes/<id>/`. `lane wait <id>...` exits when a run ends and prints its final answer, so a seat runs it as a background job to wake on it.
-
-## Commit seat state
-
-Run `tstack commit "<seat>: <what>"` from a seat's directory to commit its `state/` and push to `main`. Each `--path P` adds a path relative to the repo root, such as another seat's intake file. The command builds from `origin/main` in a private index, includes deletions, respects `.gitignore` and retries rejected pushes when origin moves. It skips added or changed files over 1 MiB and prints each path and staged size. `--max-size BYTES` overrides the limit. It never stashes or rewrites state files. After a push it fast-forwards local `main` when possible, refreshes only changed index entries and writes changed upstream files outside every `state/` only when they still match old `main`. `committed <path>` reports what the push includes. `checkout: left <path>: state file, never rewritten` means the checkout refresh preserved the working-tree file, not that the commit excluded it. Other refresh lines report `synced`, `already current`, or `local edit`. Size exclusions remain separate `skipped >...` lines. An unpushed local `main` stays untouched.
+`tstack commit "<seat>: <what>"` commits the current seat's `state/` and pushes to `main`. Each `--path <path>` adds a path relative to the instance root. The command uses a private index based on `origin/main`, includes deletions, respects `.gitignore`, and retries rejected pushes. It skips changed files over 1 MiB and reports their paths and staged sizes. Afterward, it advances local `main` when possible and syncs changed upstream files outside `state/` only if their local contents still match old `main`. It never stashes or rewrites seat state. `committed` lines identify pushed paths. `checkout: left` identifies preserved state files, and `skipped` reports local or staged edits. On a sync error, it restores completed checkouts and index updates that still match the attempted tip, preserving intervening edits and returning the original error. After successful rollback, rerunning syncs the latest upstream tip. Abrupt termination or a rollback error can leave partial changes.
 
 ## Board
 
-`tstack board` draws mission control and arranges the seat's board in horizontal bands. The operator band contains the assistant terminal, the status strip above the operator's to-do and Done tiles, and the assistant's own tiles. The to-do lists every open question. Each project has a band below it, in card order. Moving a project card above or below another card reorders the bands on the next draw. Every region names a project by `project` in its `status.json`, else by its seat directory's name. A failed read shows as a problem, never as zero. `tstack board --print` prints what it read as JSON and draws nothing.
+`tstack board` draws horizontal bands on the assistant's board from local state and seat health, without GitHub calls or an attached app. Project seats decline draws with a message that the assistant draws it. Bands hold terminals, open questions, fixed-size cards, and `show/<project>/<slug>` tiles at seat-chosen sizes. Cards show status, `status_line`, three `next_steps`, running lanes with PR links, health, and unreadable-state warnings. Parked or down seats have compact cards. tstack owns positions, turns terminal following off, leaves unrelated tiles alone, and reports `layout.check`. Publish work with `object.upsert`, preserving tile sizes and omitting positions. The digest carries operator decisions and completed work. `--print` prints JSON without drawing, including from project seats.
 
-Each project's left block is about 1000 points wide and holds its coordinator terminal, compact project card, and open question tiles. Its showcase is about 4000 points wide. Tiles run left to right in slug order, wrap into rows, and have 40-point gutters. Other keyed tiles made by the seat sit beside its showcase. The tail follows these blocks and holds unkeyed objects made by that seat's terminal in creation order. tstack preserves non-follow objects and leaves unrelated objects alone. Band heights include all their contents so bands do not overlap. Parked projects, including projects without a running coordinator, have a one-line card and reserve no empty showcase space.
+## Lane
 
-Coordinators publish work with `object.upsert` and keys `show/<project>/<slug>`, where `<project>` is the seat directory name, such as `sky`. Any tile type can participate, including images, browsers, HTML, code, changes, and notes. The seat chooses `frame.w` and `frame.h`. Omit `x` and `y` on refresh so a seat does not overwrite the user's placement. tstack changes only the position, never the size, and preserves a showcase tile the user moved. Media files live under `~/agents/showcase/<project>/`; the instance will ignore that directory in git. A project's whole showcase must never be one programmatic HTML page. Use separate clips, screenshots, charts, and interactive tiles that show the work itself.
+`lane start <name> --repo <owner/repo or path> --brief <file>` starts detached omp in a `lane/<id>` worktree through `systemd-run --user`. `--base`, `--model`, `--thinking`, and `--memory` select run settings. Records and final answers live in `<seat>/state/lanes/<id>/`, with condensed events and run output in `<seat>/state/run/lanes/<id>/`. Use `resume` to continue, `wait <id>...` to await completion, `show`, `list --all`, or `logs` to inspect, `stop` to end a run, and `merge` to merge its PR. Refresh uses local state without GitHub calls. After a recorded merge and the run's exit, it removes the worktree and branch only with a clean tree and HEAD matching the merged head. `clean` performs the same cleanup on demand and can discover merges made outside `lane merge`. Dirty trees and unpushed commits stay untouched. Cleanup refusals and errors appear on stderr and in the lane's saved cleanup result.
 
-When a showcase tile leaves its automatic position, tstack checks the newest move in board history. It re-places agent-moved tiles in their band and prints each re-placement. User moves stay pinned. Missing history also keeps a tile pinned, since the log can expire or restart. tstack records its own move entries separately so its draws never count as user moves. Calls use `EASL_TILE_ID` as the caller when it is present.
+## Watch a PR
 
-Showcase position updates carry the object's revision. A concurrent edit raises easl's conflict instead of overwriting the newer frame. Rolled-back batch revisions do not count as moves, so a failed draw cannot pin an agent's tile through its rollback events.
+`watch-pr <owner/repo>#<number>` or `watch-pr <url>` prints PR facts once with `--once` as the default. `--until change`, `--until checks`, and `--until merged` wait for changed facts, completed checks, or a merged or closed PR. Every mode stops on a closed PR. `--interval <seconds>` sets the polling interval, and `--json` prints JSON. Reports include checks, reviews, comments, unresolved threads, mergeability, and the head SHA. Merged reports include the merge SHA, runs on that SHA, and their deploy or release jobs. The command never writes to GitHub.
 
-tstack turns off file following on every seat terminal it places and removes those terminals' code follow tiles. Publish code or changes under a `show/<project>/<slug>` key when they belong on the board. Each draw prints the number of showcase tiles and tail objects placed per band and the number of user-moved tiles kept.
+## Update pstack
 
-Mission-control HTML heights come from `object.measure` at each tile's width. If the board has no attached app, the instance's `machines/<machine>/board.json` can name an app host with `{"measure_host":"history-archive-host"}`. For deckbox, that file is `~/agents/machines/deckbox/board.json`. Measurement uses the existing easl SSH transport and the app's CLI. The board stays on its original host, and the draw prints `heights measured on <host>`. If neither app is reachable, it prints `heights estimated`. Closed disclosures count as one summary row, not their hidden content. This estimate does not model CSS or text wrapping.
-
-The measuring app needs an open board. Native measurement errors, such as no open board or a busy page, pass through rather than claiming no app is attached. Generated mission-control cards are self-contained. Showcase tiles keep their seat's frame and need no measurement. Unreadable machine settings or an unreachable SSH host use the estimate. A stale app socket that fails to connect with `ENOENT` or `ECONNREFUSED` also counts as unreachable. If the app host is unreachable or has no attached app, the draw prints the host and error with the estimated-height notice. SSH connections use batch mode and a ten-second connection timeout.
-
-A seat's board is the agents board, the one the assistant's `state/board.json` names, unless the seat's own `state/board.json` or `--board` names another. The assistant draws every project there. A project seat on the agents board draws nothing, so it never overwrites mission control. Its `tstack board` prints that the assistant's board draws it, then the `choice` and `note` lines left on its project tile. A seat on a board of its own gets that seat's mission control there, plus the same lines from the agents board. While the assistant's `board.json` is missing or unreadable, a project seat draws nothing and prints why.
-
-It reads these files from each seat's `state/`:
-
-| File | Holds | Written by |
-|---|---|---|
-| `status.json` | The project's status: `{project, repos[], where, what, recorded_goal, status, status_line, last_activity, drift, in_flight[], done_recent[], asks[], risks[], next_steps[], evidence[]}`. `status` is one of active, waiting-on-tim, stalled, parked, shipped or dormant. A `done_recent` entry with `kind` release or deploy counts as deployed. | the seat's coordinator, or the assistant |
-| `tasks.tsv`, `lanes/`, `intake.md` | Tasks, lane records and unhandled intake. | the seat |
-| `todo.json` | The drawing seat's to-do for the operator: `{sync: {date, title}, items: [{id, title, body, due, with[], steps[], links[{label, url}], drafts[{to, channel, text}], done}]}`. A `due` that is a date, an ISO time, today or tomorrow counts down on the board; other words show as written. | the assistant |
-
-Each project card computes a six-stage pipeline. Backlog and Todo come from `tasks.tsv`. Build counts running lanes and in-flight agents. Review counts open PRs on the card's repos, and Merged counts merges in the last 14 days. Deployed counts production deployments and releases from GitHub, plus the `done_recent` releases and deploys whose `ref` GitHub does not list. A check that GitHub refused to start, with a "job was not started" annotation, shows as CI not run with GitHub's reason instead of as failing.
-
-The instance file `remote-seats` lists seats on other hosts, one per line: `<name> <ssh target> <seat dir>`. tstack reads each over ssh with `--redact`, so only counts, ids, states and PR links leave that host.
-
-What the operator leaves on the board prints after the draw, one line each. The seat that owns it acts on it. `choice` and `note` lines come from the project tiles, and a choice prints until `tasks.tsv` reflects it. A `todo-done <id>` line comes from Mark done on the to-do and prints until `todo.json` marks that item done.
-
-## Upstream
-
-`pstack-bump <sha>` snapshots upstream pstack onto `pstack-upstream`, merges it into the current branch, drops the `DROPPED` paths again and prints the conflicts and our edit diff. pstack is MIT licensed; its notice is `pstack/LICENSE`.
+`pstack-bump <sha>` snapshots upstream pstack onto `pstack-upstream`, merges it into the current branch, removes paths listed in `pstack/DROPPED`, and prints conflicts and the local edit diff. `pstack/` holds the fork, `global.md` and `roles/` hold agent rules, and `agents/` holds model-bound agent types. pstack is MIT licensed with its notice in `pstack/LICENSE`.

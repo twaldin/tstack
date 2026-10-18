@@ -3,16 +3,13 @@
 
 Facts: state, head SHA, mergeability, auto-merge, review decision, each check with its result, each review,
 each issue comment (bot notices such as CodeRabbit's "Review limit reached" included) and each unresolved
-review thread. After merge also the merge SHA; the workflow runs on it, plus each of those workflows' newest
-run on a later base-branch commit that contains it; their deploy and release jobs; and per environment the
-newest GitHub deployment on the merge SHA and on a later containing commit, with its latest status.
+review thread. After merge also the merge SHA, the workflow runs on it, and their deploy and release jobs.
 
 --until polls every --interval seconds and prints the facts when its condition first holds:
   change    any fact differs from the first poll (the report then starts with the changed keys)
             mergeability compares known values only; the first known value sets its baseline
   merged    the PR is merged or closed
   checks    no check is queued or running (an empty list counts as not started for two minutes)
-  deployed  a deployment, or while there is none a deploy or release job, finished other than skipped or cancelled
 Every mode also stops when the PR is closed without merging. Exit 0 with facts; 1 when gh fails, with its error.
 """
 
@@ -63,10 +60,6 @@ def login(item):
     return (item.get("author") or {}).get("login", "ghost")
 
 
-def finished(result):
-    return bool(result) and result.upper() not in RUNNING | {"SKIPPED", "CANCELLED"}
-
-
 def snapshot(repo, number):
     pr = gh("pr", "view", number, "--repo", repo, "--json", PR_FIELDS)
     owner, name = repo.split("/")
@@ -95,20 +88,7 @@ def snapshot(repo, number):
 
 
 def after_merge(repo, pr):
-    sha, base = pr["mergeCommit"]["oid"], pr["baseRefName"]
-    contains = {sha: True}
-
-    def contained(head):
-        if head not in contains:
-            # Compare head...sha, not sha...head: when sha is an ancestor of head the answer is "behind" with no
-            # commits or files, so the check stays small however far the base branch has moved.
-            contains[head] = gh("api", f"repos/{repo}/compare/{head}...{sha}")["status"] in ("behind", "identical")
-        return contains[head]
-
-    def later(key):
-        workflow, event = key
-        newest = gh("api", f"repos/{repo}/actions/workflows/{workflow}/runs?branch={base}&event={event}&per_page=1")
-        return [r for r in newest["workflow_runs"] if r["head_sha"] != sha and contained(r["head_sha"])]
+    sha = pr["mergeCommit"]["oid"]
 
     def described(run):
         listed = [] if run["conclusion"] == "skipped" else gh(
@@ -118,24 +98,9 @@ def after_merge(repo, pr):
                 "jobs": [{"name": j["name"], "result": j["conclusion"] or j["status"], "url": j["html_url"]}
                          for j in listed if DEPLOY_JOB.match(j["name"].rsplit(" / ", 1)[-1])]}
 
-    def status(deployment):
-        latest = (gh("api", f"repos/{repo}/deployments/{deployment['id']}/statuses?per_page=1") or [{}])[0]
-        return {"environment": deployment["environment"], "sha": deployment["sha"], "state": latest.get("state"),
-                "at": latest.get("created_at"), "url": latest.get("log_url") or latest.get("target_url") or None}
-
     with ThreadPoolExecutor(8) as pool:
         runs = gh("api", f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]
-        workflows = dict.fromkeys((r["workflow_id"], r["event"]) for r in runs if r["conclusion"] != "skipped")
-        runs += [r for found in pool.map(later, workflows) for r in found]
-        deployments = {}
-        for d in gh("api", f"repos/{repo}/deployments?sha={sha}&per_page=100"):
-            deployments.setdefault((d["environment"], True), d)
-        for d in gh("api", f"repos/{repo}/deployments?ref={base}&per_page=100"):
-            key = (d["environment"], False)
-            if key not in deployments and d["sha"] != sha and d["created_at"] >= pr["mergedAt"] and contained(d["sha"]):
-                deployments[key] = d
-        return {"sha": sha, "at": pr["mergedAt"], "runs": list(pool.map(described, runs)),
-                "deployments": list(pool.map(status, deployments.values()))}
+        return {"sha": sha, "at": pr["mergedAt"], "runs": list(pool.map(described, runs))}
 
 
 def stopped(until, first, now, waited):
@@ -146,10 +111,7 @@ def stopped(until, first, now, waited):
     if until == "checks":
         started = bool(now["checks"]) or waited >= EMPTY_CHECKS_GRACE
         return started and not any(str(c["result"]).upper() in RUNNING for c in now["checks"])
-    merge = now["merge"] or {"runs": [], "deployments": []}
-    if merge["deployments"]:
-        return any(finished(d["state"]) for d in merge["deployments"])
-    return any(finished(j["result"]) for r in merge["runs"] for j in r["jobs"])
+    return False
 
 
 def headline(body):
@@ -192,7 +154,7 @@ def render(r):
     m = r["merge"]
     if m:
         out += [f"merged {m['at']} as {m['sha']}",
-                f"runs on {m['sha'][:12]} or a later {r['base']} commit containing it ({len(m['runs'])}):"]
+                f"runs on {m['sha'][:12]} ({len(m['runs'])}):"]
         for x in m["runs"]:
             if x["result"] != "skipped":
                 out.append(f"  {x['workflow']} ({x['event']}) on {x['sha'][:12]}: {x['result']} {x['url']}")
@@ -200,9 +162,6 @@ def render(r):
         skipped = Counter(x["workflow"] for x in m["runs"] if x["result"] == "skipped")
         if skipped:
             out.append("  skipped: " + ", ".join(f"{name} x{count}" for name, count in skipped.items()))
-        out.append(f"deployments ({len(m['deployments'])}):")
-        out += [f"  {d['environment']} on {d['sha'][:12]}: {d['state'] or 'no status'} {d['at'] or ''} {d['url'] or ''}"
-                .rstrip() for d in m["deployments"]]
     return "\n".join(out)
 
 
@@ -211,7 +170,7 @@ def main():
     parser.add_argument("pr", help="https://github.com/<owner>/<repo>/pull/<n> or <owner>/<repo>#<n>")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="print the facts once (the default)")
-    mode.add_argument("--until", choices=["change", "merged", "checks", "deployed"])
+    mode.add_argument("--until", choices=["change", "merged", "checks"])
     parser.add_argument("--json", action="store_true", help="print the facts as JSON")
     parser.add_argument("--interval", type=float, default=60, help="seconds between polls (default 60)")
     args = parser.parse_args()

@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -74,7 +75,6 @@ class LaneRuns(Sandbox):
         self.cli("lane", "stop", slow)
 
     def test_systemd_runs_a_user_unit_that_stop_stops(self):
-        self.env["TSTACK_LAUNCHER"] = "systemd"
         self.brief.write_text("Print ${HOME} and $PATH as written.\n")
         lane_id = self.start("--memory", "4G")
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
@@ -101,6 +101,230 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.cli("lane", "list").stdout, "")
         self.assertTrue(self.cli("lane", "list", "--all").stdout.startswith(f"{lane_id}\texited"))
 
+    def test_live_stream_drops_updates_but_keeps_logs_session_cost_and_final(self):
+        self.omp(answer="answer", cost=0.7, events=[
+            123, [], None, "not an event",
+            {"type": "tool_execution_update", "partialResult": "discard me"},
+            {"type": "tool_execution_start", "toolName": "read", "intent": "Reading file"},
+            {"type": "message_update", "delta": "discard me too"}])
+        lane_id = self.start()
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\nanswer\n")
+        stream = self.seat / "state" / "run" / "lanes" / lane_id / "run-1.jsonl"
+        self.assertEqual([json.loads(line)["type"] for line in stream.read_text().splitlines()],
+                         ["session", "tool_execution_start", "message_end"])
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "> read: Reading file\nanswer\n")
+        self.assertEqual(self.record(lane_id)["runs"][0]["cost_usd"], 0.7)
+
+    def merged(self, lane_id, head):
+        path = self.seat / "state" / "lanes" / lane_id / "lane.json"
+        record = self.record(lane_id)
+        record.update(pr="https://github.com/acme/demo/pull/7", merge="f" * 40, merged_head=head)
+        path.write_text(json.dumps(record))
+
+    def test_refresh_cleans_merged_worktree_branch_and_stream_but_preserves_show(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+        show = self.cli("lane", "show", lane_id).stdout.splitlines()
+        self.assertEqual(show[-2:], ["final answer (last 20 lines):", "done"])
+        self.assertIn(f"worktree {worktree} (removed)", show)
+        self.assertFalse(worktree.exists())
+        self.assertEqual(git(self.main, "branch", "--list", f"lane/{lane_id}"), "")
+        self.assertEqual(sorted(p.name for p in (self.seat / "state/run/lanes" / lane_id).iterdir()), ["lock"])
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+
+    def test_merged_cleanup_preserves_dirty_worktree(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+        (worktree / "untracked").write_text("keep\n")
+        self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left dirty worktree\n")
+        self.assertEqual((worktree / "untracked").read_text(), "keep\n")
+        self.assertEqual(git(worktree, "branch", "--show-current"), f"lane/{lane_id}")
+
+    def test_clean_preserves_unpushed_commits_even_after_merge(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        head = git(worktree, "rev-parse", "HEAD")
+        git(worktree, "commit", "--allow-empty", "-m", "unpublished")
+        self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left worktree: unpushed commits\n")
+        self.merged(lane_id, head)
+        self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left worktree: HEAD differs from merged head\n")
+        self.assertEqual(git(worktree, "log", "-1", "--format=%s"), "unpublished")
+
+    def test_completed_inspections_work_offline_without_refresh_pr_discovery(self):
+        lane_id = self.start()
+        (self.stubs / "pr-list.err").write_text("error connecting to api.github.com")
+        (self.stubs / "pr-view.err").write_text("error connecting to api.github.com")
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+        self.assertEqual(self.log("gh"), [])
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "done\n")
+        show = self.cli("lane", "show", lane_id)
+        self.assertIn("PR ? (gh pr list --repo: error connecting to api.github.com)", show.stdout)
+        self.assertEqual(show.stdout.splitlines()[-1], "done")
+        listing = self.cli("lane", "list").stdout
+        self.assertIn(f"{lane_id}\texited\texit 0\t$0.02\t? (gh pr list --repo: error connecting to api.github.com)", listing)
+        self.assertEqual([call["args"][:2] for call in self.log("gh")], [["pr", "list"], ["pr", "list"]])
+
+    def test_unchanged_inspections_do_not_rewrite_the_record_or_view_closed_pr(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        path = self.seat / "state" / "lanes" / lane_id / "lane.json"
+        record = self.record(lane_id)
+        record.update(pr="https://github.com/acme/demo/pull/7", updated="2026-01-01T00:00:00Z")
+        path.write_text(json.dumps(record))
+        before, stat = path.read_bytes(), path.stat()
+        (self.stubs / "pr-view.err").write_text("offline")
+        for command in ("show", "list", "wait", "logs", "list"):
+            result = self.cli("lane", command, *([] if command == "list" else [lane_id]))
+            self.assertIn("done" if command != "list" else lane_id, result.stdout)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
+        self.assertEqual(self.log("gh"), [])
+
+    def test_detached_and_different_branch_cleanup_are_visible_safe_skips(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+        git(worktree, "checkout", "--detach", "--quiet")
+        for command in ("show", "list", "wait", "logs"):
+            result = self.cli("lane", command, *([] if command == "list" else [lane_id]))
+            self.assertEqual(result.stderr, f"lane: {lane_id} cleanup: left worktree on detached HEAD\n")
+            self.assertIn("done" if command != "list" else lane_id, result.stdout)
+        self.assertEqual(self.record(lane_id)["cleanup"], "left worktree on detached HEAD")
+        self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left worktree on detached HEAD\n")
+        git(worktree, "checkout", "--quiet", "-b", "other")
+        result = self.cli("lane", "show", lane_id)
+        self.assertEqual(result.stderr, f"lane: {lane_id} cleanup: left worktree on another branch\n")
+        self.assertEqual(self.record(lane_id)["cleanup"], "left worktree on another branch")
+        self.assertEqual(git(worktree, "branch", "--show-current"), "other")
+        self.assertEqual(git(self.main, "branch", "--list", f"lane/{lane_id}"), f"lane/{lane_id}")
+
+    def test_cleanup_errors_are_visible_and_persisted_but_explicit_clean_fails(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+        git(self.main, "worktree", "lock", str(worktree))
+        for command in ("show", "list", "wait", "logs"):
+            result = self.cli("lane", command, *([] if command == "list" else [lane_id]))
+            fact = self.record(lane_id)["cleanup"]
+            self.assertTrue(fact.startswith("error: git "))
+            self.assertIn("locked", fact)
+            self.assertEqual(result.stderr, f"lane: {lane_id} cleanup: {fact}\n")
+            self.assertIn("done" if command != "list" else lane_id, result.stdout)
+        path = self.seat / "state" / "lanes" / lane_id / "lane.json"
+        before = path.stat().st_mtime_ns
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "done\n")
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        result = self.cli("lane", "clean", lane_id, check=False)
+        self.assertEqual((result.returncode, result.stderr), (1, f"lane: {fact.removeprefix('error: ')}\n"))
+        self.assertTrue(worktree.is_dir())
+        git(self.main, "worktree", "unlock", str(worktree))
+        self.assertIn("(removed)", self.cli("lane", "show", lane_id).stdout)
+        self.assertTrue(self.record(lane_id)["cleaned"])
+
+    def test_clean_recovers_historical_missing_worktree_from_canonical_repo(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+        path = self.seat / "state" / "lanes" / lane_id / "lane.json"
+        record = self.record(lane_id)
+        del record["cleanup_repo"]
+        path.write_text(json.dumps(record))
+        shutil.rmtree(worktree)
+        result = self.cli("lane", "clean", lane_id)
+        self.assertIn(f"Deleted branch lane/{lane_id}", result.stdout)
+        self.assertEqual(git(self.main, "branch", "--list", f"lane/{lane_id}"), "")
+        self.assertNotIn(str(worktree), git(self.main, "worktree", "list"))
+        self.assertEqual(sorted(p.name for p in (self.seat / "state/run/lanes" / lane_id).iterdir()), ["lock"])
+        self.assertEqual(self.cli("lane", "show", lane_id).stdout.splitlines()[-1], "done")
+
+    def test_clean_uses_stored_original_repo_when_worktree_is_already_removed(self):
+        other = self.root / "elsewhere"
+        git(self.root, "clone", "--quiet", str(self.origin), str(other))
+        lane_id = self.cli("lane", "start", "Fix it", "--repo", str(other), "--brief", str(self.brief)).stdout.strip()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+        self.assertEqual(Path(self.record(lane_id)["cleanup_repo"]), other / ".git")
+        shutil.rmtree(worktree)
+        self.assertIn(f"Deleted branch lane/{lane_id}", self.cli("lane", "clean", lane_id).stdout)
+        self.assertEqual(git(other, "branch", "--list", f"lane/{lane_id}"), "")
+        self.assertTrue(self.record(lane_id)["cleaned"])
+
+    def test_local_no_origin_clean_requires_head_reachable_from_local_base(self):
+        git(self.main, "remote", "remove", "origin")
+        lane_id = self.cli("lane", "start", "Local", "--repo", str(self.main), "--brief", str(self.brief)).stdout.strip()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        git(worktree, "commit", "--allow-empty", "-m", "unpublished")
+        self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left worktree: unpushed commits\n")
+        self.assertEqual(git(worktree, "log", "-1", "--format=%s"), "unpublished")
+        git(self.main, "merge", "--ff-only", f"lane/{lane_id}")
+        self.assertIn(f"removed worktree {worktree}", self.cli("lane", "clean", lane_id).stdout)
+        self.assertFalse(worktree.exists())
+        self.assertEqual(git(self.main, "branch", "--list", f"lane/{lane_id}"), "")
+        self.assertEqual(self.log("gh"), [])
+
+    def test_missing_local_no_origin_worktree_preserves_unpublished_branch_and_stream(self):
+        git(self.main, "remote", "remove", "origin")
+        lane_id = self.cli("lane", "start", "Local", "--repo", str(self.main), "--brief", str(self.brief)).stdout.strip()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        git(worktree, "commit", "--allow-empty", "-m", "unpublished")
+        shutil.rmtree(worktree)
+        path = self.seat / "state" / "lanes" / lane_id / "lane.json"
+        record = self.record(lane_id)
+        del record["cleanup_repo"]
+        path.write_text(json.dumps(record))
+        self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left branch: unpushed commits\n")
+        self.assertEqual(git(self.main, "log", "-1", "--format=%s", f"lane/{lane_id}"), "unpublished")
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "done\n")
+        git(self.main, "merge", "--ff-only", f"lane/{lane_id}")
+        self.assertIn(f"Deleted branch lane/{lane_id}", self.cli("lane", "clean", lane_id).stdout)
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "")
+
+    def test_resume_missing_or_cleaned_worktree_does_not_append_a_run(self):
+        for remove in ("missing", "cleaned", "auto-cleaned"):
+            with self.subTest(remove=remove):
+                lane_id = self.start()
+                self.cli("lane", "wait", lane_id)
+                if remove == "cleaned":
+                    self.cli("lane", "clean", lane_id)
+                elif remove == "auto-cleaned":
+                    worktree = Path(self.record(lane_id)["worktree"])
+                    self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
+                    self.assertIn("(removed)", self.cli("lane", "show", lane_id).stdout)
+                else:
+                    shutil.rmtree(Path(self.record(lane_id)["worktree"]))
+                before = self.record(lane_id)
+                result = self.cli("lane", "resume", lane_id, "more", check=False)
+                self.assertEqual((result.returncode, result.stderr),
+                                 (1, f"lane: {lane_id} worktree is missing or cleaned; cannot resume\n"))
+                self.assertEqual(self.record(lane_id), before)
+        self.assertEqual(len(self.log("systemd-run")), 3)
+
+    def test_explicit_clean_can_discover_an_external_merge(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        head = git(worktree, "rev-parse", "HEAD")
+        url = "https://github.com/acme/demo/pull/7"
+        (self.stubs / "pr-list.json").write_text(json.dumps([{"url": url}]))
+        (self.stubs / "pr-view.json").write_text(json.dumps(
+            {"state": "MERGED", "headRefOid": head, "mergeCommit": {"oid": "f" * 40}}))
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "done\n")
+        self.assertTrue(worktree.is_dir())
+        self.assertIn(f"removed worktree {worktree}", self.cli("lane", "clean", lane_id).stdout)
+        self.assertEqual((self.record(lane_id)["merged_head"], self.record(lane_id)["merge"]), (head, "f" * 40))
+        self.assertEqual([call["args"][:2] for call in self.log("gh")], [["pr", "list"], ["pr", "view"]])
+
 
 class LaneRecords(Sandbox):
     """Merge and old records work from lane.json alone; gh is faked."""
@@ -125,9 +349,7 @@ class LaneRecords(Sandbox):
                       [c["args"] for c in self.log("gh")])
         self.assertEqual((self.record("demo-x-1")["pr"], self.record("demo-x-1")["merge"]), (self.url, "f" * 40))
 
-    def test_auto_merge_is_reported_armed_and_github_refusals_pass_through(self):
-        self.assertEqual(self.cli("lane", "merge", "demo-x-1", "--auto", "--admin").stdout,
-                         f"auto-merge armed: {self.url} at {'a' * 12}\n")
+    def test_github_merge_refusals_pass_through(self):
         (self.stubs / "merge.err").write_text("Head branch was modified. Review and try the merge again.")
         result = self.cli("lane", "merge", "demo-x-1", check=False)
         self.assertEqual((result.returncode, result.stderr), (1, f"lane: gh pr merge {self.url}: Head branch was "

@@ -22,7 +22,6 @@ from pathlib import Path
 
 ENGINE = Path(os.environ.get("TSTACK_HOME") or Path(__file__).resolve().parents[1])
 WORKTREES = Path(os.environ.get("TSTACK_WORKTREES") or Path.home() / "worktrees")
-SYSTEMD = (os.environ.get("TSTACK_LAUNCHER") or ("process" if sys.platform == "darwin" else "systemd")) == "systemd"
 PASS_ENV = ("PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSH_AUTH_SOCK", "EASL_SOCKET",
             "TSTACK_HOME", "TSTACK_INSTANCE", "TSTACK_WORKTREES", "TSTACK_MACHINE")
 # Terminals easld spawns from a system unit lack the user bus that systemctl --user needs.
@@ -31,7 +30,9 @@ BUS = {**os.environ, "XDG_RUNTIME_DIR": RUNTIME,
        "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={RUNTIME}/bus"}
 # The run goes through sh so its exit code outlives the detached process that ran it. The TERM trap keeps the
 # shell waiting until omp has exited, and the exit file appears whole, by rename.
-RUNNER = 'trap : TERM; "$@" > "$0.jsonl" 2> "$0.err"; echo $? > "$0.exit.tmp"; mv -f "$0.exit.tmp" "$0.exit"'
+RUNNER = ('trap : TERM; python="$1"; writer="$2"; shift 2; '
+          '(trap : TERM; "$@" 2> "$0.err"; echo $? > "$0.exit.tmp") | "$python" "$writer" _stream > "$0.jsonl"; '
+          'mv -f "$0.exit.tmp" "$0.exit"')
 
 
 class Fail(Exception):
@@ -60,13 +61,30 @@ def git(repo, *args, check=True) -> str:
     return run(["git", "-C", str(repo), *args], check=check)
 
 
-def events(path: Path):
-    for line in path.read_text(errors="replace").splitlines() if path.exists() else []:
+KEPT_EVENTS = {"session", "message_end", "tool_execution_start"}
+
+
+def filter_stream(source, target):
+    for line in source:
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        yield event
+        if isinstance(event, dict) and event.get("type") in KEPT_EVENTS:
+            target.write(line)
+            target.flush()
+
+
+def events(path: Path):
+    if path.exists():
+        with path.open(errors="replace") as source:
+            for line in source:
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        yield event
+                except ValueError:
+                    continue
 
 
 def assistant_text(event: dict):
@@ -113,46 +131,68 @@ class Lane:
             return False
         return str(self.run_dir / f"run-{number}") in run(["ps", "-ww", "-o", "command=", "-p", pid], check=False)
 
-    def refresh(self, stopped: bool = False) -> dict:
-        """Record the latest run's end once its process is gone (or `stopped`): exit, cost, session, final.md."""
+    def refresh(self, stopped: bool = False, auto_clean: bool = True) -> dict:
         with self.locked():
             record = self.load()
+            changed = False
             last = (record.get("runs") or [{}])[-1]
-            if not last or last.get("end") or (not stopped and self.alive(last["run"])):
+            if not last or (not last.get("end") and not stopped and self.alive(last["run"])):
                 return record
-            code = self.file(last["run"], "exit").read_text().strip() if self.file(last["run"], "exit").exists() else ""
-            stream = list(events(self.file(last["run"], "jsonl")))
-            texts = [t for t in map(assistant_text, stream) if t is not None]
-            costs = [((e["message"].get("usage") or {}).get("cost") or {}).get("total") or 0
-                     for e in stream if assistant_text(e) is not None]
-            last.update(end=now(), exit=int(code) if code.lstrip("-").isdigit() else None, cost_usd=round(sum(costs), 6))
-            record["session"] = next((e.get("id") for e in stream if e.get("type") == "session"), record.get("session"))
-            record["status"] = "stopped" if stopped else "exited"
-            if texts and texts[-1]:
-                (self.dir / "final.md").write_text(texts[-1] + "\n")
-            else:
-                (self.dir / "final.md").unlink(missing_ok=True)
-            self.save(record)
+            if not last.get("end"):
+                code = self.file(last["run"], "exit").read_text().strip() if self.file(last["run"], "exit").exists() else ""
+                cost, final = 0, None
+                for event in events(self.file(last["run"], "jsonl")):
+                    if event.get("type") == "session":
+                        record["session"] = event.get("id")
+                    text = assistant_text(event)
+                    if text is not None:
+                        final = text
+                        cost += ((event["message"].get("usage") or {}).get("cost") or {}).get("total") or 0
+                last.update(end=now(), exit=int(code) if code.lstrip("-").isdigit() else None, cost_usd=round(cost, 6))
+                changed = True
+                record["status"] = "stopped" if stopped else "exited"
+                if final:
+                    (self.dir / "final.md").write_text(final + "\n")
+                else:
+                    (self.dir / "final.md").unlink(missing_ok=True)
+            for entry in record.get("runs") or []:
+                stream = self.file(entry["run"], "jsonl")
+                if not entry.get("compacted") and stream.exists():
+                    temporary = stream.with_suffix(".tmp")
+                    with stream.open(errors="replace") as source, temporary.open("w") as target:
+                        filter_stream(source, target)
+                    temporary.replace(stream)
+                    entry["compacted"] = True
+                    changed = True
+            if changed:
+                self.save(record)
+            if auto_clean and record.get("merge") and not record.get("cleaned"):
+                before = json.dumps(record)
+                try:
+                    record["cleanup"] = cleanup(self, record)
+                except (Fail, OSError) as error:
+                    record["cleanup"] = f"error: {error}"
+                if json.dumps(record) != before:
+                    self.save(record)
+                if record["cleanup"].startswith(("left ", "error: ")):
+                    print(f"lane: {self.id} cleanup: {record['cleanup']}", file=sys.stderr)
             return record
 
     def begin_run(self, record: dict, text: str, resume: bool) -> int:
         """Append a run and launch it. Caller holds the lock, so no refresh sees the run before its pid."""
         number = len(record["runs"]) + 1
-        record["runs"].append({"run": number, "start": now()})
+        record["runs"].append({"run": number, "start": now(), "compacted": True})
         self.save({**record, "status": "running"})
         argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
                 "--append-system-prompt", str(ENGINE / "roles" / "lane.md")] + ["--resume", record["session"]] * resume
         env = {**{k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}, "TSTACK_LANE": self.id, "TSTACK_SEAT": str(self.seat)}
-        command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), *argv, text]
-        if SYSTEMD:
-            spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
-                     "--expand-environment=no", f"--working-directory={record['worktree']}",
-                     "-p", f"MemoryMax={record['memory']}"]
-            run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
-            pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
-        else:
-            pid = subprocess.Popen(command, cwd=record["worktree"], env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True).pid
+        command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), sys.executable, str(Path(__file__).resolve()),
+                   *argv, text]
+        spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
+                 "--expand-environment=no", f"--working-directory={record['worktree']}",
+                 "-p", f"MemoryMax={record['memory']}"]
+        run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
+        pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
         self.file(number, "pid").write_text(f"{pid}\n")
         return number
 
@@ -201,7 +241,8 @@ def start(seat: Path, a) -> str:
     (lane.dir / "brief.md").write_text(brief)
     record = {"id": lane.id, "project": project, "seat": str(seat),
               "host": os.environ.get("TSTACK_MACHINE") or socket.gethostname().split(".")[0],
-              "repo": slug or str(main), "worktree": str(worktree), "branch": branch, "base": base, "model": a.model,
+              "repo": slug or str(main), "cleanup_repo": git(main, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+              "worktree": str(worktree), "branch": branch, "base": base, "model": a.model,
               "thinking": a.thinking, "memory": a.memory, "session": None, "status": "running", "pr": None,
               "runs": [], "created": now()}
     text = (f"You are lane {lane.id}, in {worktree} on branch {branch} (base {base}, repo {record['repo']}). "
@@ -219,6 +260,8 @@ def resume(lane: Lane, text: str) -> str:
             raise Fail(f"{lane.id} is running run {len(record['runs'])}; `lane stop {lane.id}` first")
         if not record.get("session"):
             raise Fail(f"{lane.id} has no omp session to resume")
+        if record.get("cleaned") or not Path(record["worktree"]).is_dir():
+            raise Fail(f"{lane.id} worktree is missing or cleaned; cannot resume")
         return f"{lane.id} run {lane.begin_run(record, text, resume=True)}"
 
 
@@ -227,11 +270,7 @@ def stop(lane: Lane) -> str:
     if record["status"] != "running":
         return f"{lane.id} is not running ({record['status']})"
     number = record["runs"][-1]["run"]
-    if SYSTEMD:
-        run(["systemctl", "--user", "stop", lane.unit], env=BUS)
-    else:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(int(lane.file(number, "pid").read_text()), signal.SIGTERM)
+    run(["systemctl", "--user", "stop", lane.unit], env=BUS)
     deadline = time.monotonic() + 90
     while lane.alive(number) and time.monotonic() < deadline:
         time.sleep(0.2)
@@ -242,7 +281,7 @@ def stop(lane: Lane) -> str:
     return f"{lane.id} stopped (run {number})"
 
 
-def merge(lane: Lane, admin: bool, auto: bool) -> str:
+def merge(lane: Lane, admin: bool) -> str:
     record = lane.refresh()
     url = find_pr(lane, record)
     if not url:
@@ -250,25 +289,93 @@ def merge(lane: Lane, admin: bool, auto: bool) -> str:
     head = json.loads(run(["gh", "pr", "view", url, "--json", "headRefOid"]))["headRefOid"]
     # Run outside any clone, so gh deletes only the remote branch and leaves the worktree's checkout alone.
     run(["gh", "pr", "merge", url, "--squash", "--delete-branch", "--match-head-commit", head]
-        + ["--admin"] * admin + ["--auto"] * auto, cwd="/")
+        + ["--admin"] * admin, cwd="/")
     after = json.loads(run(["gh", "pr", "view", url, "--json", "state,mergeCommit"]))
     if after.get("state") != "MERGED":
-        return f"auto-merge armed: {url} at {head[:12]}"
+        raise Fail(f"PR was not merged: {url}")
     sha = (after.get("mergeCommit") or {}).get("oid") or ""
-    lane.update(pr=url, merge=sha)
+    lane.update(pr=url, merge=sha, merged_head=head)
     return f"merged: {url} at {head[:12]} as {sha[:12]}"
 
 
-def clean(lane: Lane) -> str:
-    record = lane.refresh()
+def cleanup(lane: Lane, record: dict) -> str:
     worktree, done = Path(record["worktree"]), []
+    if record["status"] == "running":
+        return "left running lane"
+    repo = record.get("cleanup_repo")
+    if not repo:
+        if worktree.exists():
+            repo = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        else:
+            original = (Path(record["repo"]) if (record.get("repo") or "").startswith("/")
+                        else WORKTREES / record["project"] / "main")
+            if not original.is_dir():
+                return "left branch: original repository unavailable"
+            repo = git(original, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        record["cleanup_repo"] = repo
+        lane.save(record)
+
+    def refusal(head, target):
+        if record.get("merge"):
+            if not record.get("merged_head"):
+                return f"left {target}: merged head unavailable"
+            if head != record["merged_head"]:
+                return f"left {target}: HEAD differs from merged head"
+        elif git(repo, "remote", "get-url", "origin", check=False):
+            git(repo, "fetch", "--quiet", "origin")
+            if not git(repo, "for-each-ref", f"--contains={head}", "--format=%(refname)", "refs/remotes/origin"):
+                return f"left {target}: unpushed commits"
+        elif git(repo, "merge-base", head, f"refs/heads/{record['base']}", check=False) != head:
+            return f"left {target}: unpushed commits"
+        return ""
+
     if worktree.exists():
-        repo = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if git(worktree, "status", "--porcelain", "--untracked-files=all"):
+            return "left dirty worktree"
+        branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+        if not branch:
+            return "left worktree on detached HEAD"
+        if branch != record["branch"]:
+            return "left worktree on another branch"
+        reason = refusal(git(worktree, "rev-parse", "HEAD"), "worktree")
+        if reason:
+            return reason
         git(repo, "worktree", "remove", str(worktree))
         done.append(f"removed worktree {worktree}")
-    else:
-        repo = WORKTREES / record["project"] / "main" if github(record) else record["repo"]
-    return "\n".join(done + [git(repo, "branch", "-D", record["branch"])])
+    branch = git(repo, "rev-parse", "--verify", f"refs/heads/{record['branch']}", check=False)
+    if branch:
+        reason = refusal(branch, "branch")
+        if reason:
+            return reason
+        git(repo, "worktree", "prune")
+        done.append(git(repo, "branch", "-D", record["branch"]))
+    for entry in record.get("runs") or []:
+        for ext in ("jsonl", "err", "exit", "exit.tmp", "pid", "tmp"):
+            lane.file(entry["run"], ext).unlink(missing_ok=True)
+    record["cleaned"] = now()
+    return "\n".join(done) or "already clean"
+
+
+def clean(lane: Lane) -> str:
+    lane.refresh(auto_clean=False)
+    record = lane.load()
+    if github(record) and (not record.get("merge") or not record.get("merged_head")):
+        url = find_pr(lane, record)
+        if url:
+            pr = json.loads(run(["gh", "pr", "view", url, "--json", "state,mergeCommit,headRefOid"]))
+            if pr.get("state") == "MERGED":
+                lane.update(merge=pr["mergeCommit"]["oid"], merged_head=pr["headRefOid"])
+    with lane.locked():
+        record = lane.load()
+        try:
+            result = cleanup(lane, record)
+        except (Fail, OSError) as error:
+            record["cleanup"] = f"error: {error}"
+            lane.save(record)
+            raise
+        record["cleanup"] = result
+        lane.save(record)
+        return result
 
 
 def summary(lane: Lane, record: dict) -> tuple:
@@ -358,7 +465,6 @@ def main(argv) -> int:
     p["list"].add_argument("--all", action="store_true", help="include lanes whose worktree is gone")
     p["logs"].add_argument("-n", type=int, default=60)
     p["merge"].add_argument("--admin", action="store_true")
-    p["merge"].add_argument("--auto", action="store_true")
     a = top.parse_args(argv)
     if a.seat or os.environ.get("TSTACK_SEAT"):
         seat = Path(a.seat or os.environ["TSTACK_SEAT"]).expanduser().resolve()
@@ -369,7 +475,7 @@ def main(argv) -> int:
     lane = Lane(seat, a.id) if getattr(a, "id", None) else None
     out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text), "list": lambda: listing(seat, a.all),
            "show": lambda: show(lane), "logs": lambda: logs(lane, a.n), "stop": lambda: stop(lane),
-           "wait": lambda: wait([Lane(seat, i) for i in a.ids]), "merge": lambda: merge(lane, a.admin, a.auto),
+           "wait": lambda: wait([Lane(seat, i) for i in a.ids]), "merge": lambda: merge(lane, a.admin),
            "clean": lambda: clean(lane)}[a.cmd]()
     if out:
         print(out)
@@ -377,6 +483,10 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["_stream"]:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        filter_stream(sys.stdin, sys.stdout)
+        sys.exit(0)
     try:
         sys.exit(main(sys.argv[1:]))
     except Fail as error:

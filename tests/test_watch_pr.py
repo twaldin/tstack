@@ -123,23 +123,16 @@ class WatchPr(unittest.TestCase):
         self.assertIn("  CI (push) on a02d46c2e540: success https://github.com/twaldin/tstack/actions/runs/38471157784",
                       lines)
 
-    def test_until_deployed_waits_for_the_deploy_job_past_skipped_and_preparation_jobs(self):
-        for name, edit in (("all skipped", lambda job: job.update(status="completed", conclusion="skipped")),
-                           ("deploy pending", lambda job: job["name"] == "deploy / deploy"
-                            and job.update(status="in_progress", conclusion=None))):
-            def not_deployed(recorded, edit=edit):
-                for key, value in recorded.items():
-                    for job in value["jobs"] if key.endswith("/jobs?per_page=100") else []:
-                        edit(job)
-                    if "/deployments?" in key:
-                        value.clear()
-            with self.subTest(name):
-                lines = self.watch("example/sample-app#34610", "--until", "deployed", earlier=not_deployed).stdout.splitlines()
-                run = lines.index("  Continuous Deployment [Prod] (push) on 00d98aacb563: success "
-                                  "https://github.com/example/sample-app/actions/runs/38473380387")
-                self.assertEqual(lines[run + 1], "    deploy/release jobs success (1): deploy / deploy")
-                self.assertIn("  prod on 00d98aacb563: success 2026-10-13T22:34:25Z "
-                              "https://github.com/example/sample-app/actions/runs/38473380387/job/115574654369", lines)
+    def test_merge_reports_deploy_jobs_without_deployment_or_later_commit_tracking(self):
+        result = self.watch("example/sample-app#34610", "--once", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        merge = json.loads(result.stdout)["merge"]
+        self.assertEqual(set(merge), {"sha", "at", "runs"})
+        self.assertTrue(merge["runs"])
+        self.assertTrue(all(run["sha"] == merge["sha"] for run in merge["runs"]))
+        jobs = [job for run in merge["runs"] for job in run["jobs"]]
+        self.assertEqual([job["name"] for job in jobs], ["deploy / deploy"])
+        self.assertEqual(jobs[0]["result"], "success")
 
     def test_gh_failure_passes_through_with_exit_1(self):
         result = self.watch("example/team-instance#1", earlier=lambda recorded: recorded.pop("api graphql"))
