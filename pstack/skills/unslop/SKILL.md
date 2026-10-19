@@ -60,3 +60,13 @@ Rule numbers are stable ids that other skills cite. A removed rule leaves a gap.
 31. **Prefer the plain word.** "utilize" and "leverage" become "use", "facilitate" becomes "help", "numerous" becomes "many", "in the event that" becomes "if". The fancier synonym is rarely clearer.
 32. **Mannered prose.** Metaphor or flourish where a literal phrase exists: aphorisms ("wire it or delete it"), rhetorical fragments for effect, personified code ("the plan holds it"), figurative verbs ("rides along", "stands on"), stock framing phrases. "A dial worth turning" becomes "a parameter worth varying". Say what you mean. Rule 26 covers the metaphor nouns.
 33. **Over-compression.** Dropped articles, verbless fragments, symbol-speak, and abbreviations that make the reader decode instead of read. "Parser rejects bad date → exit 2, no write" becomes "The parser rejects a bad date, exits with code 2, and writes nothing." Write whole sentences with their articles and verbs, and spell out arrows and abbreviations.
+
+## Replies and comments
+
+- Write cleanly as you draft, including delegates' output. Do not rely on a cleanup pass.
+- Write replies in short declarative sentences, one thought per sentence, ended with a period. Write file-list bullets as sentences.
+- Keep every section the playbook's reply requires, including details, tradeoffs, choices, and open decisions. Every playbook ends with that reply. Each playbook's reply lines name only its unique content. Format PR links as `https://github.com/<owner>/<repo>/pull/<number>`.
+- Before implementation details, name the consumer and what changes for them. Then say what the next maintainer inherits. If you cannot name either impact, reconsider the work or explanation.
+- Never fabricate a link, citation, or transcript reference. Link only artifacts you produced or read this session.
+- Put each claim's evidence or label in the same sentence. Use measured, inferred, or guess. Predictions and unseen causes are guesses. Never hand the human a check you could run.
+- Keep comments only for a non-obvious why the code cannot show. Verification and test scripts get no phase-narrating comments. Use assertions or log strings to document steps, such as `assert(ok, 'persisted across restart')`. Apply this to every file, including delegates' diffs.

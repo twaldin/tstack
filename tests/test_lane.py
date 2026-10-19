@@ -160,6 +160,70 @@ class LaneRuns(Sandbox):
         self.assertEqual(sorted(p.name for p in (self.seat / "state/run/lanes" / lane_id).iterdir()), ["lock"])
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
 
+    def test_list_preserves_finished_and_merged_lane_files(self):
+        lane_id = self.start()
+        record_path = self.seat / "state/lanes" / lane_id / "lane.json"
+        stream = self.seat / "state/run/lanes" / lane_id / "run-1.jsonl"
+        exit_file = stream.with_suffix(".exit")
+        self.assertTrue(self.until(exit_file.exists))
+        worktree = Path(self.record(lane_id)["worktree"])
+        (self.stubs / "pr-list.json").write_text(json.dumps([{"url": "https://github.com/acme/demo/pull/7"}]))
+        for merged in (False, True):
+            with self.subTest(merged=merged):
+                record = self.record(lane_id)
+                record["runs"][0]["compacted"] = False
+                if merged:
+                    record.update(status="exited", merge="f" * 40, merged_head=git(worktree, "rev-parse", "HEAD"))
+                    record["runs"][0].update(end="2026-01-01T00:00:00Z", exit=0)
+                record_path.write_text(json.dumps(record))
+                with stream.open("a") as output:
+                    output.write(json.dumps({"type": "message_update", "delta": "legacy"}) + "\n")
+                def snapshot():
+                    return {str(p.relative_to(self.seat)): (p.read_bytes(), p.stat().st_mtime_ns)
+                            for p in self.seat.rglob("*") if p.is_file()}
+                before = snapshot()
+                for args in ((), ("--all",)):
+                    result = self.cli("lane", "list", *args)
+                    self.assertIn(f"{lane_id}\t{'exited' if merged else 'running'}\t", result.stdout)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(snapshot(), before)
+                    self.assertTrue(worktree.is_dir())
+                    self.assertEqual(git(worktree, "branch", "--show-current"), f"lane/{lane_id}")
+                self.assertEqual(self.log("gh"), [])
+
+    def test_show_records_external_merge_and_cleans_matching_worktree(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        head = git(worktree, "rev-parse", "HEAD")
+        url = "https://github.com/acme/demo/pull/7"
+        (self.stubs / "pr-list.json").write_text(json.dumps([{"url": url}]))
+        (self.stubs / "pr-view.json").write_text(json.dumps(
+            {"state": "MERGED", "headRefOid": head, "mergeCommit": {"oid": "f" * 40}}))
+        self.assertIn(f"worktree {worktree} (removed)", self.cli("lane", "show", lane_id).stdout)
+        self.assertEqual((self.record(lane_id)["merged_head"], self.record(lane_id)["merge"]), (head, "f" * 40))
+        self.assertFalse(worktree.exists())
+        self.assertEqual(git(self.main, "branch", "--list", f"lane/{lane_id}"), "")
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+
+    def test_wait_records_external_merge_but_preserves_unpublished_head(self):
+        lane_id = self.start()
+        self.cli("lane", "wait", lane_id)
+        worktree = Path(self.record(lane_id)["worktree"])
+        head = git(worktree, "rev-parse", "HEAD")
+        git(worktree, "commit", "--allow-empty", "-m", "unpublished")
+        path = self.seat / "state/lanes" / lane_id / "lane.json"
+        record = self.record(lane_id)
+        record["pr"] = "https://github.com/acme/demo/pull/7"
+        path.write_text(json.dumps(record))
+        (self.stubs / "pr-view.json").write_text(json.dumps(
+            {"state": "MERGED", "headRefOid": head, "mergeCommit": {"oid": "f" * 40}}))
+        result = self.cli("lane", "wait", lane_id)
+        self.assertEqual(result.stdout, f"{lane_id} exited exit 0\ndone\n")
+        self.assertEqual(result.stderr, f"lane: {lane_id} cleanup: left worktree: HEAD differs from merged head\n")
+        self.assertEqual((self.record(lane_id)["merged_head"], self.record(lane_id)["merge"]), (head, "f" * 40))
+        self.assertEqual(git(worktree, "log", "-1", "--format=%s"), "unpublished")
+
     def test_merged_cleanup_preserves_dirty_worktree(self):
         lane_id = self.start()
         self.cli("lane", "wait", lane_id)
@@ -192,24 +256,44 @@ class LaneRuns(Sandbox):
         self.assertIn("PR ? (gh pr list --repo: error connecting to api.github.com)", show.stdout)
         self.assertEqual(show.stdout.splitlines()[-1], "done")
         listing = self.cli("lane", "list").stdout
-        self.assertIn(f"{lane_id}\texited\texit 0\t$0.02\t? (gh pr list --repo: error connecting to api.github.com)", listing)
-        self.assertEqual([call["args"][:2] for call in self.log("gh")], [["pr", "list"], ["pr", "list"]])
+        self.assertIn(f"{lane_id}\texited\texit 0\t$0.02\t-\t", listing)
+        self.assertEqual([call["args"][:2] for call in self.log("gh")], [["pr", "list"]])
 
-    def test_unchanged_inspections_do_not_rewrite_the_record_or_view_closed_pr(self):
+    def test_recorded_pr_outage_does_not_block_local_lifecycle(self):
         lane_id = self.start()
         self.cli("lane", "wait", lane_id)
-        path = self.seat / "state" / "lanes" / lane_id / "lane.json"
+        path = self.seat / "state/lanes" / lane_id / "lane.json"
         record = self.record(lane_id)
-        record.update(pr="https://github.com/acme/demo/pull/7", updated="2026-01-01T00:00:00Z")
+        record["pr"] = "https://github.com/acme/demo/pull/7"
         path.write_text(json.dumps(record))
-        before, stat = path.read_bytes(), path.stat()
-        (self.stubs / "pr-view.err").write_text("offline")
-        for command in ("show", "list", "wait", "logs", "list"):
-            result = self.cli("lane", command, *([] if command == "list" else [lane_id]))
-            self.assertIn("done" if command != "list" else lane_id, result.stdout)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (stat.st_ino, stat.st_mtime_ns))
-        self.assertEqual(self.log("gh"), [])
+        before = path.read_bytes()
+        (self.stubs / "pr-view.err").write_text("error connecting to api.github.com")
+        for command in ("wait", "show", "stop"):
+            result = self.cli("lane", command, lane_id)
+            self.assertIn("error connecting to api.github.com", result.stderr)
+            self.assertIn("done" if command != "stop" else "is not running", result.stdout)
+            self.assertEqual(path.read_bytes(), before)
+        self.omp(answer="resumed")
+        self.assertEqual(self.cli("lane", "resume", lane_id, "continue offline").stdout, f"{lane_id} run 2\n")
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\nresumed\n")
+
+    def test_external_merge_without_required_sha_preserves_worktree(self):
+        for field in ("mergeCommit", "headRefOid"):
+            with self.subTest(field=field):
+                lane_id = self.start()
+                self.cli("lane", "wait", lane_id)
+                worktree = Path(self.record(lane_id)["worktree"])
+                head = git(worktree, "rev-parse", "HEAD")
+                path = self.seat / "state/lanes" / lane_id / "lane.json"
+                record = self.record(lane_id)
+                record["pr"] = "https://github.com/acme/demo/pull/7"
+                path.write_text(json.dumps(record))
+                pr = {"state": "MERGED", "headRefOid": head, "mergeCommit": {"oid": "f" * 40}}
+                pr[field] = None
+                (self.stubs / "pr-view.json").write_text(json.dumps(pr))
+                self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+                self.assertTrue(worktree.is_dir())
+                self.assertEqual(git(worktree, "rev-parse", "HEAD"), head)
 
     def test_detached_and_different_branch_cleanup_are_visible_safe_skips(self):
         lane_id = self.start()
@@ -217,10 +301,10 @@ class LaneRuns(Sandbox):
         worktree = Path(self.record(lane_id)["worktree"])
         self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
         git(worktree, "checkout", "--detach", "--quiet")
-        for command in ("show", "list", "wait", "logs"):
-            result = self.cli("lane", command, *([] if command == "list" else [lane_id]))
+        for command in ("show", "wait"):
+            result = self.cli("lane", command, lane_id)
             self.assertEqual(result.stderr, f"lane: {lane_id} cleanup: left worktree on detached HEAD\n")
-            self.assertIn("done" if command != "list" else lane_id, result.stdout)
+            self.assertIn("done", result.stdout)
         self.assertEqual(self.record(lane_id)["cleanup"], "left worktree on detached HEAD")
         self.assertEqual(self.cli("lane", "clean", lane_id).stdout, "left worktree on detached HEAD\n")
         git(worktree, "checkout", "--quiet", "-b", "other")
@@ -236,13 +320,13 @@ class LaneRuns(Sandbox):
         worktree = Path(self.record(lane_id)["worktree"])
         self.merged(lane_id, git(worktree, "rev-parse", "HEAD"))
         git(self.main, "worktree", "lock", str(worktree))
-        for command in ("show", "list", "wait", "logs"):
-            result = self.cli("lane", command, *([] if command == "list" else [lane_id]))
+        for command in ("show", "wait"):
+            result = self.cli("lane", command, lane_id)
             fact = self.record(lane_id)["cleanup"]
             self.assertTrue(fact.startswith("error: git "))
             self.assertIn("locked", fact)
             self.assertEqual(result.stderr, f"lane: {lane_id} cleanup: {fact}\n")
-            self.assertIn("done" if command != "list" else lane_id, result.stdout)
+            self.assertIn("done", result.stdout)
         path = self.seat / "state" / "lanes" / lane_id / "lane.json"
         before = path.stat().st_mtime_ns
         self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "done\n")

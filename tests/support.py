@@ -41,9 +41,6 @@ if args[:2] == ["pr", "list"] and (stub(f"pr-list-{repo}.err") or stub("pr-list.
     sys.exit(stub(f"pr-list-{repo}.err") or stub("pr-list.err"))
 elif args[:2] == ["pr", "list"]:
     print(stub(f"pr-list-{repo}.json") or stub("pr-list.json", "[]"))
-elif args[0] == "api":
-    value = json.loads(stub("api.json", "{}")).get(args[1].split("?")[0], [])
-    sys.exit(value) if isinstance(value, str) else print(json.dumps(value))
 elif args[:2] == ["pr", "view"] and stub("pr-view.err"):
     sys.exit(stub("pr-view.err"))
 elif args[:2] == ["pr", "view"]:
@@ -96,11 +93,6 @@ def apply(method, p, board):
         return {"object": locate(p["id"])[1]}
     if method == "object.find":
         found = objects(board)
-        if "key" in p:
-            found = [o for o in found if o["props"].get("key") == p["key"]]
-            if not found:
-                raise Refused(f"not_found: no object holds key {p['key']}")
-            return {"object": found[0]}
         if "keyPrefix" in p:
             found = sorted((o for o in found if o["props"].get("key", "").startswith(p["keyPrefix"])),
                            key=lambda o: o["props"]["key"])
@@ -175,17 +167,13 @@ def apply(method, p, board):
                 "labelOverlaps": [], "arrowOverlaps": [], "arrowIntersections": []}
     raise Refused(f"fake easl: no method {method}")
 try:
-    if args[:2] == ["ask", "list"]:
-        board = args[args.index("--board") + 1]
-        out = {"objects": [o for o in objects(board) if o["type"] == "question" and o["props"].get("status") == "open"]}
-    else:
-        params = {}
-        for flag, value in zip(args[1::2], args[2::2]):
-            params.update(json.loads(sys.stdin.read()) if flag == "--json" else {flag[2:]: value})
-        out = apply(args[0], params, params.get("board"))
+    params = {}
+    for flag, value in zip(args[1::2], args[2::2]):
+        params.update(json.loads(sys.stdin.read()) if flag == "--json" else {flag[2:]: value})
+    out = apply(args[0], params, params.get("board"))
 except Refused as error:
     sys.exit(str(error))
-if args[0] not in ("board.get", "agent.list", "object.get", "object.find", "layout.check", "ask"):
+if args[0] not in ("board.get", "agent.list", "object.get", "object.find", "layout.check"):
     path.write_text(json.dumps(store, indent=1))
 print(json.dumps(out))
 ''',

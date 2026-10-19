@@ -20,3 +20,5 @@ Check the real thing, not a proxy:
 The strongest proof is a deterministic script that re-runs the same comparison, not a one-time eyeball. Write the script, run it, and keep its output as an artifact a reviewer can re-run instead of trusting your word.
 
 Keep the artifact visible for the human. Commit it only for large or complex work where the trail has to be auditable later, like a big port or migration (the **show-me-your-work** skill).
+
+Identify the one or two facts the change's safety depends on and prove them with real code, preferably in the running app. Report each fact's strongest evidence, from a cited line or traced failure path to an executed test or app reproduction, or mark it unproven. Separate confirmed risks from checked and cleared risks, with likelihood, impact, real `file:line` citations, and the cheapest pre-merge reproduction.

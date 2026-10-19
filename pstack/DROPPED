@@ -45,3 +45,14 @@ skills/teach/*
 skills/correct/*
 skills/create-verification-skill/*
 skills/maintain-verification-skill/*
+
+# Unused restatement and catch-up helpers
+skills/bro/*
+skills/ketchup/*
+skills/in-your-own-words/*
+
+# Optional safety workflow; checks live in interrogate and principle-prove-it-works
+skills/blast-radius/*
+
+# Unused examples; TypeScript rules remain in the entrypoint
+skills/typescript-best-practices/references/patterns.md

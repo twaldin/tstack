@@ -7,7 +7,6 @@ import {
   openStore,
   parseVerdict,
   type Counts,
-  type Forge,
   type Frontier,
   type InboxPointer,
   type OpenGate,
@@ -80,12 +79,6 @@ interface GateResolveOptions {
   readonly answer: string;
 }
 
-interface FrontierSetOptions {
-  readonly repo?: string;
-  readonly forge: Forge;
-  readonly prs?: readonly number[];
-}
-
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -96,14 +89,6 @@ function positiveInteger(value: string): number {
     throw new InvalidArgumentError("must be a positive integer");
   }
   return parsed;
-}
-
-function prList(value: string): readonly number[] {
-  const parts = value.split(",");
-  if (parts.some((part) => part.length === 0)) {
-    throw new InvalidArgumentError("requires a comma-separated PR list");
-  }
-  return parts.map(positiveInteger);
 }
 
 function countLine(value: Counts): string {
@@ -206,14 +191,6 @@ function storeDirectory(program: Command): string {
   const value = program.opts<GlobalOptions>().store;
   if (value === undefined || value.trim().length === 0) {
     throw new UsageError("set --store <dir> or ORCH_STORE");
-  }
-  return value;
-}
-
-function frontierRepo(options: FrontierSetOptions): string {
-  const value = options.repo;
-  if (value === undefined || value.trim().length === 0) {
-    throw new UsageError("set --repo <dir> or ORCH_REPO");
   }
   return value;
 }
@@ -332,9 +309,6 @@ function createProgram(io: Io): Command {
         (rows) => compactRows(rows, unitLine, "(no units)")
       )
     );
-  leaf(unit, "counts", "count units by state").action(() =>
-    runStore(program, io, (store) => store.units.counts(), countLine)
-  );
 
   const ledger = program
     .command("ledger")
@@ -378,9 +352,6 @@ function createProgram(io: Io): Command {
         (row) => row.verdict
       )
     );
-  leaf(ledger, "summary", "count verification verdicts").action(() =>
-    runStore(program, io, (store) => store.ledger.summary(), countLine)
-  );
 
   const inbox = program
     .command("inbox")
@@ -421,15 +392,6 @@ function createProgram(io: Io): Command {
         (rows) => compactRows(rows, pointerLine, "(empty)", null)
       )
     );
-  leaf(inbox, "count", "count inbox pointers").action(() =>
-    runStore(
-      program,
-      io,
-      (store) => store.inbox.count(),
-      String,
-      (count) => ({ count })
-    )
-  );
 
   const gate = program
     .command("gate")
@@ -476,40 +438,6 @@ function createProgram(io: Io): Command {
     .command("frontier")
     .description("manage the stack frontier")
     .action(() => requireSubcommand(program));
-  leaf(
-    frontier,
-    "set",
-    "resolve the pull request base chain and set the frontier"
-  )
-    .addOption(
-      new Option(
-        "--repo <dir>",
-        "repository directory (or ORCH_REPO)"
-      ).env("ORCH_REPO")
-    )
-    .addOption(
-      new Option("--forge <forge>", "pull request forge")
-        .choices(["gh", "origin"])
-        .default("gh")
-    )
-    .option(
-      "--prs <n,...>",
-      "optional expected pull request order pin",
-      prList
-    )
-    .action((options: FrontierSetOptions) =>
-      runStore(
-        program,
-        io,
-        (store) =>
-          store.frontier.set({
-            repo: frontierRepo(options),
-            forge: options.forge,
-            prs: options.prs,
-          }),
-        frontierLine
-      )
-    );
   leaf(frontier, "show", "show the frontier").action(() =>
     runStore(program, io, (store) => store.frontier.show(), frontierLine)
   );

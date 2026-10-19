@@ -18,4 +18,4 @@ pstack is written for Cursor. Here it runs in omp on easl boards, and lanes take
 | Bugbot, the agentic security review | Your team's review bot. |
 | `scripts/watch-pr/watch-pr` | tstack's `watch-pr <pr>`. It prints facts (head, checks, reviews, threads, mergeability, and after merge the runs and deploys that carry it). `--once` reads once; `--until change` waits for the next change. |
 | Graphite `gt`, Origin | Not installed. Use `gh`. |
-| Not shipped here | `playbooks/multi-phase-plan.md` (write an effort file and briefs instead), `playbooks/worktree-cleanup.md` (`lane clean <id>`), and the skills setup-pstack, poteto-help, automate-me, make-bot-ui, recall, reflect, teach, correct, create-verification-skill and maintain-verification-skill. `../../DROPPED` lists every file left out. |
+| Not shipped here | `../../DROPPED` lists every omitted path. For multi-phase work, write an effort file and briefs instead of `playbooks/multi-phase-plan.md`. Use `lane clean <id>` instead of `playbooks/worktree-cleanup.md`. |

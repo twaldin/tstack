@@ -190,6 +190,15 @@ class Lane:
                     changed = True
             if changed:
                 self.save(record)
+            if github(record) and record.get("pr") and (not record.get("merge") or not record.get("merged_head")):
+                try:
+                    pr = json.loads(run(["gh", "pr", "view", record["pr"], "--json", "state,mergeCommit,headRefOid"]))
+                    if pr.get("state") == "MERGED":
+                        record.update(merge=(pr.get("mergeCommit") or {}).get("oid") or "",
+                                      merged_head=pr.get("headRefOid") or "")
+                        self.save(record)
+                except (Fail, ValueError) as error:
+                    print(f"lane: {self.id} PR refresh: {error}", file=sys.stderr)
             if auto_clean and record.get("merge") and not record.get("cleaned"):
                 before = json.dumps(record)
                 try:
@@ -315,6 +324,7 @@ def merge(lane: Lane, admin: bool) -> str:
         raise Fail(f"PR was not merged: {url}")
     sha = (after.get("mergeCommit") or {}).get("oid") or ""
     lane.update(pr=url, merge=sha, merged_head=head)
+    lane.refresh()
     return f"merged: {url} at {head[:12]} as {sha[:12]}"
 
 
@@ -377,14 +387,8 @@ def cleanup(lane: Lane, record: dict) -> str:
 
 
 def clean(lane: Lane) -> str:
+    find_pr(lane, lane.load())
     lane.refresh(auto_clean=False)
-    record = lane.load()
-    if github(record) and (not record.get("merge") or not record.get("merged_head")):
-        url = find_pr(lane, record)
-        if url:
-            pr = json.loads(run(["gh", "pr", "view", url, "--json", "state,mergeCommit,headRefOid"]))
-            if pr.get("state") == "MERGED":
-                lane.update(merge=pr["mergeCommit"]["oid"], merged_head=pr["headRefOid"])
     with lane.locked():
         record = lane.load()
         try:
@@ -398,28 +402,29 @@ def clean(lane: Lane) -> str:
         return result
 
 
-def summary(lane: Lane, record: dict) -> tuple:
-    try:
-        pr = find_pr(lane, record) or "-"
-    except Fail as error:
-        pr = f"? ({error})"
+def summary(record: dict) -> tuple:
+    pr = record.get("pr") or "-"
     return (record.get("runs") or [{}])[-1], pr, f"${sum(r.get('cost_usd') or 0 for r in record.get('runs') or []):.2f}"
 
 
 def listing(seat: Path, show_all: bool) -> str:
     root, rows = seat / "state" / "lanes", []
     for lane in [Lane(seat, p.name) for p in sorted(root.iterdir()) if (p / "lane.json").exists()] if root.is_dir() else []:
-        record = lane.refresh()
+        record = lane.load()
         if show_all or Path(record["worktree"]).exists():
-            last, pr, cost = summary(lane, record)
+            last, pr, cost = summary(record)
             rows.append(f"{lane.id}\t{record['status']}\texit {exit_code(last)}\t{cost}\t{pr}\t"
                         f"{last.get('end') or last.get('start') or record.get('created')}")
     return "\n".join(rows)
 
 
 def show(lane: Lane) -> str:
+    try:
+        pr = find_pr(lane, lane.load()) or "-"
+    except Fail as error:
+        pr = f"? ({error})"
     record = lane.refresh()
-    last, pr, cost = summary(lane, record)
+    last, _, cost = summary(record)
     final = lane.dir / "final.md"
     out = [f"{lane.id}: {record['status']}, run {last.get('run', 0)} exit {exit_code(last)}, {cost}",
            f"repo {record['repo']}, branch {record['branch']} on {record['base']}, PR {pr}",
@@ -436,7 +441,7 @@ def show(lane: Lane) -> str:
 
 def logs(lane: Lane, lines: int) -> str:
     """The latest run as readable lines: assistant text and tool calls, then stderr."""
-    number, out = len(lane.refresh().get("runs") or [{}]), []
+    number, out = len(lane.load().get("runs") or [{}]), []
     for event in events(lane.file(number, "jsonl")):
         if assistant_text(event):
             out.append(assistant_text(event))
@@ -465,7 +470,7 @@ def main(argv) -> int:
     for name, args, text in (
             ("start", ["name"], "make the worktree, start the first run detached, print the lane id"),
             ("resume", ["id", "text"], "new run in the same omp session, prompted with TEXT"),
-            ("list", [], "one line per lane: status, exit, cost, PR, last run time"),
+            ("list", [], "read-only cached lane status, exit, cost, PR, and last run time"),
             ("show", ["id"], "the lane's facts and the tail of its final answer"),
             ("logs", ["id"], "the latest run as readable lines"),
             ("wait", ["ids"], "block until a run of any listed lane ends; print its id, exit and final answer"),

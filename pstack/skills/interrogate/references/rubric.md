@@ -22,6 +22,8 @@ Is the code fixing the actual problem or papering over a symptom?
 
 Answering this often requires looking beyond the changed files. Read the surrounding code (callers, callees, type definitions, sibling modules) and understand the architecture the change lives in. Use the tools available to you (Read, Grep, Glob) to follow the call chain, read the types, and understand why the code exists before judging whether the change addresses the right layer.
 
+Follow risks that symbol search misses through serialized API, database, wire-format, cross-language, feature-flag, and downstream contracts. Read called libraries' source at the pinned version, including local patches, and check scheduling and teardown order.
+
 - Guard clauses that mask a deeper invariant violation
 - Retry logic that hides a broken contract
 - Type casts that silence a modeling error
