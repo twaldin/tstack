@@ -67,46 +67,104 @@ def locate(oid):
             if obj["id"] == oid:
                 return board, obj
     raise Refused(f"not_found: {oid}")
+def summary(obj):
+    obj = json.loads(json.dumps(obj))
+    if obj["type"] == "html" and "html" in obj["props"]:
+        obj["props"]["html"] = f'({len(obj["props"]["html"].encode())} bytes, use object.get)'
+    return obj
+def bounds(board):
+    for group in objects(board):
+        if group["type"] != "group":
+            continue
+        members = [o for o in objects(board) if o["id"] in group["props"].get("members", [])]
+        if not members:
+            continue
+        pad = group["props"].get("padding", 24)
+        left = min(o["frame"]["x"] for o in members)
+        top = min(o["frame"]["y"] for o in members)
+        right = max(o["frame"]["x"] + o["frame"]["w"] for o in members)
+        bottom = max(o["frame"]["y"] + o["frame"]["h"] for o in members)
+        group["frame"] = {"x": left - pad, "y": top - pad - 32,
+                          "w": right - left + 2 * pad, "h": bottom - top + 2 * pad + 32}
 def apply(method, p, board):
     if method == "board.get":
-        return {"objects": objects(board)}
+        return {"objects": [summary(o) for o in objects(board) if not o["props"].get("archived")],
+                "revision": store.get("revision", 0)}
     if method == "agent.list":
         return {"agents": store["agents"]}
     if method == "object.get":
         return {"object": locate(p["id"])[1]}
     if method == "object.find":
-        found = [o for o in objects(board) if o["props"].get("key", "").startswith(p.get("keyPrefix", ""))]
+        found = objects(board)
         if "key" in p:
             found = [o for o in found if o["props"].get("key") == p["key"]]
             if not found:
                 raise Refused(f"not_found: no object holds key {p['key']}")
             return {"object": found[0]}
-        return {"objects": found}
-    if method == "object.upsert":
-        obj = next((o for o in objects(board) if o["props"].get("key") == p["key"]), None)
+        if "keyPrefix" in p:
+            found = sorted((o for o in found if o["props"].get("key", "").startswith(p["keyPrefix"])),
+                           key=lambda o: o["props"]["key"])
+        if "type" in p:
+            found = [o for o in found if o["type"] == p["type"]]
+        if "status" in p:
+            found = [o for o in found if o["props"].get("status") == p["status"]]
+        return {"objects": [summary(o) for o in found]}
+    if method in ("object.upsert", "object.create"):
+        obj = next((o for o in objects(board) if o["props"].get("key") == p.get("key")), None) if method == "object.upsert" else None
         created = obj is None
         if created:
             store["next"] = store.get("next", 100) + 1
-            obj = {"id": f"obj_{store['next']}", "type": p["type"], "props": {"key": p["key"]}, "frame": {}}
+            obj = {"id": f"obj_{store['next']}", "type": p["type"], "props": {}, "frame": {}}
             objects(board).append(obj)
+        if "key" in p:
+            obj["props"]["key"] = p["key"]
         obj["props"].update(p.get("props") or {})
-        obj["frame"].update(p.get("frame") or {})
+        if obj["type"] != "group":
+            obj["frame"].update(p.get("frame") or {})
+        obj["rev"] = obj.get("rev", 0) + 1
+        bounds(board)
         return {"object": obj, "created": created}
     if method == "object.update":
-        obj = locate(p["id"])[1]
+        held, obj = locate(p["id"])
         obj["props"].update(p.get("props") or {})
-        obj["frame"].update(p.get("frame") or {})
+        if obj["type"] != "group":
+            obj["frame"].update(p.get("frame") or {})
+        obj["rev"] = obj.get("rev", 0) + 1
+        bounds(held)
         return {"object": obj}
     if method == "object.delete":
         held, obj = locate(p["id"])
         store["boards"][held].remove(obj)
+        for group in objects(held):
+            if group["type"] == "group" and p["id"] in group["props"].get("members", []):
+                group["props"]["members"].remove(p["id"])
+        bounds(held)
         return {"id": p["id"]}
     if method == "object.batch":
-        if (stubs / "terminal-moves.err").exists() and any(
-                op["method"] == "object.update" and locate(op["params"]["id"])[1]["type"] == "terminal"
-                for op in p["ops"]):
-            raise Refused("unavailable: terminal move batch failed")
-        return {"results": [apply(op["method"], op["params"], board) for op in p["ops"]]}
+        if len(p["ops"]) > 50:
+            raise Refused("invalid_params: at most 50 ops")
+        before = json.loads(json.dumps(store))
+        results = []
+        def resolve(value):
+            if isinstance(value, str) and value.startswith("$") and value[1:].isdigit():
+                return results[int(value[1:])]["object"]["id"]
+            if isinstance(value, list):
+                return [resolve(v) for v in value]
+            if isinstance(value, dict):
+                return {k: resolve(v) for k, v in value.items()}
+            return value
+        try:
+            for op in p["ops"]:
+                params = resolve(op["params"])
+                if (stubs / "terminal-moves.err").exists() and op["method"] == "object.update" and locate(params["id"])[1]["type"] == "terminal":
+                    raise Refused("unavailable: terminal move batch failed")
+                results.append(json.loads(json.dumps(apply(op["method"], params, board))))
+        except (Refused, IndexError, KeyError):
+            store.clear()
+            store.update(before)
+            raise
+        store["revision"] = store.get("revision", 0) + 1
+        return {"results": results, "revision": store["revision"]}
     if method == "layout.check":
         held = [o for o in objects(board) if o["type"] not in ("arrow", "group") and not o["props"].get("archived")]
         def hits(a, b):
@@ -127,7 +185,8 @@ try:
         out = apply(args[0], params, params.get("board"))
 except Refused as error:
     sys.exit(str(error))
-path.write_text(json.dumps(store, indent=1))
+if args[0] not in ("board.get", "agent.list", "object.get", "object.find", "layout.check", "ask"):
+    path.write_text(json.dumps(store, indent=1))
 print(json.dumps(out))
 ''',
     "bun": PRELUDE,

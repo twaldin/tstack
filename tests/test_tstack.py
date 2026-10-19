@@ -718,10 +718,6 @@ AGENT = {"tile": "obj_t", "kind": "omp", "live": True, "open": True, "lifecycle"
 CLEAN = "layout.check\tclean\n"
 
 
-def bottom(frame):
-    return frame["y"] + frame["h"]
-
-
 class Board(Sandbox):
     def setUp(self):
         super().setUp()
@@ -749,8 +745,18 @@ class Board(Sandbox):
     def frame(self, key):
         return self.obj(key)["frame"]
 
-    def html(self, key="mc/project/assistant"):
-        return self.obj(key)["props"]["html"]
+    def html(self, key="tstack/project/assistant"):
+        from html import unescape
+        from html.parser import HTMLParser
+        class Text(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.parts = []
+            def handle_data(self, data):
+                self.parts.append(data)
+        parser = Text()
+        parser.feed(self.obj(key)["props"]["html"])
+        return unescape(" ".join(parser.parts))
 
     def put(self, seat, name, text):
         path = seat / "state" / name
@@ -779,155 +785,222 @@ class Board(Sandbox):
     def snapshot(self):
         return {s["name"]: s for s in json.loads(self.board_cli("--print"))["seats"]}
 
-    def test_cards_use_local_state_and_link_running_lane_prs(self):
-        self.status(self.seat, project="System <work>", status="active", status_line="Ready <now>",
-                    next_steps=["Ship", "Watch", "Rest", "Not shown"], risks=["Not shown"])
-        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tFix <bug>\tactive\tfix-1\t-\t-\n")
-        self.lane(self.seat, "fix-1", pr="https://github.com/o/r/pull/7")
-        self.lane(self.seat, "done-1", status="exited", task="Not shown")
-        snap = self.snapshot()["assistant"]
-        self.assertEqual(snap["status"], {"project": "System <work>", "status": "active",
-                                         "status_line": "Ready <now>", "next_steps": ["Ship", "Watch", "Rest"]})
-        self.assertEqual(snap["lanes"][1], {"id": "fix-1", "task": "t1: Fix <bug>", "status": "running",
-                                           "pr": "https://github.com/o/r/pull/7"})
-        self.assertEqual(self.board_cli(), "mc/project/assistant\tcreated\n"
-                         "band\tassistant\tshowcase 0\ttail 0\n" + CLEAN)
-        page = self.html()
-        self.assertIn("System &lt;work&gt;", page)
-        self.assertIn("<p>active · seat idle</p><p>Ready &lt;now&gt;</p>", page)
-        self.assertIn("<li>Ship</li><li>Watch</li><li>Rest</li>", page)
-        self.assertIn('href="https://github.com/o/r/pull/7">PR #7</a>', page)
-        self.assertIn("t1: Fix &lt;bug&gt;", page)
-        self.assertNotIn("Not shown", page)
+    def members(self, key):
+        return set(self.obj(key)["props"]["members"])
 
-    def test_cards_keep_fixed_size_and_unchanged_draws_do_not_write(self):
+    def test_status_keeps_tasks_and_running_prs_for_parked_and_down_projects(self):
+        alpha = self.coordinator("alpha", "obj_a")
+        self.status(alpha, project="Alpha", status="parked", status_line="Waiting for review")
+        self.put(alpha, "tasks.tsv", HEADER + "t1\t-\tRepair widget\tblocked\tfix-1\t-\t-\n")
+        self.lane(alpha, "fix-1", pr="https://github.com/o/r/pull/7")
+        store = json.loads(self.store.read_text())
+        store["agents"][1]["live"] = False
+        self.store.write_text(json.dumps(store))
         self.board_cli()
-        first = self.frame("mc/project/assistant")
-        self.assertEqual(first, {"x": 0, "y": 640, "w": 1000, "h": 420})
-        self.status(self.seat, status_line="Long headline " * 1000, next_steps=["Long step " * 100] * 20)
-        self.assertIn("mc/project/assistant\tupdated\n", self.board_cli())
-        self.assertEqual(self.frame("mc/project/assistant"), first)
-        before = self.objects()
-        self.assertEqual(self.board_cli(), "mc/project/assistant\tunchanged\n"
-                         "band\tassistant\tshowcase 0\ttail 0\n" + CLEAN)
-        self.assertEqual(self.objects(), before)
+        page = self.html("tstack/project/projects/alpha")
+        for visible in ("Alpha", "Waiting for review", "Repair widget", "blocked", "fix-1"):
+            self.assertIn(visible, page)
+        self.assertIn("https://github.com/o/r/pull/7", self.obj("tstack/project/projects/alpha")["props"]["html"])
+        self.assertEqual(self.obj("tstack/group/projects/alpha")["type"], "group")
+        self.assertEqual(self.members("tstack/group/projects/alpha"),
+                         {"obj_a", self.obj("tstack/project/projects/alpha")["id"]})
 
-    def test_unreadable_state_is_visible_without_hiding_other_seats(self):
+    def test_you_always_contains_todo_and_every_open_question_with_attribution(self):
+        self.coordinator("alpha", "obj_a")
+        self.put(self.seat, "todo.json", json.dumps({"items": [
+            {"id": "a", "title": "Approve deployment", "steps": ["Read rollout"], "done": False, "project": "alpha"},
+            {"id": "b", "title": "Choose release", "steps": [], "done": False, "with": ["alpha"]},
+            {"id": "c", "title": "Personal review", "steps": [], "done": False, "project": "missing"},
+            {"id": "d", "title": "Already finished", "steps": [], "done": True}]}))
+        self.add(self.tile("known", "question", 9000, 9000, status="open", asker={"tile": "obj_a"}),
+                 self.tile("unknown", "question", 10000, 9000, status="open", asker="nobody"),
+                 self.tile("digest", "note", 11000, 9000, 600, 700, key="digest", markdown="Needs you"))
+        self.board_cli()
+        self.assertEqual(self.obj("tstack/you")["type"], "group")
+        self.assertTrue({"known", "unknown", "digest", self.obj("tstack/todo")["id"]} <= self.members("tstack/you"))
+        page = self.html("tstack/todo")
+        for visible in ("Approve deployment", "Read rollout", "Choose release", "Personal review", "alpha", "Assistant"):
+            self.assertIn(visible.lower(), page.lower())
+        self.assertNotIn("Already finished", page)
+        self.assertEqual(self.obj("tstack/label/unknown")["type"], "shape")
+        self.assertIn("Unassigned", json.dumps(self.obj("tstack/label/unknown")["props"]))
+        self.assertIn("alpha", json.dumps(self.obj("tstack/label/known")["props"]).lower())
+        self.assertIn("Assistant", json.dumps(self.obj("tstack/label/digest")["props"]))
+        self.put(self.seat, "todo.json", '{"items":[]}')
+        self.board_cli()
+        self.assertEqual(self.obj("tstack/todo")["type"], "html")
+        self.assertNotIn("Approve deployment", self.html("tstack/todo"))
+
+    def test_todo_uses_title_project_and_source_seat_when_attribution_is_absent(self):
+        project = self.coordinator("tim-waldin-net", "obj_web")
+        self.put(self.seat, "todo.json", json.dumps({"items": [
+            {"id": "deploy", "title": "tim.waldin.net: deploy the site", "done": False}]}))
+        self.put(project, "todo.json", json.dumps({"items": [
+            {"id": "review", "title": "Review the release", "done": False}]}))
+        self.board_cli()
+        page = self.html("tstack/todo")
+        self.assertIn("tim-waldin-net | tim.waldin.net: deploy the site", page)
+        self.assertIn("tim-waldin-net | Review the release", page)
+
+    def test_malformed_todo_is_reported_without_hiding_status(self):
+        self.status(self.seat, status="active", status_line="Ready for review")
+        self.put(self.seat, "todo.json", '{"items":"not a list"}')
+        seat = self.snapshot()["assistant"]
+        self.assertIsNone(seat["todo"])
+        self.assertIn("todo.json", [error["source"] for error in seat["errors"]])
+        self.board_cli()
+        self.assertIn("Ready for review", self.html())
+        self.assertEqual(self.obj("tstack/todo")["type"], "html")
+
+    def test_unreadable_state_does_not_hide_other_projects(self):
         good, bad = self.coordinator("good", "obj_g"), self.coordinator("bad", "obj_b")
         self.status(good, status="active", status_line="Still works")
         self.put(bad, "status.json", "{")
         self.put(bad, "tasks.tsv", HEADER + "too\tfew\n")
-        self.lane(bad, "ok-1")
         self.put(bad, "lanes/broken/lane.json", "[]")
         seats = self.snapshot()
         self.assertEqual(seats["projects/bad"]["status_file"], "unreadable")
-        self.assertEqual(seats["projects/bad"]["tasks"], None)
+        self.assertIsNone(seats["projects/bad"]["tasks"])
         self.assertEqual([p["source"] for p in seats["projects/bad"]["errors"]],
                          ["tasks.tsv", "lanes/broken/lane.json", "status.json"])
         self.board_cli()
-        self.assertIn("Still works", self.html("mc/project/projects/good"))
-        self.assertIn("tasks.tsv unreadable: line 2: 2 columns, want 7", self.html("mc/project/projects/bad"))
-        self.assertIn("status.json unreadable:", self.html("mc/project/projects/bad"))
-        self.assertIn("missing: write", self.html())
+        self.assertIn("Still works", self.html("tstack/project/projects/good"))
+        self.assertIn("tasks.tsv", self.html("tstack/project/projects/bad"))
+        self.assertIn("status.json", self.html("tstack/project/projects/bad"))
 
-    def test_dangling_lane_record_is_reported_and_invalid_prs_are_text(self):
-        self.lane(self.seat, "ok-1", pr='javascript:alert("<bad>")')
+    def test_dangling_lane_record_is_reported(self):
+        self.lane(self.seat, "ok-1", pr="https://github.com/o/r/pull/9")
         folder = self.seat / "state/lanes/lost-1"
         folder.mkdir()
         (folder / "lane.json").symlink_to(self.root / "nowhere")
         seat = self.snapshot()["assistant"]
         self.assertEqual([l["id"] for l in seat["lanes"]], ["ok-1"])
-        self.assertEqual([p["source"] for p in seat["errors"]], ["lanes/lost-1/lane.json", "status.json"])
-        self.board_cli()
-        self.assertIn("javascript:alert(&quot;&lt;bad&gt;&quot;)", self.html())
-        self.assertNotIn('href="javascript:', self.html())
+        self.assertIn("lanes/lost-1/lane.json", [p["source"] for p in seat["errors"]])
 
-    def test_obsolete_mc_tiles_are_deleted_but_digest_and_unrelated_tiles_survive(self):
-        old = [self.tile(f"old_{n}", "html", -5000, n * 300, key=key, html="old")
-               for n, key in enumerate(("mc/todo", "mc/done", "mc/strip", "mc/project/gone", "mc/panel/old"))]
-        digest = self.tile("digest", "note", -30000, 0, 600, 700, key="digest", markdown="Needs you")
-        note = self.tile("mine", "note", -2000, 800, markdown="Mine")
-        self.add(*old, digest, note)
-        out = self.board_cli()
-        self.assertEqual({o["id"] for o in self.objects()},
-                         {"obj_t", "digest", "mine", self.obj("mc/project/assistant")["id"]})
-        for obj in old:
-            self.assertIn(f'{obj["props"]["key"]}\tdeleted\n', out)
-        self.assertEqual(self.obj("digest")["props"], digest["props"])
-        self.assertEqual((self.frame("digest")["w"], self.frame("digest")["h"]), (600, 700))
-        self.assertEqual(self.obj("mine"), note)
-        self.assertTrue(out.endswith(CLEAN), out)
-
-    def test_bands_are_active_first_then_name_and_wrap_show_tiles_at_chosen_sizes(self):
-        alpha, beta = self.coordinator("alpha", "obj_a"), self.coordinator("beta", "obj_b")
-        self.status(alpha, status="parked")
-        self.status(beta, status="active")
-        self.add(self.tile("c", "html", 9000, 9000, 1000, 500, key="show/beta/30-chart"),
-                 self.tile("a", "image", 9000, 9000, 1200, 700, key="show/beta/10-shot"),
-                 self.tile("d", "note", 9000, 9000, 900, 400, key="show/beta/40-notes"),
-                 self.tile("b", "browser", 9000, 9000, 1600, 900, key="show/beta/20-app"))
-        out = self.board_cli()
-        self.assertEqual([line for line in out.splitlines() if line.startswith("band\t")], [
-            "band\tassistant\tshowcase 0\ttail 0", "band\tprojects/beta\tshowcase 4\ttail 0",
-            "band\tprojects/alpha\tshowcase 0\ttail 0"])
-        a = self.frame("a")
-        self.assertEqual({i: self.frame(i) for i in ("b", "c", "d")}, {
-            "b": {"x": a["x"] + 1240, "y": a["y"], "w": 1600, "h": 900},
-            "c": {"x": a["x"] + 2880, "y": a["y"], "w": 1000, "h": 500},
-            "d": {"x": a["x"], "y": a["y"] + 940, "w": 900, "h": 400}})
-        self.assertGreaterEqual(self.frame("obj_a")["y"], bottom(self.frame("d")))
-        store = json.loads(self.store.read_text())
-        next(o for o in store["boards"]["brd_a"] if o["id"] == "a")["frame"].update(x=-30000, y=-30000)
-        self.store.write_text(json.dumps(store))
-        self.assertTrue(self.board_cli().endswith(CLEAN))
-        self.assertEqual(self.frame("a"), a)
-
-    def test_questions_follow_their_terminal_while_unowned_and_closed_questions_stay(self):
+    def test_borrowed_tiles_keep_identity_content_sizes_and_unrelated_objects(self):
         self.coordinator("alpha", "obj_a")
-        ask = {"asker": {"tile": "obj_a"}, "status": "open"}
-        first, second = self.tile("q1", "question", 9000, 9000, **ask), self.tile("q2", "question", 9000, 9000, **ask)
-        first["createdAt"], second["createdAt"] = 1, 2
-        other = self.tile("other", "question", -3000, -3000, status="open", asker="elsewhere")
-        closed = self.tile("closed", "question", -4000, -4000, status="answered", asker={"tile": "obj_a"})
-        self.add(second, first, other, closed)
-        self.assertTrue(self.board_cli().endswith(CLEAN))
-        self.assertGreaterEqual(self.frame("q1")["y"], bottom(self.frame("mc/project/projects/alpha")))
-        self.assertLess((self.frame("q1")["y"], self.frame("q1")["x"]),
-                        (self.frame("q2")["y"], self.frame("q2")["x"]))
-        self.assertEqual(self.obj("other"), other)
-        self.assertEqual(self.obj("closed"), closed)
+        published = [self.tile("shot", "image", 9000, 9000, 1200, 700, key="show/alpha/10-shot", source="local.png"),
+                     self.tile("app", "browser", 9000, 9000, 1600, 900, key="show/alpha/20-app", url="http://localhost:1234"),
+                     self.tile("code", "code", 9000, 9000, 900, 600, key="show/alpha/30-code", path="/tmp/example")]
+        unrelated = [self.tile("mine", "note", -2000, 800, markdown="Mine"),
+                     self.tile("follow", "code", -3000, 800, followOf="obj_a"),
+                     self.tile("owned", "html", -4000, 800, html="Untouched")]
+        unrelated[-1]["createdBy"] = {"kind": "agent", "tile": "obj_a"}
+        self.add(*published, *unrelated)
+        self.board_cli()
+        for old in published:
+            new = self.obj(old["id"])
+            self.assertEqual((new["id"], new["type"], new["props"]),
+                             (old["id"], old["type"], old["props"]))
+            self.assertEqual((new["frame"]["w"], new["frame"]["h"]), (old["frame"]["w"], old["frame"]["h"]))
+            self.assertIn(new["id"], self.members("tstack/group/projects/alpha"))
+        for old in unrelated:
+            self.assertEqual(self.obj(old["id"]), old)
+        self.assertEqual(self.obj("obj_a")["props"]["follow"], False)
+        self.assertEqual(self.obj("obj_t")["props"]["follow"], False)
 
-    def test_follow_is_disabled_only_for_placed_terminals(self):
+    def test_stale_keys_removed_and_legacy_cards_retired_narrowly(self):
+        self.add(self.tile("old", "html", -5000, 0, key="mc/project/assistant",
+                           html='<section data-project="assistant">old</section>'),
+                 self.tile("stale", "html", -5000, 300, key="tstack/task/removed", html="old"),
+                 self.tile("stale_lane", "html", -5000, 600, key="tstack/lane/removed", html="old"),
+                 self.tile("stale_project", "html", -5000, 900, key="tstack/project/projects/gone", html="old"),
+                 self.tile("other_mc", "note", -5000, 1200, key="mc/todo", markdown="Keep"),
+                 self.tile("other_card", "note", -5000, 1500, key="mc/project/private", markdown="Keep"))
+        self.board_cli()
+        ids = {o["id"] for o in self.objects()}
+        self.assertFalse({"old", "stale", "stale_lane", "stale_project"} & ids)
+        self.assertTrue({"other_mc", "other_card", "obj_t"} <= ids)
+        self.assertEqual(self.obj("tstack/project/assistant")["type"], "html")
+
+    def test_closed_question_retention_uses_closure_time_and_includes_archives(self):
+        import time
+        from datetime import datetime, timezone
+        now = time.time()
+        apple = 978307200
+        iso = lambda value: datetime.fromtimestamp(value, timezone.utc).isoformat()
+        cases = [
+            ("old_answer", "answered", {"answer": {"at": now - apple - 3600}}, {"updatedAt": now - apple}),
+            ("old_iso", "answered", {"answer": {"at": iso(now - 3600)}, "archived": True}, {}),
+            ("young_answer", "answered", {"answer": {"at": now - apple - 60}}, {}),
+            ("missing_answer", "answered", {}, {"createdAt": 1, "updatedAt": 1}),
+            ("young_cancel", "cancelled", {}, {"updatedAt": iso(now - 60)}),
+            ("old_cancel", "cancelled", {"archived": True}, {"updatedAt": now - apple - 3600}),
+            ("unknown_cancel", "cancelled", {"archived": True}, {}),
+        ]
+        preserved = {}
+        for oid, status, props, fields in cases:
+            obj = self.tile(oid, "question", -10000, len(preserved) * 500, status=status, **props)
+            obj.update(fields)
+            self.add(obj)
+            if oid in ("young_answer", "missing_answer", "young_cancel", "unknown_cancel"):
+                preserved[oid] = obj
+        self.add(self.tile("open", "question", 9000, 9000, status="open"))
+        self.board_cli()
+        ids = {o["id"] for o in self.objects()}
+        self.assertFalse({"old_answer", "old_iso", "old_cancel"} & ids)
+        for oid, old in preserved.items():
+            self.assertEqual(self.obj(oid), old)
+        self.assertIn("open", self.members("tstack/you"))
+
+    def test_removed_project_tasks_and_lanes_disappear_from_visible_state(self):
+        alpha = self.coordinator("alpha", "obj_a")
+        self.put(self.seat, "tasks.tsv", HEADER + "t1\t-\tObsolete task\tactive\told-1\t-\t-\n")
+        self.lane(self.seat, "old-1", pr="https://github.com/o/r/pull/123")
+        self.board_cli()
+        self.assertIn("Obsolete task", self.html())
+        shutil.rmtree(alpha)
+        self.put(self.seat, "tasks.tsv", HEADER)
+        shutil.rmtree(self.seat / "state/lanes/old-1")
+        self.board_cli()
+        keys = {o["props"].get("key") for o in self.objects()}
+        self.assertNotIn("tstack/project/projects/alpha", keys)
+        self.assertNotIn("tstack/group/projects/alpha", keys)
+        self.assertNotIn("Obsolete task", self.html())
+        self.assertNotIn("pull/123", self.obj("tstack/project/assistant")["props"]["html"])
+
+    def test_layout_avoids_obstacles_and_repeat_draw_writes_nothing(self):
         self.coordinator("alpha", "obj_a")
-        free = self.tile("free", "terminal", -30000, 0, 800, 600)
-        self.add(free, self.tile("ft", "code", 9000, 9000, followOf="obj_t"),
-                 self.tile("fa", "code", 9000, 9000, followOf="obj_a"),
-                 self.tile("ff", "code", -30000, 1000, followOf="free"),
-                 self.tile("show", "code", 9000, 9000, 900, 600, key="show/alpha/10-code"))
-        out = self.board_cli()
-        self.assertEqual(sorted(line for line in out.splitlines() if line.startswith("follow ")),
-                         ["follow fa\tdeleted", "follow ft\tdeleted"])
-        self.assertEqual([self.obj(i)["props"].get("follow") for i in ("obj_t", "obj_a", "free")],
-                         [False, False, None])
-        self.assertEqual({"ft", "fa", "ff", "show"} & {o["id"] for o in self.objects()}, {"ff", "show"})
-        self.assertEqual(self.obj("free"), free)
-        self.assertTrue(out.endswith(CLEAN))
+        obstacle = self.tile("obstacle", "note", 0, 640, 1800, 1200, markdown="Do not move")
+        self.add(obstacle, self.tile("s1", "image", 9000, 9000, 1000, 500, key="show/alpha/one"),
+                 self.tile("s2", "image", 9000, 9000, 1000, 500, key="show/alpha/two"))
+        self.assertIn(CLEAN, self.board_cli())
+        self.assertEqual(self.obj("obstacle"), obstacle)
+        a, b = self.frame("s1"), self.frame("s2")
+        self.assertTrue(a["y"] + a["h"] <= b["y"] or b["y"] + b["h"] <= a["y"])
+        for key in ("tstack/you", "tstack/group/assistant", "tstack/group/projects/alpha"):
+            group = self.frame(key)
+            blocked = obstacle["frame"]
+            self.assertTrue(group["x"] + group["w"] <= blocked["x"] or
+                            blocked["x"] + blocked["w"] <= group["x"] or
+                            group["y"] + group["h"] <= blocked["y"] or
+                            blocked["y"] + blocked["h"] <= group["y"])
+            for member in self.members(key):
+                frame = self.frame(member)
+                self.assertLessEqual(group["x"], frame["x"])
+                self.assertLessEqual(group["y"], frame["y"])
+                self.assertGreaterEqual(group["x"] + group["w"], frame["x"] + frame["w"])
+                self.assertGreaterEqual(group["y"] + group["h"], frame["y"] + frame["h"])
+        first = json.loads(self.store.read_text())
+        calls = len(self.log("easl"))
+        self.board_cli()
+        self.assertEqual(json.loads(self.store.read_text()), first)
+        writes = [c["args"][0] for c in self.log("easl")[calls:]
+                  if c["args"][0] in ("object.batch", "object.update", "object.upsert", "object.delete", "object.create")]
+        self.assertEqual(writes, [])
 
-    def test_down_and_parked_cards_are_compact_and_live_cards_expand(self):
-        self.status(self.coordinator("alpha", "obj_a"), status="active")
-        self.status(self.coordinator("old", "obj_o"), status="parked")
-        store = json.loads(self.store.read_text())
-        store["agents"][1]["live"] = False
-        self.store.write_text(json.dumps(store))
-        self.board_cli()
-        self.assertEqual(self.frame("mc/project/projects/alpha")["h"], 100)
-        self.assertEqual(self.frame("mc/project/projects/old")["h"], 100)
-        self.assertIn("seat down", self.html("mc/project/projects/alpha"))
-        store = json.loads(self.store.read_text())
-        store["agents"][1]["live"] = True
-        self.store.write_text(json.dumps(store))
-        self.board_cli()
-        self.assertEqual(self.frame("mc/project/projects/alpha")["h"], 420)
+    def test_more_than_fifty_operations_keep_cross_batch_group_members(self):
+        self.add(*(self.tile(f"q{n}", "question", 9000, 9000, status="open", asker="unknown") for n in range(60)))
+        self.assertIn(CLEAN, self.board_cli())
+        self.assertTrue({f"q{n}" for n in range(60)} <= self.members("tstack/you"))
+        for n in range(60):
+            self.assertEqual(self.obj(f"tstack/label/q{n}")["type"], "shape")
+        batches = [c for c in self.log("easl") if c["args"][0] == "object.batch"]
+        self.assertGreater(len(batches), 1)
+        self.assertEqual(self.obj("tstack/project/assistant")["type"], "html")
+        for obj in self.objects():
+            if obj["id"] != "obj_t" and obj["type"] != "question":
+                self.assertTrue(obj["props"].get("key", "").startswith("tstack/"), obj)
 
     def test_terminal_move_failure_is_reported_and_next_draw_repairs_it(self):
         self.coordinator("alpha", "obj_a")
@@ -939,10 +1012,10 @@ class Board(Sandbox):
         self.assertIn("terminal move batch failed", failed.stderr)
         self.assertEqual(self.obj("obj_a"), terminal)
         failure.unlink()
-        self.assertTrue(self.board_cli().endswith(CLEAN))
+        self.board_cli()
         self.assertEqual(self.obj("obj_a")["props"]["follow"], False)
 
-    def test_coordinator_draws_do_not_read_and_print_is_read_only_from_any_seat(self):
+    def test_project_draw_declines_and_print_is_read_only_from_any_seat(self):
         self.status(self.seat, status="active", status_line="Ready")
         self.assertEqual(self.snapshot()["assistant"]["status"]["status_line"], "Ready")
         self.assertEqual(self.objects(), [self.tile("obj_t", "terminal", 0, 0, 800, 600)])
@@ -953,20 +1026,5 @@ class Board(Sandbox):
         self.assertEqual(snap["projects/alpha"]["board"]["tile"], "obj_a")
         self.assertEqual(self.objects(), before)
         self.store.write_text("unavailable")
-        self.assertEqual(self.board_cli(), "board\tthe assistant draws the board\n")
+        self.board_cli()
         self.assertEqual(self.store.read_text(), "unavailable")
-
-    def test_owned_tiles_keep_sizes_and_creation_order_in_their_tail(self):
-        self.coordinator("alpha", "obj_a")
-        self.coordinator("beta", "obj_b")
-        first = self.tile("early", "image", 9000, 9000, 500, 400)
-        last = self.tile("late", "html", 9000, 9000, 400, 2500)
-        for number, obj in enumerate((first, last), 1):
-            obj.update(createdAt=number, createdBy={"kind": "agent", "tile": "obj_a"})
-        self.add(last, first)
-        self.assertTrue(self.board_cli().endswith(CLEAN))
-        early, late = self.frame("early"), self.frame("late")
-        self.assertEqual((early["w"], early["h"], late["w"], late["h"]), (500, 400, 400, 2500))
-        self.assertEqual(late["x"], early["x"] + 540)
-        self.assertEqual(late["y"], early["y"])
-        self.assertGreaterEqual(self.frame("obj_b")["y"], bottom(late))

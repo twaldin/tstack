@@ -4,7 +4,7 @@
 setup  links skills, agents and bins, writes systemd units and installs orch.
 update pulls the engine, safely refreshes the instance and reruns setup.
 commit pushes seat state through a private index and safely refreshes main.
-board  draws local project cards and showcases in horizontal easl bands.
+board  draws grouped local project status and a You section on easl.
 """
 
 from __future__ import annotations
@@ -21,6 +21,11 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import math
+import time
+import unicodedata
 from pathlib import Path
 
 HOME = Path.home()
@@ -434,7 +439,7 @@ def easl(method: str, **params) -> dict:
 
 READ_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
 TASK_COLUMNS = ["id", "effort", "title", "state", "lane", "pr", "updated"]
-GAP, BATCH, LEFT_W, SHOW_W = 40, 50, 1000, 4000
+GAP, BATCH, INNER_W, PANEL_W, BOARD_W = 24, 50, 1340, 640, 4300
 
 
 @dataclass
@@ -447,6 +452,7 @@ class Seat:
     status_file: str = "missing"
     tasks: list | None = None
     lanes: list | None = None
+    todo: list | None = None
     errors: list = field(default_factory=list)
 
 
@@ -491,6 +497,25 @@ def read_tasks(path: Path) -> list:
     return tasks
 
 
+def read_todo(path: Path) -> list:
+    if not path.is_file():
+        return []
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise ValueError("expected a JSON object with items[]")
+    items = []
+    for number, item in enumerate(data["items"], 1):
+        if not isinstance(item, dict) or not isinstance(item.get("title"), str):
+            raise ValueError(f"item {number}: expected an object with a title string")
+        if not isinstance(item.get("done", False), bool):
+            raise ValueError(f"item {number}: done must be boolean")
+        steps = item.get("steps", [])
+        if not isinstance(steps, list) or any(not isinstance(step, str) for step in steps):
+            raise ValueError(f"item {number}: steps must be an array of strings")
+        items.append({**item, "steps": steps, "done": item.get("done", False)})
+    return items
+
+
 def read_status(path: Path) -> dict:
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
@@ -512,6 +537,7 @@ def read_seat(path: Path) -> Seat:
     seat = Seat(str(path.relative_to(INSTANCE.resolve())), str(path))
     seat.board = attempt(seat, "board.json", lambda: read_pointer(path))
     seat.tasks = attempt(seat, "tasks.tsv", lambda: read_tasks(state / "tasks.tsv"))
+    seat.todo = attempt(seat, "todo.json", lambda: read_todo(state / "todo.json"))
     records = attempt(seat, "lanes", lambda: sorted(
         d for d in (state / "lanes").iterdir() if (d / "lane.json").exists() or (d / "lane.json").is_symlink())
         if (state / "lanes").is_dir() else [])
@@ -562,34 +588,7 @@ def project_name(seat: Seat) -> str:
 
 
 def project_key(seat: Seat) -> str:
-    return f"mc/project/{seat.name}"
-
-
-def collapsed(seat: Seat) -> bool:
-    return (seat.status or {}).get("status") == "parked" or seat.health in ("down", "no tile", "done")
-
-
-def project_card(seat: Seat, compact: bool) -> str:
-    status = seat.status or {}
-    body = (f'<h3 class="font-semibold">{e(project_name(seat))}</h3>'
-            f'<p>{e(status.get("status") or seat.status_file)} · seat {e(seat.health)}</p>')
-    if status.get("status_line"):
-        body += f'<p>{e(status["status_line"])}</p>'
-    if not compact:
-        steps = "".join(f"<li>{e(step)}</li>" for step in status.get("next_steps") or [])
-        body += f'<ol class="list-decimal pl-5">{steps}</ol>' if steps else ""
-        rows = []
-        for lane in seat.lanes or []:
-            if lane["status"] != "running":
-                continue
-            url = lane["pr"]
-            pr = (f' <a class="underline" href="{e(url)}">PR #{e(url.rsplit("/", 1)[-1])}</a>'
-                  if re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", url) else e(url))
-            rows.append(f'<li data-lane="{e(lane["id"])}">{e(lane["id"])} · {e(lane["task"])}{pr}</li>')
-        body += f'<ul>{"".join(rows)}</ul>' if rows else ""
-    body += "".join(f'<p class="text-warn">{e(p["source"])} unreadable: {e(p["error"])}</p>' for p in seat.errors)
-    return (f'<section data-project="{e(project_name(seat))}" class="h-full overflow-y-auto bg-background '
-            f'text-foreground font-sans text-sm p-4 space-y-2">{body}</section>')
+    return f"tstack/project/{seat.name}"
 
 
 def key_of(obj: dict) -> str:
@@ -606,153 +605,410 @@ def overlaps(a: dict, b: dict) -> bool:
 
 
 @dataclass
-class Band:
-    seat: Seat
-    operator: bool
-    terminal: str | None = None
-    digest: str | None = None
-    questions: list = field(default_factory=list)
-    show: list = field(default_factory=list)
-    owned: list = field(default_factory=list)
-    tail: list = field(default_factory=list)
-
-    def showcase(self) -> list:
-        return ([self.digest] if self.digest else []) + self.show + self.owned if self.operator else self.show
-
-    def blocks(self) -> list:
-        left = ([self.terminal] if self.terminal else []) + [project_key(self.seat)] + self.questions
-        if self.operator:
-            return [(left, LEFT_W, LEFT_W), (self.showcase(), SHOW_W, 0), (self.tail, SHOW_W, 0)]
-        return [(left, LEFT_W, LEFT_W), (self.show, SHOW_W, 0 if collapsed(self.seat) else SHOW_W),
-                (self.owned, SHOW_W, 0), (self.tail, SHOW_W, 0)]
-
-    def members(self) -> list:
-        return [i for i in (self.terminal, self.digest) if i] + self.questions + self.show + self.owned + self.tail
+class DesiredObject:
+    type: str
+    props: dict
+    frame: dict = field(default_factory=dict)
 
 
-def classify(snap: Snapshot, board_id: str, objects: dict) -> tuple:
-    bands, makers = [], {}
-    for n, seat in enumerate(snap.seats):
-        pointer, band = seat.board or {}, Band(seat, n == 0)
-        tile = pointer.get("tile")
-        if tile and tile not in makers:
-            makers[tile] = band
-            if pointer.get("board") == board_id and objects.get(tile, {}).get("type") == "terminal":
-                band.terminal = tile
-        bands.append(band)
-    terminals = {b.terminal: b for b in bands if b.terminal}
-    named = {b.seat.name.rsplit("/", 1)[-1]: b for b in bands}
-    follow = []
-    for i, obj in sorted(objects.items(), key=lambda item: (item[1].get("createdAt") or 0, item[0])):
-        props, key, kind = obj.get("props") or {}, key_of(obj), obj.get("type")
-        project, _, slug = key[len("show/"):].partition("/") if key.startswith("show/") else ("", "", "")
-        asker = props.get("asker") if kind == "question" and props.get("status") == "open" else None
-        if isinstance(asker, dict):
-            asker = asker.get("tile") or asker.get("name")
-        maker = makers.get((obj.get("createdBy") or {}).get("tile"))
-        if kind == "code" and props.get("followOf") in terminals:
-            follow.append(i)
-        elif kind == "terminal" or key.startswith("mc/"):
+@dataclass
+class ProjectGroup:
+    key: str
+    title: str
+    color: str
+    units: list[list[str]] = field(default_factory=list)
+    borrowed: set[str] = field(default_factory=set)
+
+    def members(self) -> list[str]:
+        return [member for unit in self.units for member in unit]
+
+
+@dataclass
+class BoardDesign:
+    desired: dict[str, DesiredObject] = field(default_factory=dict)
+    groups: list[ProjectGroup] = field(default_factory=list)
+    borrowed: set[str] = field(default_factory=set)
+    terminals: set[str] = field(default_factory=set)
+    positions: dict[str, dict] = field(default_factory=dict)
+
+
+def panel_height(text: str, width: int = 64) -> int:
+    lines = [sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in line)
+             for line in str(text).expandtabs(4).split("\n")]
+    return 22 * sum(max(1, math.ceil(length / width)) for length in lines) + 8
+
+
+def html_panel(title: str, sections: list) -> tuple[str, int]:
+    body = f'<h2 style="font-size:20px;line-height:28px;margin:0 0 12px;font-weight:650">{e(title)}</h2>'
+    height = 100 + panel_height(title, 44)
+    for heading, rows, limit in sections:
+        if heading:
+            body += f'<h3 style="font-size:14px;line-height:22px;margin:12px 0 4px;font-weight:650">{e(heading)}</h3>'
+            height += panel_height(heading) + 16
+        content = "".join(f'<div style="padding:4px 0;white-space:pre-wrap">{markup}</div>'
+                          for text, markup in rows)
+        row_height = sum(panel_height(text) for text, markup in rows)
+        style = f"max-height:{limit}px;overflow-y:auto;" if limit and row_height > limit else ""
+        body += f'<div style="{style}">{content}</div>'
+        height += min(row_height, limit) if limit else row_height
+    page = ('<style>html,body{margin:0;padding:0;background:transparent}'
+            '*{box-sizing:border-box}a{color:inherit;text-decoration:underline}</style>'
+            '<section style="padding:20px;color:#e5e7eb;background:#18202d;'
+            'font-family:ui-monospace,monospace;font-size:14px;line-height:22px;'
+            f'overflow-wrap:anywhere;word-break:break-word">{body}</section>')
+    return page, height
+
+
+def pr_markup(value: str) -> str:
+    if re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", value):
+        return f'<a href="{e(value)}">PR #{e(value.rsplit("/", 1)[-1])}</a>'
+    return e(value)
+
+
+def project_panel(seat: Seat) -> DesiredObject:
+    status = seat.status or {}
+    lines = [f'{status.get("status") or seat.status_file} | coordinator {seat.health}']
+    if status.get("status_line"):
+        lines.append(status["status_line"])
+    sections = [("", [(line, e(line)) for line in lines], None)]
+    if status.get("next_steps"):
+        sections.append(("Next steps", [(step, e(step)) for step in status["next_steps"]], None))
+    tasks = seat.tasks or []
+    task_rows = []
+    for task in tasks:
+        text = f'{task.get("id") or "?"} [{task.get("state") or "unknown"}] {task.get("title") or ""}'
+        if task.get("lane"):
+            text += f' | lane {task["lane"]}'
+        markup = e(text)
+        if task.get("pr"):
+            text += f' | {task["pr"]}'
+            markup += f' | {pr_markup(task["pr"])}'
+        task_rows.append((text, markup))
+    sections.append((f"Tasks ({len(tasks)})", task_rows or [("No tasks.", "No tasks.")], 264))
+    lanes = [lane for lane in seat.lanes or [] if lane["status"] == "running"]
+    rows = []
+    for lane in lanes:
+        text = f'{lane["id"]} | {lane["status"]}'
+        markup = e(text)
+        if lane["pr"]:
+            text += f' | {lane["pr"]}'
+            markup += f' | {pr_markup(lane["pr"])}'
+        rows.append((text, markup))
+    sections.append((f"Running lanes ({len(lanes)})", rows or [("None.", "None.")], None))
+    if seat.errors:
+        errors = [f'{error["source"]}: {error["error"]}' for error in seat.errors]
+        sections.append(("State errors", [(text, e(text)) for text in errors], None))
+    page, height = html_panel(project_name(seat), sections)
+    return DesiredObject("html", {"html": page, "title": project_name(seat)},
+                         {"w": PANEL_W, "h": height})
+
+
+def seat_aliases(seats: list[Seat]) -> dict[str, Seat]:
+    candidates = {}
+    for seat in seats:
+        for alias in (seat.name, seat.name.rsplit("/", 1)[-1], seat.path, project_name(seat),
+                      (seat.board or {}).get("tile")):
+            if alias:
+                candidates.setdefault(str(alias).casefold(), []).append(seat)
+    return {alias: matches[0] for alias, matches in candidates.items()
+            if len({seat.name for seat in matches}) == 1}
+
+
+def attributed_seat(values: list, aliases: dict) -> Seat | None:
+    for value in values:
+        if isinstance(value, (dict, list)):
+            nested = [value.get(key) for key in ("tile", "name", "project")] if isinstance(value, dict) else value
+            match = attributed_seat(nested, aliases)
+            if match:
+                return match
+        if isinstance(value, str) and value.casefold() in aliases:
+            return aliases[value.casefold()]
+    return None
+
+
+def question_project(obj: dict, objects: dict, aliases: dict) -> str:
+    props = obj.get("props") or {}
+    asker = props.get("asker") or {}
+    values = ([asker.get("tile"), asker.get("name")] if isinstance(asker, dict) else [asker])
+    creator = obj.get("createdBy") or {}
+    values += [creator.get("tile"), creator.get("name"), creator.get("agent")]
+    for context in props.get("context") or []:
+        if not isinstance(context, dict):
             continue
-        elif asker in terminals:
-            terminals[asker].questions.append(i)
-        elif slug and project in named:
-            named[project].show.append(i)
-        elif kind == "question":
-            continue
-        elif key == "digest" and not bands[0].digest:
-            bands[0].digest = i
-        elif maker and not key.startswith("show/"):
-            (maker.owned if key else maker.tail).append(i)
-    for band in bands:
-        band.show.sort(key=lambda i: key_of(objects[i]))
-        band.owned.sort(key=lambda i: key_of(objects[i]))
-    return bands, sorted(follow)
+        linked = objects.get(context.get("object"), {})
+        values.append(context.get("object"))
+        key = key_of(linked)
+        if key.startswith("show/"):
+            values.append(key.split("/", 2)[1])
+        elif key.startswith("tstack/project/"):
+            values.append(key.removeprefix("tstack/project/"))
+        values.append((linked.get("createdBy") or {}).get("tile"))
+        path = context.get("path")
+        if isinstance(path, str):
+            values.extend(alias for alias, seat in aliases.items()
+                          if path == seat.path or path.startswith(seat.path + "/"))
+    seat = attributed_seat(values, aliases)
+    return project_name(seat) if seat else "Unassigned"
 
 
-def flow(members: list, dims: dict, left, top, wrap, avoid: list) -> tuple:
-    spots, x, y, right, bottom, used = {}, left, top, left, top, False
-    for member in members:
-        w, h = dims[member]["w"], dims[member]["h"]
-        if used and x + w > left + wrap:
-            x, y, used = left, bottom + GAP, False
-        while hits := [o for o in avoid if overlaps({"x": x, "y": y, "w": w, "h": h}, o)]:
-            x = max(o["x"] + o["w"] for o in hits) + GAP
-            if x + w > left + wrap:
-                x, y = left, (bottom if used else min(o["y"] + o["h"] for o in hits)) + GAP
-                used = False
-        spots[member] = {"x": x, "y": y}
-        x, right, bottom, used = x + w + GAP, max(right, x + w), max(bottom, y + h), True
-    return spots, right, bottom
+def question_closed_time(obj: dict) -> float | None:
+    props = obj.get("props") or {}
+    if props.get("status") == "answered":
+        value = (props.get("answer") or {}).get("at")
+    elif props.get("status") == "cancelled":
+        value = next((value for value in (props.get("closedAt"), props.get("cancelledAt"), obj.get("closedAt"),
+                                         props.get("updatedAt"), obj.get("updatedAt"))
+                      if value is not None and value != ""), None)
+    else:
+        return None
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value) + 978307200 if math.isfinite(value) else None
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=timezone.utc).timestamp() if parsed.tzinfo is None else parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
 
 
-def plan(bands: list, dims: dict, obstacles: list, origin: dict) -> dict:
-    spots, top = {}, origin["y"]
-    for band in bands:
-        x, bottom = origin["x"], top
-        for members, wrap, reserve in band.blocks():
-            if members or reserve:
-                placed, right, low = flow(members, dims, x, top, wrap, obstacles)
-                spots.update(placed)
-                x, bottom = max(x + reserve, right) + GAP, max(bottom, low)
-        top = bottom + GAP
-    return spots
+def design_board(snap: Snapshot, board_id: str, objects: dict) -> BoardDesign:
+    design = BoardDesign()
+    aliases = seat_aliases(snap.seats)
+    you = ProjectGroup("tstack/you", "You", "orange")
+    design.groups.append(you)
+    todo_rows = []
+    for seat in snap.seats:
+        for item in seat.todo or []:
+            if item["done"]:
+                continue
+            prefix = item["title"].partition(":")[0].strip()
+            owner = attributed_seat([item.get("project"), item.get("with"), prefix,
+                                     prefix.replace(".", "-")], aliases) or seat
+            text = f'{project_name(owner)} | {item["title"]}'
+            if item["steps"]:
+                text += "\n" + "\n".join(f'  {number}. {step}' for number, step in enumerate(item["steps"], 1))
+            todo_rows.append((text, e(text)))
+    todo_errors = [f'{project_name(seat)} | {error["error"]}' for seat in snap.seats
+                   for error in seat.errors if error["source"] == "todo.json"]
+    sections = [(f"Open items ({len(todo_rows)})", todo_rows or [("No open todo items.", "No open todo items.")], None)]
+    if todo_errors:
+        sections.append(("Todo state errors", [(text, e(text)) for text in todo_errors], None))
+    page, height = html_panel("Needs you", sections)
+    design.desired["tstack/todo"] = DesiredObject("html", {"html": page, "title": "Needs you"},
+                                                 {"w": PANEL_W, "h": height})
+    you.units.append(["tstack/todo"])
+    assigned = set()
+
+    def borrow(group: ProjectGroup, obj: dict, label: str | None = None):
+        identity = obj["id"]
+        if identity in assigned:
+            return
+        assigned.add(identity)
+        group.borrowed.add(identity)
+        unit = []
+        if label:
+            key = "tstack/label/" + ("digest" if label == "digest" else identity)
+            text = "Assistant" if label == "digest" else question_project(obj, objects, aliases)
+            design.desired[key] = DesiredObject("shape", {"kind": "text", "text": text, "color": "grey",
+                                                         "textSize": 0.7},
+                                                {"w": min(max(160, len(text) * 9), PANEL_W),
+                                                 "h": 24 + 20 * (len(text) // 60)})
+            unit.append(key)
+        unit.append(identity)
+        group.units.append(unit)
+
+    for obj in sorted(objects.values(), key=lambda obj: obj["id"]):
+        if obj.get("type") == "question" and (obj.get("props") or {}).get("status", "open") == "open":
+            borrow(you, obj, obj["id"])
+    digests = [obj for obj in objects.values() if obj.get("type") == "note"
+               and key_of(obj) in ("digest", "show/assistant/digest")
+               and not (obj.get("props") or {}).get("archived")]
+    for obj in sorted(digests, key=lambda obj: (key_of(obj) != "digest", obj["id"])):
+        borrow(you, obj, "digest")
+        break
+    for seat in snap.seats:
+        group = ProjectGroup(f"tstack/group/{seat.name}", project_name(seat),
+                             "blue" if seat.name == "assistant" else "violet")
+        group.units.append([project_key(seat)])
+        design.desired[project_key(seat)] = project_panel(seat)
+        tile = (seat.board or {}).get("tile")
+        terminal = objects.get(tile, {})
+        if (seat.board or {}).get("board") == board_id and terminal.get("type") == "terminal":
+            borrow(group, terminal)
+            design.terminals.add(tile)
+        prefix = f'show/{Path(seat.path).name}/'
+        for obj in sorted(objects.values(), key=lambda obj: (key_of(obj), obj["id"])):
+            if (key_of(obj).startswith(prefix) and not (obj.get("props") or {}).get("archived")
+                    and obj.get("type") not in ("group", "arrow", "question")
+                    and not (obj.get("type") == "code" and (obj.get("props") or {}).get("followOf"))):
+                borrow(group, obj)
+        design.groups.append(group)
+    design.borrowed = assigned
+    for group in design.groups:
+        design.desired[group.key] = DesiredObject("group", {"members": group.members(), "title": group.title,
+                                                            "color": group.color, "padding": 24})
+    return design
+
+
+def place_groups(design: BoardDesign, objects: dict, obstacles: list[dict]):
+    dimensions = {identity: frame_of(objects[identity]) for identity in design.borrowed}
+    dimensions.update({key: obj.frame for key, obj in design.desired.items()})
+    left, top, row_bottom = 0, 0, 0
+    for number, group in enumerate(design.groups):
+        positions = {}
+        x, y, right, bottom = 0, 0, 0, 0
+        for unit in group.units:
+            width = max(dimensions[member]["w"] for member in unit)
+            height = sum(dimensions[member]["h"] for member in unit) + GAP * (len(unit) - 1)
+            if x and x + width > INNER_W:
+                x, y = 0, bottom + GAP
+            offset = y
+            for member in unit:
+                positions[member] = {"x": x, "y": offset}
+                offset += dimensions[member]["h"] + GAP
+            right, bottom = max(right, x + width), max(bottom, y + height)
+            x += width + GAP
+        width, height = right + 48, bottom + 80
+        if left and left + width > BOARD_W:
+            left, top = 0, row_bottom + GAP
+        while True:
+            bounds = {"x": left, "y": top, "w": width, "h": height}
+            hits = [frame for frame in obstacles if overlaps(bounds, frame)]
+            if not hits:
+                break
+            next_left = max(frame["x"] + frame["w"] for frame in hits) + GAP
+            if next_left + width <= BOARD_W:
+                left = next_left
+            else:
+                left, top = 0, max(top, min(frame["y"] + frame["h"] for frame in hits)) + GAP
+        for member, position in positions.items():
+            position = {"x": left + 24 + position["x"], "y": top + 56 + position["y"]}
+            if member in design.desired:
+                design.desired[member].frame.update(position)
+            else:
+                design.positions[member] = position
+        row_bottom = max(row_bottom, top + height)
+        left += width + GAP
+        if number == 0:
+            left, top = 0, row_bottom + GAP
+        obstacles.append(bounds)
+
+
+def reconcile_board(board_id: str, design: BoardDesign, objects: dict, existing: dict,
+                    obsolete: list[dict], caller: dict) -> list[str]:
+    ids = {key: obj["id"] for key, obj in existing.items()}
+    pending, pending_keys, output = [], {}, []
+
+    def flush():
+        if not pending:
+            return
+        result = easl("object.batch", board=board_id, ops=pending, **caller)
+        results = result.get("results") or []
+        if len(results) != len(pending):
+            raise Fail("easl object.batch: incomplete results")
+        for key, index in pending_keys.items():
+            identity = (results[index].get("object") or {}).get("id")
+            if not identity:
+                raise Fail(f"easl object.batch: no id for {key}")
+            ids[key] = identity
+        pending.clear()
+        pending_keys.clear()
+
+    def add(method: str, params: dict, key: str | None = None):
+        if len(pending) == BATCH:
+            flush()
+        if key:
+            pending_keys[key] = len(pending)
+        pending.append({"method": method, "params": params})
+
+    for obj in obsolete:
+        add("object.delete", {"id": obj["id"]})
+        output.append(f'{key_of(obj) or obj["id"]}\tdeleted')
+    for identity, position in sorted(design.positions.items()):
+        obj = objects[identity]
+        params = {"id": identity}
+        if any(frame_of(obj)[axis] != position[axis] for axis in ("x", "y")):
+            params["frame"] = position
+        if identity in design.terminals and (obj.get("props") or {}).get("follow") is not False:
+            params["props"] = {"follow": False}
+        if len(params) > 1:
+            add("object.update", params)
+    for key, desired in design.desired.items():
+        if len(pending) == BATCH:
+            flush()
+        props = dict(desired.props)
+        if desired.type == "group":
+            props["members"] = [f"${pending_keys[member]}" if member in pending_keys else ids.get(member, member)
+                                for member in props["members"]]
+        old = existing.get(key)
+        changed = not old or any((old.get("props") or {}).get(name) != value for name, value in props.items())
+        moved = desired.type != "group" and (not old or frame_of(old) != desired.frame)
+        if changed or moved:
+            params = {"key": key, "type": desired.type, "props": props}
+            if desired.type != "group":
+                params["frame"] = desired.frame
+            add("object.upsert", params, key)
+        output.append(f"{key}\t{'created' if not old else 'updated' if changed or moved else 'unchanged'}")
+    flush()
+    check = easl("layout.check", board=board_id, ids=sorted(set(ids.values()) | design.borrowed))
+    findings = {key: value for key, value in check.items() if value and key not in ("hints", "approximate")}
+    return output + ["layout.check\t" + (json.dumps(findings, sort_keys=True) if findings else "clean")]
 
 
 def draw(snap: Snapshot, pointer: dict) -> list:
     board_id = pointer["board"]
     caller = {"caller": os.environ["EASL_TILE_ID"]} if os.environ.get("EASL_TILE_ID") else {}
-    objects = {o["id"]: o for o in easl("board.get", board=board_id).get("objects") or []
-               if o.get("type") not in ("arrow", "group") and not (o.get("props") or {}).get("archived")}
-    found = easl("object.find", board=board_id, keyPrefix="mc/").get("objects") or []
-    existing = {key_of(o): o for o in found}
-    bands, follow = classify(snap, board_id, objects)
-    cards = {project_key(s): {"html": project_card(s, n > 0 and collapsed(s)),
-                             "title": project_name(s)} for n, s in enumerate(snap.seats)}
-    obsolete = [o for o in found if key_of(o) not in cards]
-    dims = {i: frame_of(o) for i, o in objects.items()}
-    dims.update({project_key(s): {"w": LEFT_W, "h": 100 if n > 0 and collapsed(s) else 420}
-                 for n, s in enumerate(snap.seats)})
-    placed = {i for band in bands for i in band.members()}
-    ignored = placed | {o["id"] for o in found} | set(follow)
-    obstacles = [frame_of(o) for i, o in objects.items() if i not in ignored]
-    origin = frame_of(objects.get(bands[0].terminal, {}))
-    spots = plan(bands, dims, obstacles, origin)
-    out, ops, ids = [], [], []
-    for key, props in cards.items():
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        manifest = pool.submit(easl, "board.get", board=board_id)
+        owned = pool.submit(easl, "object.find", board=board_id, keyPrefix="tstack/")
+        questions = pool.submit(easl, "object.find", board=board_id, type="question")
+        legacy = pool.submit(easl, "object.find", board=board_id, keyPrefix="mc/project/")
+        objects = {obj["id"]: obj for obj in manifest.result().get("objects") or []}
+        found = owned.result().get("objects") or []
+        closed = questions.result().get("objects") or []
+        old_cards = legacy.result().get("objects") or []
+        objects.update({obj["id"]: obj for obj in found + closed + old_cards})
+        full = {obj["id"]: pool.submit(easl, "object.get", id=obj["id"])
+                for obj in found + old_cards if obj.get("type") == "html"}
+        for identity, future in full.items():
+            obj = future.result().get("object")
+            if not obj:
+                raise Fail(f"easl object.get: no object for {identity}")
+            objects[identity] = obj
+    existing = {key_of(obj): objects[obj["id"]] for obj in found}
+    design = design_board(snap, board_id, objects)
+    obsolete = {obj["id"]: obj for key, obj in existing.items()
+                if key not in design.desired and obj["id"] not in design.borrowed
+                and not (obj.get("type") == "question"
+                         and (obj.get("props") or {}).get("status") in ("answered", "cancelled", "expired"))}
+    for obj in old_cards:
+        key = key_of(obj)
+        props = objects[obj["id"]].get("props") or {}
+        seat_name = key.removeprefix("mc/project/")
+        known_name = seat_name == "assistant" or (seat_name.startswith("projects/") and len(seat_name) > 9)
+        if (known_name and key == f"mc/project/{seat_name}" and obj.get("type") == "html"
+                and 'data-project="' in props.get("html", "")):
+            obsolete[obj["id"]] = obj
+    now = time.time()
+    for obj in closed:
+        closed_at = question_closed_time(obj)
+        if closed_at is not None and now - closed_at >= 1800:
+            obsolete[obj["id"]] = obj
+    for key, desired in design.desired.items():
         old = existing.get(key)
-        if old:
-            old = easl("object.get", id=old["id"]).get("object") or {}
-        frame = {**spots[key], **dims[key]}
-        changed = not old or any((old.get("props") or {}).get(k) != v for k, v in props.items())
-        out.append(f"{key}\t{'created' if not old else 'updated' if changed else 'unchanged'}")
-        if changed:
-            ops.append(("object.upsert", {"key": key, "type": "html", "frame": frame, "props": props}))
-        elif frame_of(old) != frame:
-            ops.append(("object.update", {"id": old["id"], "frame": frame}))
-        if old:
-            ids.append(old["id"])
-    for band in bands:
-        for i in band.members():
-            old = frame_of(objects[i])
-            change = {"frame": spots[i]} if any(old[k] != spots[i][k] for k in ("x", "y")) else {}
-            if i == band.terminal and (objects[i].get("props") or {}).get("follow") is not False:
-                change["props"] = {"follow": False}
-            if change:
-                ops.append(("object.update", {"id": i, **change}))
-    ops += [("object.delete", {"id": i}) for i in follow]
-    ops += [("object.delete", {"id": o["id"]}) for o in obsolete]
-    for n in range(0, len(ops), BATCH):
-        done = easl("object.batch", board=board_id,
-                    ops=[{"method": m, "params": p} for m, p in ops[n:n + BATCH]], **caller)
-        ids += [r["object"]["id"] for (method, _), r in zip(ops[n:n + BATCH], done.get("results") or [])
-                if method == "object.upsert"]
-    check = easl("layout.check", board=board_id, ids=sorted(set(ids) | placed))
-    findings = {k: v for k, v in check.items() if v and k not in ("hints", "approximate")}
-    return (out + [f"follow {i}\tdeleted" for i in follow]
-            + [f"{key_of(o)}\tdeleted" for o in obsolete]
-            + [f"band\t{b.seat.name}\tshowcase {len(b.showcase())}\ttail {len(b.tail)}" for b in bands]
-            + ["layout.check\t" + (json.dumps(findings, sort_keys=True) if findings else "clean")])
+        if old and old.get("type") != desired.type:
+            obsolete[old["id"]] = old
+            del existing[key]
+    existing = {key: obj for key, obj in existing.items() if key in design.desired}
+    ignored = design.borrowed | set(obsolete) | {obj["id"] for obj in existing.values()}
+    obstacles = [frame_of(obj) for identity, obj in objects.items()
+                 if identity not in ignored and obj.get("type") != "arrow"
+                 and not (obj.get("props") or {}).get("archived")]
+    place_groups(design, objects, obstacles)
+    output = reconcile_board(board_id, design, objects, existing,
+                             sorted(obsolete.values(), key=lambda obj: obj["id"]), caller)
+    return output + [f"group\t{group.key}\tborrowed {len(group.borrowed)}" for group in design.groups]
 
 
 def board(a) -> int:
@@ -788,8 +1044,9 @@ def main(argv) -> int:
     p = sub.add_parser("commit", help=text, description=text)
     p.add_argument("message", help="commit message")
     p.add_argument("--path", action="append", default=[], help="another literal repo-root-relative path to commit")
-    text = ("Draw fixed-size local project cards, terminals, open questions and show/<project>/* tiles in bands. "
-            "The assistant owns the layout. Showcase sizes and unrelated tiles are preserved.")
+    text = ("Draw a You group with open questions, todos and digest, plus project groups with full status, "
+            "coordinator terminals and show/<project>/* tiles. The assistant owns this layout. "
+            "Showcase sizes and unrelated tiles are preserved; --print is read-only.")
     p = sub.add_parser("board", parents=[common], help=text, description=text)
     p.add_argument("--print", dest="print_only", action="store_true", help="print the snapshot without drawing")
     a = top.parse_args(argv)

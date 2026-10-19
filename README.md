@@ -16,8 +16,13 @@ tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/o
 
 ## Board
 
-`tstack board` draws horizontal bands on the assistant's board from local state and seat health, without GitHub calls or an attached app. Project seats decline draws with a message that the assistant draws it. Bands hold terminals, open questions, fixed-size cards, and `show/<project>/<slug>` tiles at seat-chosen sizes. Cards show status, `status_line`, three `next_steps`, running lanes with PR links, health, and unreadable-state warnings. Parked or down seats have compact cards. tstack owns positions, turns terminal following off, leaves unrelated tiles alone, and reports `layout.check`. Publish work with `object.upsert`, preserving tile sizes and omitting positions. The digest carries operator decisions and completed work. `--print` prints JSON without drawing, including from project seats.
-Each seat's `state/status.json` holds only `project`, `status`, `status_line` and `next_steps`, which the board card shows.
+`tstack board` draws the assistant's board from local seat state and easl health, without GitHub or Linear calls. The first group, **You**, holds every open question, a panel of open `state/todo.json` items, and the digest. Project labels identify who each item belongs to.
+
+Each project has a titled, colored easl group with an HTML status panel, its coordinator terminal, and its `show/<project>/<slug>` tiles. The panel shows `status`, `status_line`, up to three `next_steps`, tasks with their states, running lanes with PR links, and unreadable-state warnings. Groups wrap in rows. Published tiles keep their IDs, content, and chosen sizes. Publish them with `object.upsert`, setting `w` and `h` but omitting positions.
+
+tstack reconciles its `tstack/*` keys in batches of at most 50 operations. It deletes keys no longer drawn and retires the old project cards. Answered and cancelled questions are deleted only after their close time is at least 30 minutes old. Unrelated objects stay untouched. An unchanged redraw writes nothing. Each draw reports `layout.check`.
+
+Project seats leave drawing to the assistant. `--print` prints the local snapshot without drawing, including from project seats. Each seat's `state/status.json` holds only `project`, `status`, `status_line`, and `next_steps`. `state/todo.json` holds `items[]` with `id`, `title`, `steps`, and `done`. An item's `project` or `with` identifies its project. Without either, tstack matches a project prefix in the title or uses the source seat.
 
 ## Lane
 
