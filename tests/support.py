@@ -183,6 +183,8 @@ print(json.dumps(out))
     "systemd-run": PRELUDE + r'''
 if "--expand-environment=no" not in args:
     sys.exit("fake systemd-run: would expand $ in the command line")
+if (stubs / "systemd-run.err").exists():
+    sys.exit((stubs / "systemd-run.err").read_text())
 env, cwd, unit, i = dict(os.environ), None, None, 0
 while args[i].startswith("-"):
     key, _, value = args[i].partition("=")
@@ -194,8 +196,13 @@ proc = subprocess.Popen(args[i:], cwd=cwd, env=env, start_new_session=True, stdi
 (stubs / f"{unit}.pid").write_text(str(proc.pid))
 ''',
     "systemctl": PRELUDE + r'''
-if args[1:3] == ["show", "-p"]:
+if args[1:4] == ["show", "-p", "MainPID"]:
     print((stubs / f"{args[-1]}.pid").read_text())
+elif args[1:3] == ["show", "-p"]:
+    path = stubs / "systemd-properties.json"
+    if path.exists():
+        for key, value in json.loads(path.read_text()).items():
+            print(f"{key}={value}")
 elif args[1] == "stop":
     os.killpg(int((stubs / f"{args[2]}.pid").read_text()), 15)
 ''',

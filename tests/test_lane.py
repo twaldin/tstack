@@ -1,5 +1,6 @@
 import json
 import shutil
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -45,6 +46,87 @@ class LaneRuns(Sandbox):
         self.assertEqual(second["args"][-3:], ["--resume", session, "CI failed on test_x"])
         self.assertNotIn("--resume", first["args"])
         self.assertIn(f"{lane_id}\texited\texit 0\t$0.52\t-\t", self.cli("lane", "list").stdout)
+
+    def test_resume_changes_the_cap_and_reuses_it_on_the_next_run(self):
+        lane_id = self.start("--memory", "4G")
+        self.cli("lane", "wait", lane_id)
+        self.cli("lane", "resume", lane_id, "try with more memory", "--memory", "16G")
+        self.cli("lane", "wait", lane_id)
+        self.assertEqual(self.record(lane_id)["memory"], "16G")
+        self.cli("lane", "resume", lane_id, "continue")
+        self.cli("lane", "wait", lane_id)
+        self.assertEqual(self.record(lane_id)["memory"], "16G")
+        self.assertEqual([next(a for a in call["args"] if a.startswith("MemoryMax="))
+                          for call in self.log("systemd-run")], ["MemoryMax=4G", "MemoryMax=16G", "MemoryMax=16G"])
+
+    def test_rejected_resume_cap_preserves_the_previous_run_and_cap(self):
+        self.omp(exit=137)
+        lane_id = self.start("--memory", "4G")
+        self.cli("lane", "wait", lane_id)
+        before = self.record(lane_id)
+        (self.stubs / "systemd-run.err").write_text("Failed to parse MemoryMax=16g")
+        failed = self.cli("lane", "resume", lane_id, "retry", "--memory", "16g", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Failed to parse MemoryMax=16g", failed.stderr)
+        after = self.record(lane_id)
+        for key in ("memory", "status", "runs"):
+            self.assertEqual(after[key], before[key])
+        self.assertIn(f"{lane_id}\texited\texit 137\t", self.cli("lane", "list").stdout)
+        (self.stubs / "systemd-run.err").unlink()
+        self.omp(answer="recovered")
+        self.cli("lane", "resume", lane_id, "retry with the saved cap")
+        self.cli("lane", "wait", lane_id)
+        self.assertEqual(self.record(lane_id)["memory"], "4G")
+        self.assertEqual(len(self.record(lane_id)["runs"]), 2)
+
+    def test_oom_outcome_survives_collection_and_list_does_not_write(self):
+        self.omp(exit=137)
+        lane_id = self.start("--memory", "8G")
+        run = self.seat / "state/run/lanes" / lane_id
+        self.assertTrue(self.until(lambda: (run / "run-1.exit").exists()))
+        (self.stubs / "systemd-properties.json").write_text(json.dumps(
+            {"LoadState": "loaded", "Result": "oom-kill", "MemoryPeak": 8 * 2**30, "MemoryMax": 8 * 2**30}))
+        callback = next(a for a in self.log("systemd-run")[0]["args"] if a.startswith("ExecStopPost="))
+        result = subprocess.run(shlex.split(callback.removeprefix("ExecStopPost=-")),
+                                env={**self.env, "SERVICE_RESULT": "oom-kill"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.stubs / "systemd-properties.json").unlink()
+        before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                  for p in self.seat.rglob("*") if p.is_file()}
+        listing = self.cli("lane", "list").stdout
+        self.assertIn(f"{lane_id}\texited (oom-kill)\texit -; oom-kill (peak 8.0G of 8G cap)\t", listing)
+        self.assertEqual({str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                          for p in self.seat.rglob("*") if p.is_file()}, before)
+        self.assertIn("exit 137; oom-kill (peak 8.0G of 8G cap)", self.cli("lane", "show", lane_id).stdout)
+        self.assertEqual(self.record(lane_id)["runs"][0]["systemd"],
+                         {"result": "oom-kill", "memory_peak": 8 * 2**30, "memory_max": 8 * 2**30})
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout,
+                         f"{lane_id} exited exit 137; oom-kill (peak 8.0G of 8G cap)\n(no final answer)\n")
+        self.omp(answer="recovered")
+        self.cli("lane", "resume", lane_id, "recover", "--memory", "16G")
+        self.cli("lane", "wait", lane_id)
+        self.assertIn("oom-kill (peak 8.0G of 8G cap)", self.cli("lane", "show", lane_id).stdout)
+        self.assertIn("removed worktree", self.cli("lane", "clean", lane_id).stdout)
+        self.assertFalse((run / "run-1.result").exists())
+
+    def test_lazy_outcome_ignores_unavailable_memory_properties(self):
+        self.omp(exit=137)
+        lane_id = self.start()
+        run = self.seat / "state/run/lanes" / lane_id
+        self.assertTrue(self.until(lambda: (run / "run-1.exit").exists()))
+        (self.stubs / "systemd-properties.json").write_text(json.dumps(
+            {"LoadState": "loaded", "Result": "oom-kill", "MemoryPeak": "[not set]",
+             "MemoryMax": "18446744073709551615"}))
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout,
+                         f"{lane_id} exited exit 137; oom-kill\n(no final answer)\n")
+        self.assertEqual(self.record(lane_id)["runs"][0]["systemd"], {"result": "oom-kill"})
+
+    def test_collected_unit_does_not_supply_a_fake_success_result(self):
+        lane_id = self.start()
+        (self.stubs / "systemd-properties.json").write_text(json.dumps(
+            {"LoadState": "not-found", "Result": "success", "MemoryPeak": "[not set]"}))
+        self.cli("lane", "wait", lane_id)
+        self.assertNotIn("systemd", self.record(lane_id)["runs"][0])
 
     def test_a_run_without_a_final_answer_is_reported_as_such(self):
         self.omp(exit=3)
@@ -110,7 +192,8 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} stopped exit 143\n(no final answer)\n")
         self.assertTrue(self.cli("lane", "show", other).stdout.startswith(f"{other}: running,"))
         self.assertEqual(self.log("systemctl"), [])
-        self.assertEqual(self.cli_platform("darwin", "lane", "resume", lane_id, "go on").stdout, f"{lane_id} run 2\n")
+        self.assertEqual(self.cli_platform("darwin", "lane", "resume", lane_id, "go on", "--memory", "512M").stdout,
+                         f"{lane_id} run 2\n")
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
         self.assertIn("removed worktree", self.cli("lane", "clean", lane_id).stdout)
 

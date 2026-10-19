@@ -28,6 +28,10 @@ Project seats leave drawing to the assistant. `--print` prints the local snapsho
 
 `lane start <name> --repo <owner/repo or path> --brief <file>` starts detached omp in a `lane/<id>` worktree through `systemd-run --user` on Linux or a new POSIX session with `nohup` on macOS. `--base`, `--model`, `--thinking`, and `--memory` select run settings. macOS ignores `--memory` and stops the run's process group by its recorded leader PID. Records and final answers live in `<seat>/state/lanes/<id>/`, with condensed events and run output in `<seat>/state/run/lanes/<id>/`. `list --all` reads cached records without GitHub calls or file writes. `logs` reads the stream without refreshing. Use `show` or `wait <id>...` to refresh run results and compact old streams, `resume` to continue, and `stop` to end a run. `show` discovers the PR. Refresh checks a known PR after the run exits and records merges made outside `lane merge`. After a merge, refresh removes the worktree and branch only with a clean tree and HEAD matching the merged head. `merge` performs the same cleanup after merging, and `clean` discovers the PR and cleans on demand. Dirty trees and unpushed commits stay untouched. Cleanup refusals and errors appear on stderr and in the lane's saved cleanup result.
 
+`lane resume <id> <text> --memory <size>` changes the Linux memory cap and saves it for later runs. Without `--memory`, resume reuses the saved cap. Both commands pass the size to systemd for validation. A rejected resume leaves the previous cap and run history intact. macOS ignores the cap.
+
+Linux runs capture systemd's exit result before unit collection, with the peak memory and cap when available. `show` and `wait` report failures such as `oom-kill (peak 8.0G of 8G cap)`. `list` includes the failure reason in its status column and reads captured results without changing files. macOS reports only the process exit code.
+
 A failed PR refresh reports the native error on stderr without blocking local run operations. Missing merge SHAs never authorize automatic cleanup.
 
 ## Watch a PR

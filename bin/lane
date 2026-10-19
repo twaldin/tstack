@@ -43,8 +43,60 @@ def now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def exit_reason(run_entry: dict) -> str:
+    outcome = run_entry.get("systemd") or {}
+    result = outcome.get("result")
+    if not result or result == "success":
+        return ""
+    peak, cap = outcome.get("memory_peak"), outcome.get("memory_max")
+    details = []
+    if peak is not None:
+        details.append(f"peak {memory_size(peak, peak=True)}")
+    if cap is not None:
+        details.append(f"of {memory_size(cap)} cap" if details else f"{memory_size(cap)} cap")
+    return result + (f" ({' '.join(details)})" if details else "")
+
+
+def memory_size(value: int, peak: bool = False) -> str:
+    size = float(value)
+    for unit in ("B", "K", "M", "G", "T", "P", "E"):
+        if size < 1024 or unit == "E":
+            return (f"{size:.1f}" if peak else f"{size:g}") + unit
+        size /= 1024
+
+
 def exit_code(run_entry: dict) -> str:
-    return "-" if run_entry.get("exit") is None else str(run_entry["exit"])
+    code = "-" if run_entry.get("exit") is None else str(run_entry["exit"])
+    reason = exit_reason(run_entry)
+    return code + (f"; {reason}" if reason else "")
+
+
+def unit_outcome(unit: str) -> dict:
+    outcome = {}
+    try:
+        result = subprocess.run(["systemctl", "--user", "show", "-p", "LoadState", "-p", "Result",
+                                 "-p", "MemoryPeak", "-p", "MemoryMax", unit],
+                                env=BUS, capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            properties = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+            if properties.get("LoadState") != "loaded":
+                return outcome
+            if properties.get("Result"):
+                outcome["result"] = properties["Result"]
+            for prop, key in (("MemoryPeak", "memory_peak"), ("MemoryMax", "memory_max")):
+                value = properties.get(prop, "")
+                if value.isdigit() and int(value) < 2**64 - 1:
+                    outcome[key] = int(value)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return outcome
+
+
+def capture_result(path: Path, unit: str) -> None:
+    outcome = {**unit_outcome(unit), "result": os.environ.get("SERVICE_RESULT", "")}
+    temporary = path.with_suffix(".result.tmp")
+    temporary.write_text(json.dumps(outcome) + "\n")
+    temporary.replace(path)
 
 
 def run(argv, cwd=None, env=None, check=True) -> str:
@@ -135,15 +187,30 @@ class Lane:
             return False
         return str(self.run_dir / f"run-{number}") in run(["ps", "-ww", "-o", "command=", "-p", pid], check=False)
 
+    def read_outcomes(self, record: dict) -> bool:
+        changed = False
+        for entry in record.get("runs") or []:
+            path = self.file(entry["run"], "result")
+            if path.exists():
+                outcome = json.loads(path.read_text())
+                if entry.get("systemd") != outcome:
+                    entry["systemd"] = outcome
+                    changed = True
+        return changed
+
     def start_process(self, command: list, record: dict, env: dict) -> str:
         if sys.platform == "darwin":
             process = subprocess.Popen(["/usr/bin/nohup", *command], cwd=record["worktree"], env=env,
                                        start_new_session=True, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return str(process.pid)
+        result_command = " ".join(json.dumps(arg, ensure_ascii=False) for arg in (
+            sys.executable, str(Path(__file__).resolve()), "_result",
+            str(self.file(record["runs"][-1]["run"], "result")), self.unit))
+        result_command = result_command.replace("$", "$$")
         spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
                  "--expand-environment=no", f"--working-directory={record['worktree']}",
-                 "-p", f"MemoryMax={record['memory']}"]
+                 "-p", f"MemoryMax={record['memory']}", "-p", f"ExecStopPost=-{result_command}"]
         run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
         return run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
 
@@ -158,10 +225,17 @@ class Lane:
     def refresh(self, stopped: bool = False, auto_clean: bool = True) -> dict:
         with self.locked():
             record = self.load()
-            changed = False
+            changed = self.read_outcomes(record)
             last = (record.get("runs") or [{}])[-1]
             if not last or (not last.get("end") and not stopped and self.alive(last["run"])):
+                if changed:
+                    self.save(record)
                 return record
+            if not last.get("systemd") and last.get("backend") != "nohup" and sys.platform != "darwin":
+                outcome = unit_outcome(self.unit)
+                if outcome.get("result"):
+                    last["systemd"] = outcome
+                    changed = True
             if not last.get("end"):
                 code = self.file(last["run"], "exit").read_text().strip() if self.file(last["run"], "exit").exists() else ""
                 cost, final = 0, None
@@ -214,7 +288,8 @@ class Lane:
     def begin_run(self, record: dict, text: str, resume: bool) -> int:
         """Append a run and launch it. Caller holds the lock, so no refresh sees the run before its pid."""
         number = len(record["runs"]) + 1
-        record["runs"].append({"run": number, "start": now(), "compacted": True})
+        record["runs"].append({"run": number, "start": now(), "compacted": True,
+                               "backend": "nohup" if sys.platform == "darwin" else "systemd"})
         self.save({**record, "status": "running"})
         argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
                 "--append-system-prompt", str(ENGINE / "roles" / "lane.md")] + ["--resume", record["session"]] * resume
@@ -281,7 +356,7 @@ def start(seat: Path, a) -> str:
     return lane.id
 
 
-def resume(lane: Lane, text: str) -> str:
+def resume(lane: Lane, text: str, memory: str | None) -> str:
     lane.refresh()
     with lane.locked():
         record = lane.load()
@@ -291,7 +366,14 @@ def resume(lane: Lane, text: str) -> str:
             raise Fail(f"{lane.id} has no omp session to resume")
         if record.get("cleaned") or not Path(record["worktree"]).is_dir():
             raise Fail(f"{lane.id} worktree is missing or cleaned; cannot resume")
-        return f"{lane.id} run {lane.begin_run(record, text, resume=True)}"
+        previous = {**record, "runs": list(record["runs"])}
+        if memory is not None:
+            record["memory"] = memory
+        try:
+            return f"{lane.id} run {lane.begin_run(record, text, resume=True)}"
+        except Fail:
+            lane.save(previous)
+            raise
 
 
 def stop(lane: Lane) -> str:
@@ -380,7 +462,7 @@ def cleanup(lane: Lane, record: dict) -> str:
         git(repo, "worktree", "prune")
         done.append(git(repo, "branch", "-D", record["branch"]))
     for entry in record.get("runs") or []:
-        for ext in ("jsonl", "err", "exit", "exit.tmp", "pid", "tmp"):
+        for ext in ("jsonl", "err", "exit", "exit.tmp", "pid", "tmp", "result", "result.tmp"):
             lane.file(entry["run"], ext).unlink(missing_ok=True)
     record["cleaned"] = now()
     return "\n".join(done) or "already clean"
@@ -411,9 +493,15 @@ def listing(seat: Path, show_all: bool) -> str:
     root, rows = seat / "state" / "lanes", []
     for lane in [Lane(seat, p.name) for p in sorted(root.iterdir()) if (p / "lane.json").exists()] if root.is_dir() else []:
         record = lane.load()
+        lane.read_outcomes(record)
+        last = (record.get("runs") or [{}])[-1]
+        if last.get("systemd") and record["status"] == "running":
+            record["status"] = "exited"
         if show_all or Path(record["worktree"]).exists():
             last, pr, cost = summary(record)
-            rows.append(f"{lane.id}\t{record['status']}\texit {exit_code(last)}\t{cost}\t{pr}\t"
+            reason = (last.get("systemd") or {}).get("result")
+            status = record["status"] + (f" ({reason})" if reason and reason != "success" else "")
+            rows.append(f"{lane.id}\t{status}\texit {exit_code(last)}\t{cost}\t{pr}\t"
                         f"{last.get('end') or last.get('start') or record.get('created')}")
     return "\n".join(rows)
 
@@ -486,7 +574,10 @@ def main(argv) -> int:
     p["start"].add_argument("--base", help="default: origin's default branch, else the clone's current branch")
     p["start"].add_argument("--model", default="@sol")
     p["start"].add_argument("--thinking", default="high")
-    p["start"].add_argument("--memory", default="8G", help="MemoryMax of the run's systemd unit on Linux; ignored on macOS")
+    for name in ("start", "resume"):
+        p[name].add_argument("--memory", default="8G" if name == "start" else None,
+                             help="MemoryMax of the run's systemd unit on Linux; ignored on macOS"
+                                  + (" (default: reuse the previous cap)" if name == "resume" else ""))
     p["list"].add_argument("--all", action="store_true", help="include lanes whose worktree is gone")
     p["logs"].add_argument("-n", type=int, default=60)
     p["merge"].add_argument("--admin", action="store_true")
@@ -498,7 +589,7 @@ def main(argv) -> int:
         if not seat:
             raise Fail("no seat: pass --seat DIR, set TSTACK_SEAT, or run inside a seat dir")
     lane = Lane(seat, a.id) if getattr(a, "id", None) else None
-    out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text), "list": lambda: listing(seat, a.all),
+    out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text, a.memory), "list": lambda: listing(seat, a.all),
            "show": lambda: show(lane), "logs": lambda: logs(lane, a.n), "stop": lambda: stop(lane),
            "wait": lambda: wait([Lane(seat, i) for i in a.ids]), "merge": lambda: merge(lane, a.admin),
            "clean": lambda: clean(lane)}[a.cmd]()
@@ -508,6 +599,9 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "_result":
+        capture_result(Path(sys.argv[2]), sys.argv[3])
+        sys.exit(0)
     if sys.argv[1:] == ["_stream"]:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         filter_stream(sys.stdin, sys.stdout)
