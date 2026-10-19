@@ -8,6 +8,10 @@ git init -q --bare "$tmp/u"; git -C "$tmp/u" fetch -q --no-tags --depth 1 "$up" 
 sha=$(git -C "$tmp/u" rev-parse FETCH_HEAD); mkdir "$tmp/t"; git -C "$tmp/u" archive FETCH_HEAD pstack | tar -x -C "$tmp/t"
 tree=$(cd "$tmp/t" && GIT_INDEX_FILE="$tmp/i" git --git-dir="$gd" --work-tree=. add -A -f pstack && GIT_INDEX_FILE="$tmp/i" git --git-dir="$gd" write-tree)
 parent=$(git rev-parse -q --verify refs/heads/pstack-upstream || true)
+if [[ -z $parent ]]; then
+  parent=$(git rev-parse -q --verify refs/remotes/origin/pstack-upstream || true)
+  if [[ -n $parent ]]; then git update-ref refs/heads/pstack-upstream "$parent"; fi
+fi
 if [[ -z $parent || $(git rev-parse "$parent^{tree}") != "$tree" ]]; then
   git update-ref refs/heads/pstack-upstream "$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "pstack: upstream cursor/plugins $sha")"
 fi

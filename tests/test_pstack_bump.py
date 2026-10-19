@@ -40,3 +40,22 @@ class PstackBump(unittest.TestCase):
         self.assertFalse((eng / "x").exists())
         self.assertIn("pstack/docs/n.md", run(eng, "git", "ls-tree", "-r", "--name-only", "pstack-upstream").stdout)
 
+    def test_bump_recovers_missing_local_ref_from_fetched_snapshot(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        up, eng = tmp / "plugins", tmp / "engine"
+        for repo in (up, eng):
+            repo.mkdir()
+            run(repo, "git", "init", "-q", "-b", "main")
+        commit(eng, {"README.md": "engine\n"})
+        v1 = commit(up, {"pstack/a.md": "a\n", "pstack/b.md": "b\n"})
+        self.assertEqual(run(eng, str(BUMP), v1, str(up)).returncode, 0)
+        snapshot = run(eng, "git", "rev-parse", "pstack-upstream").stdout.strip()
+        run(eng, "git", "update-ref", "refs/remotes/origin/pstack-upstream", snapshot)
+        run(eng, "git", "branch", "-D", "pstack-upstream")
+        commit(eng, {"pstack/a.md": "local\n"})
+        v2 = commit(up, {"pstack/b.md": "upstream\n"})
+        out = run(eng, str(BUMP), v2, str(up))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual((eng / "pstack/a.md").read_text(), "local\n")
+        self.assertEqual((eng / "pstack/b.md").read_text(), "upstream\n")
+

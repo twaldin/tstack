@@ -8,6 +8,7 @@ pstack is written for Cursor. Here it runs in omp on easl boards, and lanes take
 | `readonly: true`, `run_in_background: true` | Say read-only in the brief. omp tasks already run in the background and report back on their own. |
 | Cursor cloud agent, `environment: "cloud"`, cloud VM, `cloud_base_branch` | `lane start` for work that writes code or must outlive you (a worktree plus a detached `omp -p`). `task` with `isolated: true` for short parallel work inside your session. Name the base branch in the brief. |
 | `pstack-models.mdc`, `/setup-pstack`, role lines | omp model roles and the agent types above. Review and design panels (interrogate, arena, architect) use `opus` and `grok`, plus `review` when the author is Opus. |
+| Subagent reasoning level and fast or standard speed | Choose the agent type above for the job. omp task items expose no separate reasoning-level or speed field. |
 | `AskQuestion` | `easl ask "<question>" --option <id>=<label> --recommend <id> --wait` as a background bash job. Tim answers in the easl tile. |
 | `control-ui`, `control-cli` | The real CLI for CLIs and TUIs. The browser tool or an easl browser tile for web UI. |
 | `/deslop` | Run the project's checks and remove code the diff does not need. |

@@ -34,4 +34,4 @@ Project seats leave drawing to the assistant. `--print` prints the local snapsho
 
 ## Update pstack
 
-`pstack-bump <sha>` snapshots upstream pstack onto `pstack-upstream`, merges it into the current branch, removes paths listed in `pstack/DROPPED`, and prints conflicts and the local edit diff. `pstack/` holds the fork, `global.md` and `roles/` hold agent rules, and `agents/` holds model-bound agent types. pstack is MIT licensed with its notice in `pstack/LICENSE`.
+Run `git fetch origin` before `pstack-bump <sha>`. The command restores a missing local `pstack-upstream` ref from the fetched snapshot, imports upstream pstack, merges it into the current branch, and removes paths listed in `pstack/DROPPED`. Resolve reported conflicts while keeping local edits, then publish the snapshot with `git push origin pstack-upstream` alongside the PR branch. `pstack/` holds the fork, `global.md` and `roles/` hold agent rules, and `agents/` holds model-bound agent types. pstack is MIT licensed with its notice in `pstack/LICENSE`.
