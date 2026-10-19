@@ -125,11 +125,35 @@ class Lane:
         with self.locked():
             self.save({**self.load(), **fields})
 
+    def pid(self, number: int) -> str:
+        path = self.file(number, "pid")
+        return path.read_text().strip() if path.exists() else ""
+
     def alive(self, number: int) -> bool:
-        pid = self.file(number, "pid").read_text().strip() if self.file(number, "pid").exists() else ""
+        pid = self.pid(number)
         if self.file(number, "exit").exists() or not pid.isdigit():
             return False
         return str(self.run_dir / f"run-{number}") in run(["ps", "-ww", "-o", "command=", "-p", pid], check=False)
+
+    def start_process(self, command: list, record: dict, env: dict) -> str:
+        if sys.platform == "darwin":
+            process = subprocess.Popen(["/usr/bin/nohup", *command], cwd=record["worktree"], env=env,
+                                       start_new_session=True, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return str(process.pid)
+        spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
+                 "--expand-environment=no", f"--working-directory={record['worktree']}",
+                 "-p", f"MemoryMax={record['memory']}"]
+        run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
+        return run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
+
+    def stop_process(self, number: int) -> None:
+        if sys.platform == "darwin":
+            if self.alive(number):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(int(self.pid(number)), signal.SIGTERM)
+        else:
+            run(["systemctl", "--user", "stop", self.unit], env=BUS)
 
     def refresh(self, stopped: bool = False, auto_clean: bool = True) -> dict:
         with self.locked():
@@ -188,11 +212,7 @@ class Lane:
         env = {**{k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}, "TSTACK_LANE": self.id, "TSTACK_SEAT": str(self.seat)}
         command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), sys.executable, str(Path(__file__).resolve()),
                    *argv, text]
-        spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
-                 "--expand-environment=no", f"--working-directory={record['worktree']}",
-                 "-p", f"MemoryMax={record['memory']}"]
-        run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
-        pid = run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
+        pid = self.start_process(command, record, env)
         self.file(number, "pid").write_text(f"{pid}\n")
         return number
 
@@ -270,13 +290,13 @@ def stop(lane: Lane) -> str:
     if record["status"] != "running":
         return f"{lane.id} is not running ({record['status']})"
     number = record["runs"][-1]["run"]
-    run(["systemctl", "--user", "stop", lane.unit], env=BUS)
+    lane.stop_process(number)
     deadline = time.monotonic() + 90
     while lane.alive(number) and time.monotonic() < deadline:
         time.sleep(0.2)
     if lane.alive(number):
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(int(lane.file(number, "pid").read_text()), signal.SIGKILL)
+            os.killpg(int(lane.pid(number)), signal.SIGKILL)
     lane.refresh(stopped=True)
     return f"{lane.id} stopped (run {number})"
 
@@ -461,7 +481,7 @@ def main(argv) -> int:
     p["start"].add_argument("--base", help="default: origin's default branch, else the clone's current branch")
     p["start"].add_argument("--model", default="@sol")
     p["start"].add_argument("--thinking", default="high")
-    p["start"].add_argument("--memory", default="8G", help="MemoryMax of the run's systemd unit (Linux)")
+    p["start"].add_argument("--memory", default="8G", help="MemoryMax of the run's systemd unit on Linux; ignored on macOS")
     p["list"].add_argument("--all", action="store_true", help="include lanes whose worktree is gone")
     p["logs"].add_argument("-n", type=int, default=60)
     p["merge"].add_argument("--admin", action="store_true")

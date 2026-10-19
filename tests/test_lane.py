@@ -88,6 +88,32 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.cli("lane", "stop", slow).stdout, f"{slow} stopped (run 1)\n")
         self.assertIn(["--user", "stop", f"tstack-lane-{slow}"], [c["args"] for c in self.log("systemctl")])
 
+    def test_darwin_run_detaches_without_systemd_and_keeps_literal_prompt(self):
+        self.brief.write_text("Print ${HOME} and $PATH as written.\n")
+        lane_id = self.cli_platform("darwin", "lane", "start", "Mac", "--repo", "acme/demo",
+                                    "--brief", str(self.brief), "--memory", "1").stdout.strip()
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+        self.assertEqual(self.log("systemd-run"), [])
+        self.assertEqual(self.log("systemctl"), [])
+        self.assertTrue(self.log("omp")[0]["args"][-1].endswith("Print ${HOME} and $PATH as written.\n"))
+
+    def test_darwin_stop_records_exit_and_leaves_another_lane_running(self):
+        self.brief.write_text("SLOW\n")
+        def start_mac(name):
+            return self.cli_platform("darwin", "lane", "start", name, "--repo", "acme/demo",
+                                     "--brief", str(self.brief)).stdout.strip()
+        lane_id, other = start_mac("Mac"), start_mac("Other")
+        self.addCleanup(lambda: self.cli_platform("darwin", "lane", "stop", other))
+        stream = self.seat / "state/run/lanes" / lane_id / "run-1.jsonl"
+        self.assertTrue(self.until(lambda: stream.exists() and stream.read_text()))
+        self.assertEqual(self.cli_platform("darwin", "lane", "stop", lane_id).stdout, f"{lane_id} stopped (run 1)\n")
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} stopped exit 143\n(no final answer)\n")
+        self.assertTrue(self.cli("lane", "show", other).stdout.startswith(f"{other}: running,"))
+        self.assertEqual(self.log("systemctl"), [])
+        self.assertEqual(self.cli_platform("darwin", "lane", "resume", lane_id, "go on").stdout, f"{lane_id} run 2\n")
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+        self.assertIn("removed worktree", self.cli("lane", "clean", lane_id).stdout)
+
     def test_clean_removes_the_worktree_and_branch_from_the_clone_the_lane_came_from(self):
         other = self.root / "elsewhere"
         git(self.root, "clone", "--quiet", str(self.origin), str(other))

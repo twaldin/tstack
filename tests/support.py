@@ -201,6 +201,15 @@ class Sandbox(unittest.TestCase):
             self.fail(f"{tool} {' '.join(args)}: exit {result.returncode}\n{result.stdout}{result.stderr}")
         return result
 
+    def cli_platform(self, platform, tool, *args, check=True) -> subprocess.CompletedProcess:
+        launcher = ("import runpy,sys; sys.platform=sys.argv.pop(1); "
+                    "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+        result = subprocess.run([sys.executable, "-c", launcher, platform, str(CODE / "bin" / tool), *args],
+                                env=self.env, cwd=self.seat, capture_output=True, text=True, timeout=60)
+        if check and result.returncode:
+            self.fail(f"{tool} {' '.join(args)}: exit {result.returncode}\n{result.stdout}{result.stderr}")
+        return result
+
     def record(self, lane_id: str) -> dict:
         return json.loads((self.seat / "state" / "lanes" / lane_id / "lane.json").read_text())
 

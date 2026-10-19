@@ -104,21 +104,24 @@ def setup(name: str) -> int:
                                      lambda p: p.suffix == ".md"), out)
     link_dir(HOME / ".local" / "bin", sources([ENGINE / "bin", INSTANCE / "bin", box / "bin"],
                                               lambda p: p.is_file() and os.access(p, os.X_OK)), out)
-    units, unit_dir = ENGINE / "systemd", HOME / ".config" / "systemd" / "user"
-    before = len(out)
-    for template in sorted(units.iterdir()) if units.is_dir() else []:
-        text = template.read_text()
-        for key, value in (("@ENGINE@", ENGINE), ("@INSTANCE@", INSTANCE), ("@MACHINE@", name)):
-            text = text.replace(key, str(value))
-        write_owned(unit_dir / template.name, text, out)
-    if any(line.startswith("wrote ") for line in out[before:]):
-        if not (Path(RUNTIME) / "bus").exists():
-            out.append(f"skip systemctl --user daemon-reload: no user bus at {RUNTIME}/bus")
-        else:
-            reload = subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, env=BUS)
-            if reload.returncode:
-                failed = True
-                out.append(f"failed systemctl --user daemon-reload: {(reload.stderr or reload.stdout).strip()}")
+    if sys.platform == "darwin":
+        out.append("skip systemd update units on macOS; coordinators run tstack update on heartbeat")
+    else:
+        units, unit_dir = ENGINE / "systemd", HOME / ".config" / "systemd" / "user"
+        before = len(out)
+        for template in sorted(units.iterdir()) if units.is_dir() else []:
+            text = template.read_text()
+            for key, value in (("@ENGINE@", ENGINE), ("@INSTANCE@", INSTANCE), ("@MACHINE@", name)):
+                text = text.replace(key, str(value))
+            write_owned(unit_dir / template.name, text, out)
+        if any(line.startswith("wrote ") for line in out[before:]):
+            if not (Path(RUNTIME) / "bus").exists():
+                out.append(f"skip systemctl --user daemon-reload: no user bus at {RUNTIME}/bus")
+            else:
+                reload = subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, env=BUS)
+                if reload.returncode:
+                    failed = True
+                    out.append(f"failed systemctl --user daemon-reload: {(reload.stderr or reload.stdout).strip()}")
 
     parts = [p for p in (ENGINE / "global.md", INSTANCE / "global.md", box / "global.md") if p.is_file()]
     header = f"<!-- {MARK} from {', '.join(map(str, parts))}. Edit those, then rerun `tstack setup`. -->\n"
