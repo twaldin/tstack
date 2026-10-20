@@ -459,13 +459,16 @@ def tree_gates(worktree: Path, expected_head: str | None, processes=None) -> lis
         failures.append("gate 3: dirty worktree")
     ignored = git(worktree, "ls-files", "-z", "--others", "--ignored", "--exclude-standard").split("\0")
     collapsed = git(worktree, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
-    unsafe_roots = [name for name in collapsed.split("\0") if name
-                    and any(file.startswith(name) for file in ignored)
-                    and Path(name).name not in (REGENERABLE_DIRS if name.endswith("/") else REGENERABLE_FILES)]
-    unsafe = [name for name in ignored if name
-              and not any(part in REGENERABLE_DIRS for part in Path(name).parts[:-1])
-              and Path(name).name not in REGENERABLE_FILES]
-    if unsafe or unsafe_roots:
+    unsafe = []
+    for root in collapsed.split("\0"):
+        if not root:
+            continue
+        root_depth = len(Path(root).parts) - 1
+        files = (name for name in ignored if name.startswith(root)) if root.endswith("/") else (root,)
+        if any(not any(part in REGENERABLE_DIRS for part in Path(name).parts[root_depth:-1])
+               and Path(name).name not in REGENERABLE_FILES for name in files):
+            unsafe.append(root)
+    if unsafe:
         failures.append("gate 4: ignored paths are not regenerable")
     try:
         processes = process_cwds() if processes is None else processes

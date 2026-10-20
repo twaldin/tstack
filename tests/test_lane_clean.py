@@ -46,6 +46,36 @@ class CleanGates(Sandbox):
         self.assertFalse(self.tree.exists())
         self.assertEqual(git(self.main, "branch", "--list", "lane/finished"), "")
 
+    def test_ignored_parent_with_only_node_modules_is_removed(self):
+        (self.main / ".git/info/exclude").write_text("scripts/\n")
+        self.ignored("scripts/node_modules/pkg/cache")
+        result = self.cli("lane", "clean", "finished")
+        self.assertIn(f"removed worktree {self.tree}", result.stdout)
+        self.assertFalse(self.tree.exists())
+
+    def test_ignored_parent_with_node_modules_and_other_file_is_preserved(self):
+        (self.main / ".git/info/exclude").write_text("scripts/\n")
+        cache = self.ignored("scripts/node_modules/x")
+        keep = self.ignored("scripts/keep.txt")
+        result = self.cli("lane", "clean", "finished")
+        self.assertIn("gate 4: ignored paths are not regenerable", result.stdout)
+        self.assertEqual(keep.read_text(), "proof\n")
+        self.assertEqual(cache.read_text(), "proof\n")
+
+    def test_tracked_cache_named_parent_does_not_authorize_ignored_files(self):
+        self.ignored("build/README")
+        git(self.tree, "add", "build/README")
+        git(self.tree, "commit", "-m", "track build directory")
+        self.lane.unlink()
+        self.inventory(headRefOid=git(self.tree, "rev-parse", "HEAD"))
+        (self.main / ".git/info/exclude").write_text(".env\nsecrets/\n")
+        for name in ("build/.env", "build/secrets/key"):
+            with self.subTest(name=name):
+                path = self.ignored(name)
+                result = self.cli("lane", "clean", "--list")
+                self.assertIn("gate 4: ignored paths are not regenerable", result.stdout)
+                path.unlink()
+
     def test_head_mismatch_preserves_tree(self):
         git(self.tree, "commit", "--allow-empty", "-m", "unpublished")
         result = self.cli("lane", "clean", "finished")
@@ -59,13 +89,11 @@ class CleanGates(Sandbox):
         self.assertEqual(path.read_text(), "keep\n")
 
     def test_ignored_proof_preserved_even_beside_allowed_cache(self):
-        for name in (".local/acceptance/result.proof", ".local/acceptance/build/result.proof"):
-            with self.subTest(name=name):
-                path = self.ignored(name)
-                self.ignored("node_modules/pkg/cache")
-                self.assertIn("gate 4:", self.cli("lane", "clean", "finished").stdout)
-                self.assertEqual(path.read_text(), "proof\n")
-                path.unlink()
+        path = self.ignored(".local/acceptance/result.proof")
+        self.ignored(".local/acceptance/build/cache")
+        self.ignored("node_modules/pkg/cache")
+        self.assertIn("gate 4:", self.cli("lane", "clean", "finished").stdout)
+        self.assertEqual(path.read_text(), "proof\n")
 
     def test_ignored_directory_leading_space_is_not_a_cache(self):
         ignore = self.tree / ".gitignore"
