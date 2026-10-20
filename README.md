@@ -6,9 +6,22 @@ tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/o
 
 `tstack setup` links the engine and instance skills, agent types, and commands, and writes `~/.omp/agent/AGENTS.md` and the systemd update units. It replaces only its own links and files. Install git, Python 3.10 or newer, authenticated `gh`, omp, and easl, then clone the engine to `~/tstack` and the instance to `~/agents`. Run `~/tstack/bin/tstack setup`, with `--machine <name>` if needed. On Linux, enable hourly updates with `systemctl --user enable --now tstack-update.timer`. On macOS, setup skips systemd units, and coordinators run `tstack update` on heartbeat. `TSTACK_HOME`, `TSTACK_INSTANCE`, `TSTACK_MACHINE`, and `TSTACK_WORKTREES` override the engine, instance, machine, and worktree locations. `TSTACK_SEAT` selects a seat instead of the nearest ancestor directory with `state/`.
 
+Setup manages two full git checkouts with the existing git authentication:
+
+| Source | Checkout | Installed skill |
+| --- | --- | --- |
+| [twaldin/frontend-studio](https://github.com/twaldin/frontend-studio) | `~/worktrees/frontend-studio/main` | `~/.omp/agent/skills/frontend-studio` links to the checkout root. |
+| [mattpocock/skills](https://github.com/mattpocock/skills) | `~/worktrees/mattpocock-skills/main` | `~/.omp/agent/skills/grilling` links to `skills/productivity/grilling` in the checkout. |
+
+Frontend-studio's `SKILL.md` references `../grilling/SKILL.md`. Setup also links `~/worktrees/frontend-studio/grilling` to the grilling skill root, so that reference works through both the installed skill link and the canonical checkout path. Grilling has no further sibling-skill dependencies. Only these two skills are installed from the managed sources. Full checkouts retain their source and license files. There are no gitlinks or vendored dependency files in the instance.
+
+Engine, instance, and machine skills override either managed default, in that order. The canonical sibling link continues to use the managed grilling source. Setup preserves user-owned files, directories, and unrelated symlinks at skill destinations and the sibling path, and reports collisions. It also preserves content that blocks a checkout. A failed clone, missing required `SKILL.md`, or unresolved dependency makes setup return nonzero while other setup steps continue. Git failures include git's native error. Repeated setup keeps existing managed links.
+
+Setup does not install the studio's JavaScript dependencies or start a server or daemon. Follow the skill when you need the studio.
+
 ## Update
 
-`tstack update` pulls the engine with `git pull --ff-only`, fetches the instance, syncs upstream files without overwriting changed local files or seat state, and reruns setup. The hourly systemd timer runs the same command.
+`tstack update` pulls the engine and both installed managed checkouts with `git pull --ff-only`, fetches the instance, syncs upstream files without overwriting changed local files or seat state, and reruns setup. Setup clones either managed checkout if it is missing and restores missing skill and sibling links. Updates do not reset, stash, or discard local checkout edits. A failed pull reports git's native error and makes update return nonzero, even if the other repositories and setup succeed. The hourly systemd timer runs the same command.
 
 ## Commit
 

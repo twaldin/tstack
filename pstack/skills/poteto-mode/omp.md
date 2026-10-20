@@ -14,6 +14,7 @@ pstack is written for Cursor. Here it runs in omp on easl boards, and lanes take
 | `/deslop` | Run the project's checks and remove code the diff does not need. |
 | `create-skill` | A SKILL.md with `name` and `description` frontmatter, written per `playbooks/authoring-a-skill.md`. |
 | `agent-transcripts/`, `~/.cursor/projects` | `history://<id>` for your subagents. `lane show <id>` for a lane's omp session. |
+| `why` evidence | git and `gh` for PRs, issues and review threads; seat state (`orders.md`, `tasks.tsv`, `efforts/`); `lane show` reports and digests; your history repository and instance git log; session archives on your history archive host. |
 | `git show origin/main:pstack/<path>` | Read the installed file, `skill://<name>/<path>`. |
 | Bugbot, the agentic security review | Your team's review bot. |
 | `scripts/watch-pr/watch-pr` | tstack's `watch-pr <pr>`. It prints facts (head, checks, reviews, threads, mergeability, and after merge the runs and deploys that carry it). `--once` reads once; `--until change` waits for the next change. |

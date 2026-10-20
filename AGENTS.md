@@ -12,3 +12,4 @@ This repo is the engine, the same on every host. Every change reaches it through
 - The CLIs use the Python standard library only (`pstack-bump` is bash), so they run on every host.
 - Tests call a CLI as its users do, with gh, omp, easl and systemd faked by small executables on PATH, and assert literal output. Run `python3 -m unittest discover -s tests`.
 - Agent-facing prose (`global.md`, `roles/`, `agents/`) follows the `unslop` skill. A role states facts and judgment; the CLIs' `--help` carries their usage.
+- PRs that change roles, global rules or poteto-mode run `playbooks/eval.md` from `skill://poteto-mode` on old and new text before review.

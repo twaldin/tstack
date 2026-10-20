@@ -11,6 +11,8 @@ from support import CODE, Sandbox, git
 
 
 class Setup(Sandbox):
+    frontend_skill = "# Frontend Studio\n[Grilling](../grilling/SKILL.md)\n"
+
     def setUp(self):
         super().setUp()
         self.engine, self.instance = self.root / "engine", self.home / "agents"
@@ -30,6 +32,30 @@ class Setup(Sandbox):
         runtime.mkdir()
         (runtime / "bus").touch()
         self.env.update(TSTACK_HOME=str(self.engine), TSTACK_INSTANCE=str(self.instance), XDG_RUNTIME_DIR=str(runtime))
+        self.frontend = self.home / "worktrees/frontend-studio/main"
+        self.frontend_remote = self.root / "frontend-studio.git"
+        self.clone(self.frontend_remote, self.frontend, {
+            "SKILL.md": self.frontend_skill,
+            "references/options.md": "Use real content.\n",
+            "studio/package.json": '{"scripts": {"dev": "vite"}}\n'})
+        shutil.rmtree(self.frontend)
+        self.mattpocock = self.home / "worktrees/mattpocock-skills/main"
+        self.mattpocock_remote = self.root / "mattpocock-skills.git"
+        self.grilling = self.mattpocock / "skills/productivity/grilling"
+        self.clone(self.mattpocock_remote, self.mattpocock, {
+            "LICENSE": "upstream license\n",
+            "skills/productivity/grilling/SKILL.md": "# Grilling\n[Guide](references/guide.md)\n",
+            "skills/productivity/grilling/references/guide.md": "Ask the next question.\n",
+            "skills/unneeded/SKILL.md": "Do not install me.\n"})
+        shutil.rmtree(self.mattpocock)
+        config = self.root / "gitconfig"
+        config.write_text(f'[url "{self.frontend_remote}"]\n'
+                          '\tinsteadOf = https://github.com/twaldin/frontend-studio.git\n'
+                          f'[url "{self.mattpocock_remote}"]\n'
+                          '\tinsteadOf = https://github.com/mattpocock/skills.git\n')
+        self.env["GIT_CONFIG_GLOBAL"] = str(config)
+        self.env["GIT_CONFIG_NOSYSTEM"] = "1"
+        self.env["GIT_ALLOW_PROTOCOL"] = "file"
 
     def links(self, folder: str) -> dict:
         root = self.home / folder
@@ -39,8 +65,15 @@ class Setup(Sandbox):
         self.cli("tstack", "setup")
         pstack, box = self.engine / "pstack", self.instance / "machines" / "box"
         self.assertEqual(self.links(".omp/agent/skills"), {
+            "frontend-studio": str(self.frontend),
+            "grilling": str(self.grilling),
             "mac-gui": str(box / "skills" / "mac-gui"), "poteto-mode": str(pstack / "skills" / "poteto-mode"),
             "principle-x": str(pstack / "skills" / "principle-x"), "writing": str(self.instance / "skills" / "writing")})
+        self.assertEqual((self.home / ".omp/agent/skills/frontend-studio/SKILL.md").read_text(),
+                         self.frontend_skill)
+        self.assertEqual((self.home / ".omp/agent/skills/frontend-studio/references/options.md").read_text(),
+                         "Use real content.\n")
+        self.assertTrue((self.home / ".omp/agent/skills/frontend-studio/studio/package.json").is_file())
         self.assertEqual(self.links(".omp/agent/agents"), {
             "opus.md": str(self.engine / "agents" / "opus.md"), "poteto-agent.md": str(pstack / "agents" / "poteto-agent.md")})
         self.assertEqual(self.links(".local/bin"), {
@@ -59,6 +92,8 @@ class Setup(Sandbox):
         out = self.cli_platform("darwin", "tstack", "setup").stdout.splitlines()
         pstack, box = self.engine / "pstack", self.instance / "machines" / "box"
         self.assertEqual(self.links(".omp/agent/skills"), {
+            "frontend-studio": str(self.frontend),
+            "grilling": str(self.grilling),
             "mac-gui": str(box / "skills" / "mac-gui"), "poteto-mode": str(pstack / "skills" / "poteto-mode"),
             "principle-x": str(pstack / "skills" / "principle-x"), "writing": str(self.instance / "skills" / "writing")})
         self.assertEqual(self.links(".omp/agent/agents"), {
@@ -140,6 +175,201 @@ class Setup(Sandbox):
         self.assertIn("skipped orders.md: staged edit", result.stdout)
         self.assertIn("skipped assistant/state/status.md: staged edit", result.stdout)
         self.assertIn("synced skills/new/SKILL.md", result.stdout)
+
+    def test_frontend_studio_overrides_follow_engine_instance_and_machine_precedence(self):
+        for root in (self.engine / "pstack", self.instance, self.instance / "machines/box"):
+            with self.subTest(root=root):
+                source = root / "skills/frontend-studio"
+                source.mkdir()
+                (source / "SKILL.md").write_text(f"{root}\n")
+                self.cli("tstack", "setup")
+                link = self.home / ".omp/agent/skills/frontend-studio"
+                self.assertEqual(os.readlink(link), str(source))
+        for root in (self.instance / "machines/box", self.instance, self.engine / "pstack"):
+            shutil.rmtree(root / "skills/frontend-studio")
+        self.cli("tstack", "setup")
+        self.assertEqual(os.readlink(link), str(self.frontend))
+
+    def test_frontend_studio_leaves_user_owned_skill_collisions(self):
+        skills = self.home / ".omp/agent/skills"
+        skills.mkdir(parents=True)
+        link = skills / "frontend-studio"
+        link.mkdir()
+        (link / "SKILL.md").write_text("user skill\n")
+        result = self.cli("tstack", "setup")
+        self.assertIn(f"left {link}: not a tstack link", result.stdout)
+        self.assertEqual((link / "SKILL.md").read_text(), "user skill\n")
+        shutil.rmtree(link)
+        user = self.root / "user-skill"
+        user.mkdir()
+        link.symlink_to(user)
+        result = self.cli("tstack", "setup")
+        self.assertIn(f"left {link}: not a tstack link", result.stdout)
+        self.assertEqual(os.readlink(link), str(user))
+
+    def test_frontend_studio_clone_failure_is_nonzero_and_preserves_content(self):
+        self.frontend.mkdir()
+        (self.frontend / "notes.md").write_text("user content\n")
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("frontend-studio: clone failed:", result.stdout)
+        self.assertIn("already exists and is not an empty directory", result.stdout)
+        self.assertEqual((self.frontend / "notes.md").read_text(), "user content\n")
+        self.assertFalse((self.home / ".omp/agent/skills/frontend-studio").exists())
+
+    def test_frontend_studio_missing_skill_fails_without_linking_broken_checkout(self):
+        seed = self.root / "seed-frontend-studio"
+        git(seed, "rm", "--quiet", "SKILL.md")
+        git(seed, "commit", "--quiet", "-m", "remove skill")
+        git(seed, "push", "--quiet", str(self.frontend_remote), "main")
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"frontend-studio: missing {self.frontend / 'SKILL.md'}", result.stdout)
+        self.assertFalse((self.home / ".omp/agent/skills/frontend-studio").is_symlink())
+        self.assertTrue((self.home / ".omp/agent/skills/writing").is_symlink())
+
+    def test_update_installs_missing_frontend_studio(self):
+        self.cli("tstack", "update")
+        self.assertEqual((self.home / ".omp/agent/skills/frontend-studio/SKILL.md").read_text(),
+                         self.frontend_skill)
+
+    def test_update_fast_forwards_frontend_studio_and_preserves_local_content(self):
+        self.cli("tstack", "setup")
+        seed = self.root / "seed-frontend-studio"
+        (seed / "SKILL.md").write_text("# Updated Frontend Studio\n")
+        git(seed, "commit", "--quiet", "-am", "update skill")
+        git(seed, "push", "--quiet", str(self.frontend_remote), "main")
+        (self.frontend / "notes.md").write_text("local content\n")
+        result = self.cli("tstack", "update")
+        self.assertIn("frontend-studio:", result.stdout)
+        self.assertEqual((self.home / ".omp/agent/skills/frontend-studio/SKILL.md").read_text(),
+                         "# Updated Frontend Studio\n")
+        self.assertEqual((self.frontend / "notes.md").read_text(), "local content\n")
+        self.assertEqual(git(self.frontend, "rev-parse", "HEAD"), git(seed, "rev-parse", "HEAD"))
+
+    def test_frontend_studio_pull_failure_is_nonzero_and_preserves_local_edit(self):
+        self.cli("tstack", "setup")
+        seed = self.root / "seed-frontend-studio"
+        (seed / "SKILL.md").write_text("upstream change\n")
+        git(seed, "commit", "--quiet", "-am", "update skill")
+        git(seed, "push", "--quiet", str(self.frontend_remote), "main")
+        (self.frontend / "SKILL.md").write_text("local change\n")
+        result = self.cli("tstack", "update", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("frontend-studio: pull failed", result.stdout)
+        self.assertIn("would be overwritten by merge", result.stdout)
+        self.assertEqual((self.frontend / "SKILL.md").read_text(), "local change\n")
+
+    def test_managed_dependency_resolves_recursively_through_both_skill_paths(self):
+        self.cli("tstack", "setup")
+        sibling = self.frontend.parent / "grilling"
+        self.assertEqual(os.readlink(sibling), str(self.grilling))
+        for root in (self.frontend, self.home / ".omp/agent/skills/frontend-studio"):
+            dependency = root / "../grilling"
+            self.assertEqual((dependency / "SKILL.md").read_text(),
+                             "# Grilling\n[Guide](references/guide.md)\n")
+            self.assertEqual((dependency / "references/guide.md").read_text(), "Ask the next question.\n")
+        self.assertEqual((self.mattpocock / "LICENSE").read_text(), "upstream license\n")
+        self.assertFalse((self.home / ".omp/agent/skills/unneeded").exists())
+        self.assertEqual(self.cli("tstack", "setup").stdout, "tstack setup: box is current\n")
+
+    def test_grilling_overrides_follow_engine_instance_and_machine_precedence(self):
+        for root in (self.engine / "pstack", self.instance, self.instance / "machines/box"):
+            with self.subTest(root=root):
+                source = root / "skills/grilling"
+                source.mkdir()
+                (source / "SKILL.md").write_text(f"{root}\n")
+                self.cli("tstack", "setup")
+                self.assertEqual(os.readlink(self.home / ".omp/agent/skills/grilling"), str(source))
+                self.assertEqual(os.readlink(self.frontend.parent / "grilling"), str(self.grilling))
+        for root in (self.instance / "machines/box", self.instance, self.engine / "pstack"):
+            shutil.rmtree(root / "skills/grilling")
+        self.cli("tstack", "setup")
+        self.assertEqual(os.readlink(self.home / ".omp/agent/skills/grilling"), str(self.grilling))
+
+    def test_dependency_sibling_collisions_are_preserved_and_unresolved_references_fail(self):
+        sibling = self.frontend.parent / "grilling"
+        sibling.mkdir(parents=True)
+        (sibling / "notes.md").write_text("user content\n")
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"left {sibling}: not a tstack link", result.stdout)
+        self.assertIn("unresolved dependency", result.stdout)
+        self.assertEqual((sibling / "notes.md").read_text(), "user content\n")
+        shutil.rmtree(sibling)
+        user = self.root / "user-grilling"
+        user.mkdir()
+        sibling.symlink_to(user)
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(os.readlink(sibling), str(user))
+        self.assertIn(f"left {sibling}: not a tstack link", result.stdout)
+
+    def test_dependency_skill_collision_is_preserved_and_unresolved_reference_fails(self):
+        skill = self.home / ".omp/agent/skills/grilling"
+        skill.mkdir(parents=True)
+        (skill / "notes.md").write_text("user skill\n")
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"left {skill}: not a tstack link", result.stdout)
+        self.assertIn("unresolved dependency", result.stdout)
+        self.assertEqual((skill / "notes.md").read_text(), "user skill\n")
+
+    def test_dependency_missing_skill_fails_without_installing_broken_link(self):
+        seed = self.root / "seed-mattpocock-skills"
+        git(seed, "rm", "--quiet", "skills/productivity/grilling/SKILL.md")
+        git(seed, "commit", "--quiet", "-m", "remove grilling")
+        git(seed, "push", "--quiet", str(self.mattpocock_remote), "main")
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"grilling: missing {self.grilling / 'SKILL.md'}", result.stdout)
+        self.assertIn("unresolved dependency", result.stdout)
+        self.assertFalse((self.home / ".omp/agent/skills/grilling").is_symlink())
+
+    def test_dependency_clone_failure_keeps_user_content_and_reports_native_error(self):
+        self.mattpocock.mkdir(parents=True)
+        (self.mattpocock / "notes.md").write_text("user checkout\n")
+        result = self.cli("tstack", "setup", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mattpocock-skills: clone failed:", result.stdout)
+        self.assertIn("already exists and is not an empty directory", result.stdout)
+        self.assertEqual((self.mattpocock / "notes.md").read_text(), "user checkout\n")
+
+    def test_update_fast_forwards_both_managed_repositories_and_restores_dependency_links(self):
+        self.cli("tstack", "setup")
+        for label, remote, name in (("frontend-studio", self.frontend_remote, "SKILL.md"),
+                                    ("mattpocock-skills", self.mattpocock_remote,
+                                     "skills/productivity/grilling/SKILL.md")):
+            seed = self.root / f"seed-{label}"
+            with (seed / name).open("a") as file:
+                file.write("upstream update\n")
+            git(seed, "commit", "--quiet", "-am", "update skill")
+            git(seed, "push", "--quiet", str(remote), "main")
+        (self.frontend.parent / "grilling").unlink()
+        (self.home / ".omp/agent/skills/grilling").unlink()
+        (self.grilling / "notes.md").write_text("local dependency content\n")
+        result = self.cli("tstack", "update")
+        for label, checkout in (("frontend-studio", self.frontend), ("mattpocock-skills", self.mattpocock)):
+            self.assertIn(f"{label}:", result.stdout)
+            self.assertEqual(git(checkout, "rev-parse", "HEAD"),
+                             git(self.root / f"seed-{label}", "rev-parse", "HEAD"))
+        self.assertEqual((self.frontend / "../grilling/SKILL.md").read_text(),
+                         "# Grilling\n[Guide](references/guide.md)\nupstream update\n")
+        self.assertEqual((self.grilling / "notes.md").read_text(), "local dependency content\n")
+        self.assertEqual(os.readlink(self.home / ".omp/agent/skills/grilling"), str(self.grilling))
+
+    def test_dependency_pull_failure_preserves_local_edit_and_reports_native_error(self):
+        self.cli("tstack", "setup")
+        seed = self.root / "seed-mattpocock-skills"
+        (seed / "skills/productivity/grilling/SKILL.md").write_text("upstream change\n")
+        git(seed, "commit", "--quiet", "-am", "update grilling")
+        git(seed, "push", "--quiet", str(self.mattpocock_remote), "main")
+        (self.grilling / "SKILL.md").write_text("local change\n")
+        result = self.cli("tstack", "update", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mattpocock-skills: pull failed", result.stdout)
+        self.assertIn("would be overwritten by merge", result.stdout)
+        self.assertEqual((self.grilling / "SKILL.md").read_text(), "local change\n")
 
 
 class Commit(Sandbox):

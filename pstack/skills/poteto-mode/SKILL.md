@@ -87,7 +87,7 @@ Read the leaf skill in full for any principle you apply. Each entry names when i
 
 ## Subagents
 
-**Use `subagent_type: "poteto-agent"` for any subagent you spawn inside a playbook step** (code-writing delegates, ad-hoc helpers). The chat that receives `/poteto-mode` runs the playbook. Never spawn a `poteto-agent` to run the playbook itself. Routed workflow skills (`how`, `why`, `interrogate`, `reflect`, `swarm`) set their own `subagent_type` for diverse-model review. Respect what the skill prescribes, don't override to `poteto-agent`.
+**Use `subagent_type: "poteto-agent"` for any subagent you spawn inside a playbook step** (code-writing delegates, ad-hoc helpers). The chat that receives `/poteto-mode` runs the playbook. Never spawn a `poteto-agent` to run the playbook itself. Routed workflow skills (`how`, `why`, `interrogate`, `swarm`) set their own `subagent_type` for diverse-model review. Respect what the skill prescribes, don't override to `poteto-agent`.
 
 You own every subagent's work. Review the diff and write your own summary, don't pass through what it said. A second opinion is the same prompt against a different model. Agreement is high-signal.
 
@@ -102,6 +102,7 @@ A large or cross-cutting effort (a migration across many call sites, an ambitiou
 - **Investigation.** Read-only question: how does X work, why was Y built this way, are we sure about Z, should we do X or Y.
 - **Bug fix.** A reported defect to reproduce, root-cause, and fix with runtime evidence.
 - **Perf issue.** A measured slowness to trace and improve against a baseline.
+- **Hillclimb.** Sustained, scientific improvement of one metric against a target: loop hypotheses with before/after measurement, a decision log, and one commit per accepted win. Distinct from Perf issue, which is a one-off fix.
 - **Feature.** New or changed behavior, built from a named data shape.
 - **Refactoring.** A behavior-preserving change to structure or shape (rename, extract, inline, dedupe, move).
 - **Prototype.** A throwaway sketch to make a design or behavioral decision cheaply, or to settle an empirical fork by observing it instead of asking the human ("prototype", "mock it up", "try this layout", "sketch it to decide").
