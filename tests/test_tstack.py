@@ -989,6 +989,190 @@ class Board(Sandbox):
                   if c["args"][0] in ("object.batch", "object.update", "object.upsert", "object.delete", "object.create")]
         self.assertEqual(writes, [])
 
+    def test_project_columns_are_balanced_and_keep_tiles_in_vertical_order(self):
+        names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+        published = {}
+        for name in names:
+            self.coordinator(name, f"terminal_{name}")
+            tiles = [
+                self.tile(f"{name}_last", "browser", 9000, 9000, 1500, 450,
+                          key=f"show/{name}/20-preview", url=f"http://localhost/{name}"),
+                self.tile(f"{name}_first", "image", 9000, 9000, 1200, 350,
+                          key=f"show/{name}/10-screenshot", source=f"{name}.png"),
+            ]
+            self.add(*tiles)
+            published[name] = [self.obj(f"terminal_{name}"), tiles[1], tiles[0]]
+
+        self.board_cli()
+        keys = ["tstack/you", "tstack/group/assistant"] + [
+            f"tstack/group/projects/{name}" for name in names]
+        groups = [self.frame(key) for key in keys]
+        width = max(g["x"] + g["w"] for g in groups) - min(g["x"] for g in groups)
+        height = max(g["y"] + g["h"] for g in groups) - min(g["y"] for g in groups)
+        self.assertLessEqual(max(width, height) / min(width, height), 1.8)
+        you, assistant = groups[:2]
+        self.assertEqual(you["y"], assistant["y"])
+        self.assertEqual(you["y"], min(g["y"] for g in groups))
+        self.assertEqual(you["x"], min(g["x"] for g in groups))
+        self.assertLessEqual(you["x"] + you["w"], assistant["x"])
+        for group in groups[2:]:
+            if group["y"] == you["y"]:
+                self.assertLessEqual(assistant["x"] + assistant["w"], group["x"])
+
+        for name in names:
+            with self.subTest(project=name):
+                status = self.obj(f"tstack/project/projects/{name}")
+                ordered = [status] + [self.obj(tile["id"]) for tile in published[name]]
+                self.assertEqual(self.members(f"tstack/group/projects/{name}"),
+                                 {tile["id"] for tile in ordered})
+                self.assertEqual(len({tile["frame"]["x"] for tile in ordered}), 1)
+                for above, below in zip(ordered, ordered[1:]):
+                    self.assertLessEqual(above["frame"]["y"] + above["frame"]["h"],
+                                         below["frame"]["y"])
+                for old in published[name]:
+                    new = self.obj(old["id"])
+                    self.assertEqual((new["frame"]["w"], new["frame"]["h"]),
+                                     (old["frame"]["w"], old["frame"]["h"]))
+                    expected_props = {**old["props"], "follow": False} if old["type"] == "terminal" else old["props"]
+                    self.assertEqual(new["props"], expected_props)
+
+    def test_many_tall_project_columns_wrap_into_balanced_rows(self):
+        names = [f"project-{n:02}" for n in range(16)]
+        for name in names:
+            self.coordinator(name, f"terminal_{name}")
+            self.add(self.tile(f"show_{name}", "image", 9000, 9000, 900, 3000,
+                               key=f"show/{name}/screen", source=f"{name}.png"))
+
+        self.board_cli()
+        projects = [(name, self.frame(f"tstack/group/projects/{name}")) for name in names]
+        self.assertGreater(len({frame["y"] for _, frame in projects}), 1)
+        self.assertEqual([name for name, _ in sorted(projects, key=lambda item: (item[1]["y"], item[1]["x"]))],
+                         names)
+        you, assistant = self.frame("tstack/you"), self.frame("tstack/group/assistant")
+        groups = [you, assistant] + [frame for _, frame in projects]
+        self.assertEqual(you["y"], assistant["y"])
+        self.assertEqual(you["y"], min(frame["y"] for frame in groups))
+        self.assertLessEqual(you["x"] + you["w"], assistant["x"])
+        self.assertTrue(any(frame["y"] == you["y"] for _, frame in projects))
+        for _, frame in projects:
+            if frame["y"] == you["y"]:
+                self.assertLessEqual(assistant["x"] + assistant["w"], frame["x"])
+        width = max(g["x"] + g["w"] for g in groups) - min(g["x"] for g in groups)
+        height = max(g["y"] + g["h"] for g in groups) - min(g["y"] for g in groups)
+        self.assertLessEqual(max(width, height) / min(width, height), 1.8)
+
+    def test_foreign_review_questions_stay_fixed_and_columns_avoid_all_obstacles(self):
+        foreign = [
+            self.tile("review_group", "group", 16, 24, 948, 1150,
+                      key="review2/group", members=["review_open", "review_closed"], title="Review"),
+            self.tile("review_open", "question", 40, 80, 900, 500,
+                      key="review2/ask-release", status="open", asker={"tile": "obj_t"}),
+            self.tile("review_closed", "question", 40, 650, 900, 500,
+                      key="review2/ask-old", status="answered", answer={"at": 1}),
+            self.tile("foreign_note", "note", 3000, 2500, 1500, 1000, markdown="Keep here"),
+        ]
+        self.add(*foreign)
+        for name in ("alpha", "bravo", "charlie", "delta"):
+            self.coordinator(name, f"terminal_{name}")
+            self.add(self.tile(f"show_{name}", "image", 9000, 9000, 1100, 700,
+                               key=f"show/{name}/screen", source=f"{name}.png"))
+        own_questions = [
+            self.tile("unkeyed", "question", 9000, 9000, status="open"),
+            self.tile("tstack_question", "question", 9000, 9000, key="tstack/ask-own", status="open"),
+            self.tile("show_question", "question", 9000, 9000, key="show/alpha/ask-own", status="open"),
+        ]
+        self.add(*own_questions)
+
+        self.board_cli()
+        for old in foreign:
+            self.assertEqual(self.obj(old["id"]), old)
+        self.assertTrue({obj["id"] for obj in own_questions} <= self.members("tstack/you"))
+        self.assertTrue({"review_open", "review_closed"}.isdisjoint(self.members("tstack/you")))
+        self.assertNotIn("tstack/label/review_open", {obj["props"].get("key") for obj in self.objects()})
+        groups = [obj for obj in self.objects()
+                  if obj["type"] == "group" and obj["props"].get("key", "").startswith("tstack/")]
+        for index, group in enumerate(groups):
+            frame = group["frame"]
+            others = foreign + groups[index + 1:]
+            for other in others:
+                with self.subTest(group=group["props"]["key"], obstacle=other["id"]):
+                    blocked = other["frame"]
+                    self.assertTrue(frame["x"] + frame["w"] <= blocked["x"] or
+                                    blocked["x"] + blocked["w"] <= frame["x"] or
+                                    frame["y"] + frame["h"] <= blocked["y"] or
+                                    blocked["y"] + blocked["h"] <= frame["y"])
+        first = json.loads(self.store.read_text())
+        calls = len(self.log("easl"))
+        self.board_cli()
+        self.assertEqual(json.loads(self.store.read_text()), first)
+        writes = [call["args"][0] for call in self.log("easl")[calls:]
+                  if call["args"][0] in ("object.batch", "object.update", "object.upsert",
+                                         "object.delete", "object.create")]
+        self.assertEqual(writes, [])
+
+    def test_foreign_tile_below_short_column_does_not_move_clear_columns(self):
+        self.coordinator("alpha", "obj_a")
+        self.add(self.tile("tall", "image", 9000, 9000, 1600, 3000, key="show/alpha/screen"))
+        self.board_cli()
+        assistant = self.frame("tstack/group/assistant")
+        self.assertEqual(assistant["y"], self.frame("tstack/group/projects/alpha")["y"])
+        foreign = self.tile("gap", "note", assistant["x"] + 24,
+                            assistant["y"] + assistant["h"] + 24, 100, 100, markdown="Stay here")
+        self.add(foreign)
+        first = json.loads(self.store.read_text())
+        calls = len(self.log("easl"))
+        self.assertIn(CLEAN, self.board_cli())
+        self.assertEqual(json.loads(self.store.read_text()), first)
+        self.assertFalse(any(call["args"][0] == "object.batch" for call in self.log("easl")[calls:]))
+
+    def test_only_colliding_foreign_tiles_determine_column_shift(self):
+        near = self.tile("near", "note", 0, 0, 500, 500, markdown="Near")
+        distant = self.tile("distant", "note", 40000, 90000, 500, 500, markdown="Far away")
+        self.add(near, distant)
+        self.assertIn(CLEAN, self.board_cli())
+        you = self.frame("tstack/you")
+        self.assertGreaterEqual(you["x"], near["frame"]["x"] + near["frame"]["w"])
+        self.assertLess(you["x"] + you["w"], distant["frame"]["x"])
+        self.assertEqual(self.obj("near"), near)
+        self.assertEqual(self.obj("distant"), distant)
+
+    def test_answering_own_question_does_not_shift_other_columns(self):
+        from datetime import datetime, timedelta, timezone
+        self.add(self.tile("q1", "question", 9000, 9000, status="open"),
+                 self.tile("q2", "question", 9000, 9000, status="open"))
+        self.board_cli()
+        origin = self.frame("tstack/todo")["x"]
+        terminal = self.frame("obj_t")
+        store = json.loads(self.store.read_text())
+        question = next(obj for obj in store["boards"]["brd_a"] if obj["id"] == "q1")
+        question["props"].update(status="answered", answer={"at": datetime.now(timezone.utc).isoformat()})
+        question["frame"]["h"] = 148
+        self.store.write_text(json.dumps(store))
+        self.assertIn(CLEAN, self.board_cli())
+        self.assertEqual(self.frame("tstack/todo")["x"], origin)
+        self.assertEqual(self.frame("obj_t"), terminal)
+        self.assertEqual(self.obj("q1"), question)
+        self.assertIn("q1", self.members("tstack/you"))
+        self.assertIn("q2", self.members("tstack/you"))
+        store = json.loads(self.store.read_text())
+        question = next(obj for obj in store["boards"]["brd_a"] if obj["id"] == "q1")
+        question["props"]["archived"] = True
+        self.store.write_text(json.dumps(store))
+        self.assertIn(CLEAN, self.board_cli())
+        self.assertNotIn("q1", self.members("tstack/you"))
+        self.assertEqual(self.frame("tstack/todo")["x"], origin)
+        self.assertEqual(self.frame("obj_t"), terminal)
+        store = json.loads(self.store.read_text())
+        question = next(obj for obj in store["boards"]["brd_a"] if obj["id"] == "q2")
+        question["props"].update(status="cancelled",
+                                 closedAt=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
+        self.store.write_text(json.dumps(store))
+        self.assertIn(CLEAN, self.board_cli())
+        self.assertNotIn("q2", {obj["id"] for obj in self.objects()})
+        self.assertNotIn("q2", self.members("tstack/you"))
+        self.assertEqual(self.frame("tstack/todo")["x"], origin)
+        self.assertEqual(self.frame("obj_t"), terminal)
+
     def test_more_than_fifty_operations_keep_cross_batch_group_members(self):
         self.add(*(self.tile(f"q{n}", "question", 9000, 9000, status="open", asker="unknown") for n in range(60)))
         self.assertIn(CLEAN, self.board_cli())

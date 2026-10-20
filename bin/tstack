@@ -439,7 +439,7 @@ def easl(method: str, **params) -> dict:
 
 READ_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
 TASK_COLUMNS = ["id", "effort", "title", "state", "lane", "pr", "updated"]
-GAP, BATCH, INNER_W, PANEL_W, BOARD_W = 24, 50, 1340, 640, 4300
+GAP, BATCH, PANEL_W = 24, 50, 640
 
 
 @dataclass
@@ -593,6 +593,11 @@ def project_key(seat: Seat) -> str:
 
 def key_of(obj: dict) -> str:
     return obj.get("key") or (obj.get("props") or {}).get("key") or ""
+
+
+def ownable_question(obj: dict) -> bool:
+    key = key_of(obj)
+    return obj.get("type") == "question" and (not key or key.startswith(("tstack/", "show/")))
 
 
 def frame_of(obj: dict) -> dict:
@@ -818,8 +823,18 @@ def design_board(snap: Snapshot, board_id: str, objects: dict) -> BoardDesign:
         unit.append(identity)
         group.units.append(unit)
 
+    previous_you = next((obj for obj in objects.values() if key_of(obj) == you.key), {})
+    previous_members = set((previous_you.get("props") or {}).get("members") or [])
+    now = time.time()
     for obj in sorted(objects.values(), key=lambda obj: obj["id"]):
-        if obj.get("type") == "question" and (obj.get("props") or {}).get("status", "open") == "open":
+        props = obj.get("props") or {}
+        if not ownable_question(obj) or props.get("archived"):
+            continue
+        status = props.get("status", "open")
+        closed_at = question_closed_time(obj)
+        retained = (obj["id"] in previous_members and status in ("answered", "cancelled", "expired")
+                    and (closed_at is None or now - closed_at < 1800))
+        if status == "open" or retained:
             borrow(you, obj, obj["id"])
     digests = [obj for obj in objects.values() if obj.get("type") == "note"
                and key_of(obj) in ("digest", "show/assistant/digest")
@@ -854,45 +869,53 @@ def design_board(snap: Snapshot, board_id: str, objects: dict) -> BoardDesign:
 def place_groups(design: BoardDesign, objects: dict, obstacles: list[dict]):
     dimensions = {identity: frame_of(objects[identity]) for identity in design.borrowed}
     dimensions.update({key: obj.frame for key, obj in design.desired.items()})
-    left, top, row_bottom = 0, 0, 0
-    for number, group in enumerate(design.groups):
-        positions = {}
-        x, y, right, bottom = 0, 0, 0, 0
-        for unit in group.units:
-            width = max(dimensions[member]["w"] for member in unit)
-            height = sum(dimensions[member]["h"] for member in unit) + GAP * (len(unit) - 1)
-            if x and x + width > INNER_W:
-                x, y = 0, bottom + GAP
-            offset = y
-            for member in unit:
-                positions[member] = {"x": x, "y": offset}
-                offset += dimensions[member]["h"] + GAP
-            right, bottom = max(right, x + width), max(bottom, y + height)
-            x += width + GAP
-        width, height = right + 48, bottom + 80
-        if left and left + width > BOARD_W:
-            left, top = 0, row_bottom + GAP
-        while True:
-            bounds = {"x": left, "y": top, "w": width, "h": height}
-            hits = [frame for frame in obstacles if overlaps(bounds, frame)]
-            if not hits:
-                break
-            next_left = max(frame["x"] + frame["w"] for frame in hits) + GAP
-            if next_left + width <= BOARD_W:
-                left = next_left
-            else:
-                left, top = 0, max(top, min(frame["y"] + frame["h"] for frame in hits)) + GAP
-        for member, position in positions.items():
-            position = {"x": left + 24 + position["x"], "y": top + 56 + position["y"]}
+    sizes = []
+    for group in design.groups:
+        members = group.members()
+        width = max(dimensions[member]["w"] for member in members) + 48
+        height = sum(dimensions[member]["h"] for member in members) + GAP * (len(members) - 1) + 80
+        sizes.append((width, height))
+
+    def measure(columns: int) -> tuple[float, float]:
+        rows = [sizes[start:start + columns] for start in range(0, len(sizes), columns)]
+        width = max(sum(w for w, h in row) + GAP * (len(row) - 1) for row in rows)
+        height = sum(max(h for w, h in row) for row in rows) + GAP * (len(rows) - 1)
+        return width, height
+
+    def score(columns: int) -> tuple[float, float, int]:
+        width, height = measure(columns)
+        return abs(math.log(width / height)), width * height, columns
+
+    columns = min(range(min(2, len(sizes)), len(sizes) + 1), key=score)
+    bounds = []
+    top = 0
+    for start in range(0, len(sizes), columns):
+        left = 0
+        for width, height in sizes[start:start + columns]:
+            bounds.append({"x": left, "y": top, "w": width, "h": height})
+            left += width + GAP
+        top += max(h for w, h in sizes[start:start + columns]) + GAP
+
+    def hits(origin: float) -> list[tuple[dict, dict]]:
+        return [(column, frame) for column in bounds for frame in obstacles
+                if overlaps({**column, "x": column["x"] + origin}, frame)]
+
+    todo = next((obj for obj in objects.values() if key_of(obj) == "tstack/todo"), None)
+    origin = frame_of(todo)["x"] - 24 if todo else 0
+    if hits(origin):
+        origin = 0
+        while collisions := hits(origin):
+            origin = max(frame["x"] + frame["w"] - column["x"] for column, frame in collisions) + GAP
+
+    for group, column in zip(design.groups, bounds):
+        offset = column["y"] + 56
+        for member in group.members():
+            position = {"x": origin + column["x"] + 24, "y": offset}
             if member in design.desired:
                 design.desired[member].frame.update(position)
             else:
                 design.positions[member] = position
-        row_bottom = max(row_bottom, top + height)
-        left += width + GAP
-        if number == 0:
-            left, top = 0, row_bottom + GAP
-        obstacles.append(bounds)
+            offset += dimensions[member]["h"] + GAP
 
 
 def reconcile_board(board_id: str, design: BoardDesign, objects: dict, existing: dict,
@@ -992,8 +1015,8 @@ def draw(snap: Snapshot, pointer: dict) -> list:
             obsolete[obj["id"]] = obj
     now = time.time()
     for obj in closed:
-        closed_at = question_closed_time(obj)
-        if closed_at is not None and now - closed_at >= 1800:
+        closed_at = question_closed_time(obj) if ownable_question(obj) else None
+        if closed_at is not None and now - closed_at >= 1800 and obj["id"] not in design.borrowed:
             obsolete[obj["id"]] = obj
     for key, desired in design.desired.items():
         old = existing.get(key)
