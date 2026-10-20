@@ -32,7 +32,7 @@ print(json.dumps(recorded[key])) if key in recorded else sys.exit(f"no fixture f
 
 
 class WatchPr(unittest.TestCase):
-    def watch(self, pr, *args, earlier=lambda recorded: None, polls=()):
+    def watch(self, pr, *args, earlier=lambda recorded: None, polls=(), lane_model=None, symlink=False):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         tmp = Path(scratch.name)
@@ -46,7 +46,18 @@ class WatchPr(unittest.TestCase):
         (tmp / "gh").write_text(FAKE_GH)
         (tmp / "gh").chmod(0o755)
         env = {**os.environ, "PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}"}
-        return subprocess.run([str(ROOT / "bin/watch-pr"), pr, "--interval", "0", *args],
+        env.pop("TSTACK_SEAT", None)
+        env.pop("TSTACK_LANE", None)
+        if lane_model is not None:
+            lane = tmp / "state/lanes/review"
+            lane.mkdir(parents=True)
+            (lane / "lane.json").write_text(json.dumps({"model": lane_model, "pr": recorded["pr view"]["url"]}))
+            env.update(TSTACK_SEAT=str(tmp), TSTACK_LANE="review")
+        executable = ROOT / "bin/watch-pr"
+        if symlink:
+            (tmp / "watch-pr").symlink_to(executable)
+            executable = tmp / "watch-pr"
+        return subprocess.run([str(executable), pr, "--interval", "0", *args],
                               capture_output=True, text=True, env=env, timeout=60)
 
     def test_coderabbit_review_limit_notice_is_reported(self):
@@ -138,3 +149,133 @@ class WatchPr(unittest.TestCase):
         result = self.watch("example/team-instance#1", earlier=lambda recorded: recorded.pop("api graphql"))
         self.assertEqual((result.returncode, result.stdout), (1, ""))
         self.assertEqual(result.stderr, "watch-pr: no fixture for api graphql\n")
+
+    def review_record(self, **changes):
+        record = {"head": "f08be0ca3e03ad5597e09a241eb698a155ce568f",
+                  "reviewer_model": "anthropic/claude-opus-5-5",
+                  "author_model": "openai-codex/gpt-6.1-sol", "verdict": "READY"}
+        record.update(changes)
+        return {"author": {"login": "twaldin"}, "createdAt": "2026-10-20T12:00:00Z",
+                "body": "tstack-verdict: " + json.dumps(record), "url": "https://github.com/example/review"}
+
+    def verdict_poll(self, *comments, body="tstack-author-model: openai-codex/gpt-6.1-sol", **fields):
+        return {"body": body, "comments": list(comments), "reviews": [], **fields}
+
+    def test_current_other_family_verdict_in_text_and_json(self):
+        poll = self.verdict_poll(self.review_record())
+        result = self.watch("example/team-instance#1", polls=[poll], symlink=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("other-family verdict")]
+        self.assertEqual(lines, ["other-family verdict READY at f08be0ca3e03ad5597e09a241eb698a155ce568f: "
+                                 "anthropic/claude-opus-5-5 reviewed openai-codex/gpt-6.1-sol"])
+        result = self.watch("example/team-instance#1", "--json", polls=[poll])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["verdict"],
+                         {"ready": True, "head": "f08be0ca3e03ad5597e09a241eb698a155ce568f",
+                          "reviewer_model": "anthropic/claude-opus-5-5",
+                          "author_model": "openai-codex/gpt-6.1-sol", "verdict": "READY",
+                          "source": "comments", "at": "2026-10-20T12:00:00Z"})
+
+    def test_nonqualifying_verdicts_are_facts_not_errors(self):
+        malformed = self.review_record()
+        malformed["body"] = 'tstack-verdict: {"verdict":"READY"}'
+        for label, poll in (
+                ("missing", self.verdict_poll()),
+                ("same family", self.verdict_poll(self.review_record(reviewer_model="openai/gpt-6.1"))),
+                ("stale", self.verdict_poll(self.review_record(head="a" * 40))),
+                ("short SHA", self.verdict_poll(self.review_record(head="f08be0c"))),
+                ("malformed", self.verdict_poll(malformed)),
+                ("unknown reviewer", self.verdict_poll(self.review_record(reviewer_model="@opus"))),
+                ("unknown provider", self.verdict_poll(self.review_record(reviewer_model="other/claude-opus-5-5"))),
+                ("unknown author", self.verdict_poll(self.review_record(), body="tstack-author-model: @sol")),
+                ("wrong author", self.verdict_poll(self.review_record(author_model="google/gemini-3-pro"))),
+                ("non-ready", self.verdict_poll(self.review_record(verdict="NOT_READY"))),
+                ("missing author metadata", self.verdict_poll(self.review_record(), body="")),
+                ("duplicate author", self.verdict_poll(self.review_record(), body=
+                    "tstack-author-model: openai-codex/gpt-6.1-sol\n"
+                    "tstack-author-model: anthropic/claude-opus-5-5"))):
+            with self.subTest(label):
+                result = self.watch("example/team-instance#1", polls=[poll])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([line for line in result.stdout.splitlines()
+                                  if line.startswith("other-family verdict")],
+                                 ["other-family verdict: no READY current-head verdict"])
+
+    def test_lane_resolved_model_precedes_pr_metadata_and_alias_falls_back(self):
+        for model, body, ready in (
+                ("openai-codex/gpt-6.1-sol", "tstack-author-model: anthropic/claude-opus-5-5", True),
+                ("anthropic/claude-opus-5-5", "tstack-author-model: openai-codex/gpt-6.1-sol", False),
+                ("@sol", "tstack-author-model: openai-codex/gpt-6.1-sol", True),
+                ("@sol", "", False)):
+            with self.subTest(model=model, body=body):
+                result = self.watch("example/team-instance#1", "--json", lane_model=model,
+                                    polls=[self.verdict_poll(self.review_record(), body=body)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["verdict"]["ready"], ready)
+
+    def test_latest_rejection_supersedes_ready_across_comments_and_reviews(self):
+        rejection = self.review_record(verdict="NOT_READY")
+        rejection.update(submittedAt="2026-10-20T13:00:00Z", state="COMMENTED")
+        poll = self.verdict_poll(self.review_record(), reviews=[rejection])
+        result = self.watch("example/team-instance#1", "--json", polls=[poll])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fact = json.loads(result.stdout)["verdict"]
+        self.assertEqual((fact["ready"], fact["verdict"], fact["source"]), (False, "NOT_READY", "reviews"))
+
+    def test_dismissed_or_changes_requested_review_is_not_ready(self):
+        for state in ("DISMISSED", "CHANGES_REQUESTED", "PENDING"):
+            with self.subTest(state):
+                review = self.review_record()
+                review.update(submittedAt="2026-10-20T13:00:00Z", state=state)
+                comments = [] if state == "PENDING" else [self.review_record()]
+                result = self.watch("example/team-instance#1", "--json",
+                                    polls=[self.verdict_poll(*comments, reviews=[review])])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(json.loads(result.stdout)["verdict"]["ready"])
+
+    def test_verdict_change_is_reported_by_until_change(self):
+        result = self.watch("example/team-instance#1", "--until", "change", "--json",
+                            polls=[self.verdict_poll(), self.verdict_poll(self.review_record())])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["changed"], ["verdict", "comments"])
+        self.assertTrue(report["verdict"]["ready"])
+
+    def test_malformed_structured_metadata_never_creates_ready_evidence(self):
+        valid = self.review_record()["body"]
+        for body in (
+                valid[:-1],
+                valid.replace('"verdict": "READY"', '"verdict": "NOT_READY", "verdict": "READY"'),
+                valid.replace('"reviewer_model": "anthropic/claude-opus-5-5"', '"reviewer_model": null'),
+                valid.replace('"verdict": "READY"', '"verdict": "ready"'),
+                "Independent exact-head review approved f08be0ca3e03ad5597e09a241eb698a155ce568f "
+                "by anthropic/claude-opus-5-5; author openai-codex/gpt-6.1-sol. READY."):
+            with self.subTest(body=body):
+                comment = {**self.review_record(), "body": body}
+                result = self.watch("example/team-instance#1", "--json", polls=[self.verdict_poll(comment)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(json.loads(result.stdout)["verdict"]["ready"])
+
+    def test_latest_comment_wins_by_time_not_array_order(self):
+        rejection = {**self.review_record(verdict="NOT_READY"), "createdAt": "2026-10-20T14:00:00Z"}
+        result = self.watch("example/team-instance#1", "--json",
+                            polls=[self.verdict_poll(rejection, self.review_record())])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["verdict"]["ready"])
+
+    def test_ready_evidence_becomes_stale_when_head_changes(self):
+        current = self.verdict_poll(self.review_record())
+        stale = {**current, "headRefOid": "a" * 40}
+        result = self.watch("example/team-instance#1", "--until", "change", "--json", polls=[current, stale])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["changed"], ["head", "verdict"])
+        self.assertFalse(report["verdict"]["ready"])
+
+    def test_resolved_grok_reviewer_counts_as_other_family(self):
+        result = self.watch("example/team-instance#1", "--json",
+                            polls=[self.verdict_poll(self.review_record(reviewer_model="xai/grok-4"))])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fact = json.loads(result.stdout)["verdict"]
+        self.assertTrue(fact["ready"])
+        self.assertEqual(fact["reviewer_model"], "xai/grok-4")

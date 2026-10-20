@@ -20,6 +20,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pr_verdict import render_verdict, verdict_fact
+
 ENGINE = Path(os.environ.get("TSTACK_HOME") or Path(__file__).resolve().parents[1])
 WORKTREES = Path(os.environ.get("TSTACK_WORKTREES") or Path.home() / "worktrees")
 PASS_ENV = ("PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "SSH_AUTH_SOCK", "EASL_SOCKET",
@@ -106,7 +109,7 @@ def run(argv, cwd=None, env=None, check=True) -> str:
         raise Fail(f"{argv[0]}: not found")
     if check and result.returncode:
         raise Fail(f"{' '.join(map(str, argv[:4]))}: {(result.stderr or result.stdout).strip()}")
-    return result.stdout.strip()
+    return result.stdout if "\0" in result.stdout else result.stdout.strip()
 
 
 def git(repo, *args, check=True) -> str:
@@ -405,7 +408,9 @@ def merge(lane: Lane, admin: bool) -> str:
     url = find_pr(lane, record)
     if not url:
         raise Fail(f"no PR for {record['branch']} in {record['repo']}")
-    head = json.loads(run(["gh", "pr", "view", url, "--json", "headRefOid"]))["headRefOid"]
+    pr = json.loads(run(["gh", "pr", "view", url, "--json", "headRefOid,body,reviews,comments"]))
+    head = pr["headRefOid"]
+    print(render_verdict(verdict_fact(pr, record.get("model"))), flush=True)
     # Run outside any clone, so gh deletes only the remote branch and leaves the worktree's checkout alone.
     run(["gh", "pr", "merge", url, "--squash", "--delete-branch", "--match-head-commit", head]
         + ["--admin"] * admin, cwd="/")
@@ -416,6 +421,131 @@ def merge(lane: Lane, admin: bool) -> str:
     lane.update(pr=url, merge=sha, merged_head=head)
     lane.refresh()
     return f"merged: {url} at {head[:12]} as {sha[:12]}"
+
+
+REGENERABLE_DIRS = {
+    "node_modules", ".build", ".swiftpm", "DerivedData", "dist", "build", "target", "__pycache__",
+    ".venv", "venv", "coverage", ".next", ".turbo", ".cache", "out", ".omp", ".agents",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache",
+}
+REGENERABLE_FILES = {"AGENTS.override.md", "WORKFLOW.md", ".DS_Store", ".omp", ".agents"}
+
+
+def process_cwds() -> list:
+    command = ["lsof", "-nP", "-a", "-d", "cwd", "-Fpn"]
+    if os.geteuid() != 0:
+        command = ["sudo", "-n", *command]
+    try:
+        result = subprocess.run(command, cwd="/", capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise Fail("lsof timed out after 30s") from None
+    if result.returncode or result.stderr.strip():
+        raise Fail((result.stderr or result.stdout).strip() or f"lsof exited {result.returncode}")
+    output = result.stdout
+    found, pid = [], ""
+    for line in output.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("n") and line[1:].startswith("/"):
+            found.append((pid, Path(line[1:]).resolve()))
+    return found
+
+
+def tree_gates(worktree: Path, expected_head: str | None, processes=None) -> list:
+    failures = []
+    if expected_head is not None and git(worktree, "rev-parse", "HEAD") != expected_head:
+        failures.append("gate 2: HEAD differs from PR head")
+    if git(worktree, "status", "--porcelain", "--untracked-files=all"):
+        failures.append("gate 3: dirty worktree")
+    ignored = git(worktree, "ls-files", "-z", "--others", "--ignored", "--exclude-standard").split("\0")
+    collapsed = git(worktree, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+    unsafe_roots = [name for name in collapsed.split("\0") if name
+                    and any(file.startswith(name) for file in ignored)
+                    and Path(name).name not in (REGENERABLE_DIRS if name.endswith("/") else REGENERABLE_FILES)]
+    unsafe = [name for name in ignored if name
+              and not any(part in REGENERABLE_DIRS for part in Path(name).parts[:-1])
+              and Path(name).name not in REGENERABLE_FILES]
+    if unsafe or unsafe_roots:
+        failures.append("gate 4: ignored paths are not regenerable")
+    try:
+        processes = process_cwds() if processes is None else processes
+        if isinstance(processes, str):
+            raise Fail(processes)
+        root = worktree.resolve()
+        pids = [pid for pid, cwd in processes if cwd == root or root in cwd.parents]
+        if pids:
+            failures.append(f"gate 5: process cwd inside worktree, PIDs {', '.join(pids)}")
+    except (Fail, OSError) as error:
+        failures.append(f"gate 5: process inspection failed: {error}")
+    return failures
+
+
+def clean_listing(seat: Path) -> str:
+    instances = {Path.home() / "agents", Path(os.environ.get("TSTACK_INSTANCE") or Path.home() / "agents")}
+    seats = {seat}
+    for instance in instances:
+        seats.add(instance / "assistant")
+        seats.update((instance / "projects").glob("*"))
+    recorded = set()
+    for candidate in seats:
+        for path in (candidate / "state" / "lanes").glob("*/lane.json"):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError) as error:
+                raise Fail(f"{path}: {error}") from None
+            if record.get("worktree"):
+                recorded.add(Path(record["worktree"]).resolve())
+    try:
+        processes = process_cwds()
+    except (Fail, OSError) as error:
+        processes = str(error)
+    inventories, rows = {}, []
+    scanned = finished = eligible = errors = 0
+    for directory, dirs, files in os.walk(WORKTREES, followlinks=False):
+        if ".git" not in dirs and ".git" not in files:
+            continue
+        dirs[:] = []
+        worktree = Path(directory)
+        if worktree.resolve() in recorded or worktree.name == "main":
+            continue
+        scanned += 1
+        try:
+            branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+            if not branch or branch in {"main", "master"}:
+                continue
+            origin = git(worktree, "remote", "get-url", "origin")
+            match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", origin)
+            if not match:
+                continue
+            repo = match[1]
+            if repo not in inventories:
+                inventories[repo] = json.loads(run([
+                    "gh", "pr", "list", "--repo", repo, "--state", "all", "--limit", "1000", "--json",
+                    "url,state,headRefName,headRefOid,mergedAt,closedAt,updatedAt"]))
+            matches = [pr for pr in inventories[repo] if pr["headRefName"] == branch]
+            if not matches:
+                continue
+            pr = max(matches, key=lambda item: item.get("updatedAt") or "")
+            if pr["state"] not in {"MERGED", "CLOSED"}:
+                continue
+            timestamp = pr.get("mergedAt") or pr.get("closedAt")
+            failures = []
+            if not timestamp:
+                failures.append("gate 1: terminal time unavailable")
+            elif (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00"))).total_seconds() <= 86400:
+                failures.append("gate 1: terminal PR is not over 24 hours old")
+            failures += tree_gates(worktree, pr.get("headRefOid") or "", processes)
+            finished += 1
+            eligible += not failures
+            rows.append(f"{worktree}\t{pr['state']}\t{pr['url']}\t"
+                        + ("; ".join(failures) if failures else "all gates pass"))
+        except (Fail, OSError, ValueError) as error:
+            errors += 1
+            rows.append(f"{worktree}\tUNKNOWN\tinspection failed: {error}")
+    rows.append(f"unrecorded: {scanned}, finished: {finished}, eligible: {eligible}, "
+                f"blocked: {finished - eligible}, errors: {errors}")
+    return "\n".join(rows)
 
 
 def cleanup(lane: Lane, record: dict) -> str:
@@ -450,8 +580,12 @@ def cleanup(lane: Lane, record: dict) -> str:
         return ""
 
     if worktree.exists():
-        if git(worktree, "status", "--porcelain", "--untracked-files=all"):
-            return "left dirty worktree"
+        expected_head = record.get("merged_head") if record.get("merge") else None
+        if record.get("pr") and not record.get("merge"):
+            expected_head = json.loads(run(["gh", "pr", "view", record["pr"], "--json", "headRefOid"])).get("headRefOid") or ""
+        failures = tree_gates(worktree, expected_head)
+        if failures:
+            return "left worktree: " + "; ".join(failures)
         branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
         if not branch:
             return "left worktree on detached HEAD"
@@ -577,7 +711,7 @@ def main(argv) -> int:
         p[name] = sub.add_parser(name, help=text, description=text)
         p[name].add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/)")
         for arg in args:
-            p[name].add_argument(arg, nargs="+" if arg == "ids" else None)
+            p[name].add_argument(arg, nargs="+" if arg == "ids" else "?" if name == "clean" else None)
     p["start"].add_argument("--repo", required=True, help="OWNER/REPO (cloned to ~/worktrees/<repo>/main if absent) or a clone")
     p["start"].add_argument("--brief", required=True,
                            help="brief file; optional PLAYBOOK: name line is recorded, unknown names are reported")
@@ -591,18 +725,24 @@ def main(argv) -> int:
     p["list"].add_argument("--all", action="store_true", help="include lanes whose worktree is gone")
     p["logs"].add_argument("-n", type=int, default=60)
     p["merge"].add_argument("--admin", action="store_true")
+    p["clean"].add_argument("--list", action="store_true",
+                            help="read-only: list unrecorded terminal-PR trees and gates 1–5 under ~/worktrees")
     a = top.parse_args(argv)
+    if a.cmd == "clean" and bool(a.id) == bool(a.list):
+        p["clean"].error("pass a lane id or --list")
     if a.seat or os.environ.get("TSTACK_SEAT"):
         seat = Path(a.seat or os.environ["TSTACK_SEAT"]).expanduser().resolve()
     else:
         seat = next((d for d in (Path.cwd().resolve(), *Path.cwd().resolve().parents) if (d / "state").is_dir()), None)
+        if not seat and a.cmd == "clean" and a.list:
+            seat = Path(os.environ.get("TSTACK_INSTANCE") or Path.home() / "agents") / "assistant"
         if not seat:
             raise Fail("no seat: pass --seat DIR, set TSTACK_SEAT, or run inside a seat dir")
     lane = Lane(seat, a.id) if getattr(a, "id", None) else None
     out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text, a.memory), "list": lambda: listing(seat, a.all),
            "show": lambda: show(lane), "logs": lambda: logs(lane, a.n), "stop": lambda: stop(lane),
            "wait": lambda: wait([Lane(seat, i) for i in a.ids]), "merge": lambda: merge(lane, a.admin),
-           "clean": lambda: clean(lane)}[a.cmd]()
+           "clean": lambda: clean_listing(seat) if a.list else clean(lane)}[a.cmd]()
     if out:
         print(out)
     return 0

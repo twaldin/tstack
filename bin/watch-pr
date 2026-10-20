@@ -4,6 +4,10 @@
 Facts: state, head SHA, mergeability, auto-merge, review decision, each check with its result, each review,
 each issue comment (bot notices such as CodeRabbit's "Review limit reached" included) and each unresolved
 review thread. After merge also the merge SHA, the workflow runs on it, and their deploy and release jobs.
+The other-family verdict line reports structured exact-head review evidence, never a merge gate.
+Metadata uses standalone lines:
+  tstack-author-model: openai-codex/gpt-6.1-sol
+  tstack-verdict: {"head":"<full SHA>","reviewer_model":"anthropic/claude-opus-5-5","author_model":"openai-codex/gpt-6.1-sol","verdict":"READY"}
 
 --until polls every --interval seconds and prints the facts when its condition first holds:
   change    any fact differs from the first poll (the report then starts with the changed keys)
@@ -15,15 +19,20 @@ Every mode also stops when the PR is closed without merging. Exit 0 with facts; 
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pr_verdict import model_family, render_verdict, verdict_fact
 
 PR_REF = re.compile(r"(?:https://github\.com/)?([\w.-]+)/([\w.-]+)(?:/pull/|#)(\d+)")
-PR_FIELDS = ("url,title,state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,"
+PR_FIELDS = ("url,title,body,state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,"
              "autoMergeRequest,mergeCommit,mergedAt,reviews,comments,statusCheckRollup")
 THREADS_QUERY = """query($o:String!,$r:String!,$n:Int!,$endCursor:String){
   repository(owner:$o,name:$r){pullRequest(number:$n){
@@ -60,6 +69,20 @@ def login(item):
     return (item.get("author") or {}).get("login", "ghost")
 
 
+def lane_author_model(url):
+    seat, lane = os.environ.get("TSTACK_SEAT"), os.environ.get("TSTACK_LANE")
+    if not seat or not lane or Path(lane).name != lane:
+        return None
+    try:
+        record = json.loads((Path(seat) / "state" / "lanes" / lane / "lane.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("pr") != url:
+        return None
+    model = record.get("model")
+    return model if model_family(model) else None
+
+
 def snapshot(repo, number):
     pr = gh("pr", "view", number, "--repo", repo, "--json", PR_FIELDS)
     owner, name = repo.split("/")
@@ -72,6 +95,7 @@ def snapshot(repo, number):
         "mergeable": pr["mergeable"], "merge_state": pr["mergeStateStatus"],
         "auto_merge": (pr["autoMergeRequest"] or {}).get("mergeMethod"),
         "review_decision": pr["reviewDecision"] or None,
+        "verdict": verdict_fact(pr, lane_author_model(pr["url"])),
         "checks": [{"name": c.get("name") or c.get("context"),
                     "result": c.get("conclusion") or c.get("status") or c.get("state"),
                     "url": c.get("detailsUrl") or c.get("targetUrl") or None} for c in pr["statusCheckRollup"]],
@@ -142,6 +166,7 @@ def render(r):
             f"head {r['head']} into {r['base']}",
             f"mergeable {r['mergeable']}, merge state {r['merge_state']}, auto-merge {r['auto_merge'] or 'off'}",
             f"review decision {r['review_decision'] or 'none'}",
+            render_verdict(r["verdict"]),
             f"checks ({len(r['checks'])}):"]
     out += grouped("  ", "", r["checks"])
     out.append(f"reviews ({len(r['reviews'])}):")

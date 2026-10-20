@@ -17,6 +17,14 @@ with open(stubs / f"{Path(__file__).name}.log", "a") as log:
     log.write(json.dumps({"args": args, "cwd": os.getcwd(), "lane": os.environ.get("TSTACK_LANE")}) + "\n")
 '''
 FAKES = {
+    "sudo": PRELUDE + r'''
+sys.exit(subprocess.run(args[1:]).returncode)
+''',
+    "lsof": PRELUDE + r'''
+if (stubs / "lsof.err").exists():
+    sys.exit((stubs / "lsof.err").read_text())
+print((stubs / "lsof.out").read_text() if (stubs / "lsof.out").exists() else "p1\nn/")
+''',
     # A session event, then one assistant message after omp.json's sleep (60 s when the prompt says SLOW).
     # Like omp, it takes a moment to shut down on SIGTERM; omp.pid holds its pid.
     "omp": PRELUDE + r'''

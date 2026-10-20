@@ -36,9 +36,17 @@ Linux runs capture systemd's exit result before unit collection, with the peak m
 
 A failed PR refresh reports the native error on stderr without blocking local run operations. Missing merge SHAs never authorize automatic cleanup.
 
+`lane clean <id>` and automatic post-merge cleanup check the PR head, clean status, ignored files, and process working directories before removal. Recorded lanes have no 24-hour delay after a terminal PR. Lanes without a PR retain the published-commit or local-base check. A failed gate leaves the tree and names the gate. Removal uses `git worktree remove` without `--force`.
+
+Ignored entries must name a regenerable directory in `REGENERABLE_DIRS` in `bin/lane`, or a file in `REGENERABLE_FILES`. Every expanded ignored file must also pass. A cache-like name inside an unapproved ignored directory does not authorize its removal. Process inspection uses noninteractive `sudo lsof` on Linux and macOS. An inspection failure keeps the tree.
+
+`lane clean --list` reads unrecorded trees below `~/worktrees`, without following directory symlinks or entering checkout roots. It excludes main checkouts and lanes recorded in the current seat or instance seats. Each terminal-PR row shows its state and failed gates, including the 24-hour terminal-age gate. The final line counts unrecorded, finished, eligible, blocked, and inspection-error trees. Listing never removes a tree or changes lane records.
+
 ## Watch a PR
 
 `watch-pr <owner/repo>#<number>` or `watch-pr <url>` prints PR facts once with `--once` as the default. `--until change`, `--until checks`, and `--until merged` wait for changed facts, completed checks, or a merged or closed PR. Every mode stops on a closed PR. `--interval <seconds>` sets the polling interval, and `--json` prints JSON. Reports include checks, reviews, comments, unresolved threads, mergeability, and the head SHA. Merged reports include the merge SHA, runs on that SHA, and their deploy or release jobs. The command never writes to GitHub.
+
+`lane merge` and `watch-pr` report whether a structured cross-family `READY` verdict covers the current head. They never require a verdict. The PR body carries `tstack-author-model: <provider/model>` when the lane record has no resolved model. Review comments carry the `tstack-verdict` JSON line documented in `roles/lane.md`. The latest current-head record wins. Prose-only reviews, model aliases, unknown families, stale heads, and dismissed reviews do not establish approval.
 
 ## Update pstack
 
