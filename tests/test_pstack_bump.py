@@ -40,6 +40,27 @@ class PstackBump(unittest.TestCase):
         self.assertFalse((eng / "x").exists())
         self.assertIn("pstack/docs/n.md", run(eng, "git", "ls-tree", "-r", "--name-only", "pstack-upstream").stdout)
 
+    def test_bump_does_not_restore_orch_runtime_or_dependencies(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        up, eng = tmp / "plugins", tmp / "engine"
+        for repo in (up, eng):
+            repo.mkdir()
+            run(repo, "git", "init", "-q", "-b", "main")
+        commit(eng, {"README.md": "engine\n"})
+        scripts = "pstack/skills/poteto-mode/scripts/"
+        removed = ["orch/orch.ts", "orch/store.ts", "orch/orch.test.ts",
+                   "bootstrap.ts", "package.json", "bun.lock"]
+        v1 = commit(up, {scripts + name: "old\n" for name in removed})
+        self.assertEqual(run(eng, str(BUMP), v1, str(up)).returncode, 0)
+        run(eng, "git", "rm", "-qr", scripts)
+        commit(eng, {"pstack/DROPPED": (BUMP.parent.parent / "pstack/DROPPED").read_text()})
+        v2 = commit(up, {scripts + name: "new\n" for name in removed + ["orch/new.ts"]})
+        out = run(eng, str(BUMP), v2, str(up))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(run(eng, "git", "ls-files", scripts).stdout, "")
+        for name in removed + ["orch/new.ts"]:
+            self.assertFalse((eng / (scripts + name)).exists(), name)
+
     def test_bump_recovers_missing_local_ref_from_fetched_snapshot(self):
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         up, eng = tmp / "plugins", tmp / "engine"

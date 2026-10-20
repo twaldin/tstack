@@ -341,13 +341,21 @@ def start(seat: Path, a) -> str:
             break
     lane = Lane(seat, f"{stem}-{number}")
     worktree, branch, brief = WORKTREES / project / lane.id, f"lane/{lane.id}", Path(a.brief).read_text()
+    field = re.search(r"^PLAYBOOK:[ \t]*(.*)$", brief, re.MULTILINE | re.IGNORECASE)
+    playbook = field.group(1).strip() if field else None
+    if playbook is not None:
+        playbooks = {"none"} | {path.stem for path in (ENGINE / "pstack" / "skills" / "poteto-mode" / "playbooks").glob("*.md")
+                               if path.is_file()}
+        if playbook not in playbooks:
+            print(f"lane: unknown PLAYBOOK {playbook!r}; valid names: {', '.join(sorted(playbooks))}", file=sys.stderr)
     git(main, "worktree", "add", "--quiet", "-b", branch, str(worktree), f"origin/{base}" if origin else base)
     (lane.dir / "brief.md").write_text(brief)
     record = {"id": lane.id, "project": project, "seat": str(seat),
               "host": os.environ.get("TSTACK_MACHINE") or socket.gethostname().split(".")[0],
               "repo": slug or str(main), "cleanup_repo": git(main, "rev-parse", "--path-format=absolute", "--git-common-dir"),
               "worktree": str(worktree), "branch": branch, "base": base, "model": a.model,
-              "thinking": a.thinking, "memory": a.memory, "session": None, "status": "running", "pr": None,
+              "thinking": a.thinking, "memory": a.memory, "playbook": playbook,
+              "session": None, "status": "running", "pr": None,
               "runs": [], "created": now()}
     text = (f"You are lane {lane.id}, in {worktree} on branch {branch} (base {base}, repo {record['repo']}). "
             f"Your brief, also at {lane.dir / 'brief.md'}:\n\n{brief}")
@@ -517,7 +525,8 @@ def show(lane: Lane) -> str:
     out = [f"{lane.id}: {record['status']}, run {last.get('run', 0)} exit {exit_code(last)}, {cost}",
            f"repo {record['repo']}, branch {record['branch']} on {record['base']}, PR {pr}",
            f"worktree {record['worktree']}" + ("" if Path(record["worktree"]).exists() else " (removed)"),
-           f"model {record['model']} {record['thinking']}, session {record.get('session')}"]
+           f"model {record['model']} {record['thinking']}, session {record.get('session')}",
+           f"PLAYBOOK: {record.get('playbook') if record.get('playbook') is not None else '(absent)'}"]
     out += [f"run {r['run']}: {r.get('start')} to {r.get('end') or 'running'}, exit {exit_code(r)}, "
             f"${r.get('cost_usd') or 0:.2f}" for r in record.get("runs") or []]
     if record["status"] == "running":
@@ -570,7 +579,8 @@ def main(argv) -> int:
         for arg in args:
             p[name].add_argument(arg, nargs="+" if arg == "ids" else None)
     p["start"].add_argument("--repo", required=True, help="OWNER/REPO (cloned to ~/worktrees/<repo>/main if absent) or a clone")
-    p["start"].add_argument("--brief", required=True)
+    p["start"].add_argument("--brief", required=True,
+                           help="brief file; optional PLAYBOOK: name line is recorded, unknown names are reported")
     p["start"].add_argument("--base", help="default: origin's default branch, else the clone's current branch")
     p["start"].add_argument("--model", default="@sol")
     p["start"].add_argument("--thinking", default="high")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tstack: maintain this host's engine and instance.
 
-setup  links skills, agents and bins, writes systemd units and installs orch.
+setup  links skills, agents and bins and writes systemd units.
 update pulls the engine, safely refreshes the instance and reruns setup.
 commit pushes seat state through a private index and safely refreshes main.
 board  draws grouped local project status and a You section on easl.
@@ -132,18 +132,6 @@ def setup(name: str) -> int:
     header = f"<!-- {MARK} from {', '.join(map(str, parts))}. Edit those, then rerun `tstack setup`. -->\n"
     write_owned(OMP / "AGENTS.md", header + "".join(f"\n{p.read_text().strip()}\n" for p in parts), out)
 
-    scripts = ENGINE / "pstack" / "skills" / "poteto-mode" / "scripts"
-    if not (scripts / "package.json").is_file():
-        out.append(f"skip bun install: no {scripts / 'package.json'}")
-    else:
-        try:
-            bun = subprocess.run(["bun", "install", "--frozen-lockfile"], cwd=scripts, capture_output=True, text=True)
-            error = bun.returncode and (bun.stderr or bun.stdout).strip()
-        except FileNotFoundError:
-            error = "bun: not found"
-        if error:
-            failed = True
-            out.append(f"failed bun install in {scripts}: {error}")
     print("\n".join(out) or f"tstack setup: {name} is current")
     return 1 if failed else 0
 

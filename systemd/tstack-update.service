@@ -6,5 +6,5 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart="@ENGINE@/bin/tstack" update --instance "@INSTANCE@" --machine "@MACHINE@"

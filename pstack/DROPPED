@@ -20,6 +20,11 @@ skills/poteto-mode/scripts/check-plan.*
 # Reads Cursor transcripts; lane clean removes lane worktrees
 skills/poteto-mode/scripts/worktree-audit.sh
 
+skills/poteto-mode/scripts/orch/*
+skills/poteto-mode/scripts/bootstrap.ts
+skills/poteto-mode/scripts/package.json
+skills/poteto-mode/scripts/bun.lock
+
 # Built on Cursor cloud VMs and pinned chats
 skills/poteto-mode/playbooks/multi-phase-plan.md
 skills/poteto-mode/playbooks/worktree-cleanup.md

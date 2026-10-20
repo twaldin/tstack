@@ -177,7 +177,6 @@ if args[0] not in ("board.get", "agent.list", "object.get", "object.find", "layo
     path.write_text(json.dumps(store, indent=1))
 print(json.dumps(out))
 ''',
-    "bun": PRELUDE,
     # Starts the command detached with its --working-directory and --setenv, keeping its pid for systemctl.
     # Real systemd-run expands $VAR in the command unless told not to.
     "systemd-run": PRELUDE + r'''

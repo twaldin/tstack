@@ -35,6 +35,50 @@ class LaneRuns(Sandbox):
         self.assertEqual(show[0], "demo-fix-it-1: exited, run 1 exit 0, $0.02")
         self.assertEqual(show[-2:], ["final answer (last 20 lines):", "done"])
 
+    def test_start_records_playbook_and_reports_unknown_names_without_refusing(self):
+        engine = self.root / "engine"
+        playbooks = engine / "pstack" / "skills" / "poteto-mode" / "playbooks"
+        playbooks.mkdir(parents=True)
+        for name in ("feature", "bug-fix"):
+            (playbooks / f"{name}.md").write_text(f"# {name}\n")
+        (playbooks / "directory.md").mkdir()
+        (playbooks / "notes.txt").write_text("not a playbook\n")
+        (playbooks.parent / "outside.md").write_text("# Outside\n")
+        self.env["TSTACK_HOME"] = str(engine)
+        cases = [
+            ("PLAYBOOK: feature\n", "feature", "", "feature"),
+            ("PLAYBOOK: none\n", "none", "", "none"),
+            ("", None, "", "(absent)"),
+            ("PLAYBOOK: nonexistent\n", "nonexistent",
+             "lane: unknown PLAYBOOK 'nonexistent'; valid names: bug-fix, feature, none\n", "nonexistent"),
+            ("Playbook: Debugging\n", "Debugging",
+             "lane: unknown PLAYBOOK 'Debugging'; valid names: bug-fix, feature, none\n", "Debugging"),
+            ("PLAYBOOK: ../outside\n", "../outside",
+             "lane: unknown PLAYBOOK '../outside'; valid names: bug-fix, feature, none\n", "../outside"),
+            ("PLAYBOOK: feature.md\n", "feature.md",
+             "lane: unknown PLAYBOOK 'feature.md'; valid names: bug-fix, feature, none\n", "feature.md"),
+            ("PLAYBOOK: \tfeature \t\n", "feature", "", "feature"),
+        ]
+        for number, (field, saved, diagnostic, shown) in enumerate(cases, 1):
+            with self.subTest(playbook=saved, field=field):
+                self.brief.write_text(f"Task brief.\n{field}Reply with the word done.\n")
+                result = self.cli("lane", "start", "Fix it", "--repo", "acme/demo", "--brief", str(self.brief))
+                lane_id = f"demo-fix-it-{number}"
+                self.assertEqual(result.stdout, f"{lane_id}\n")
+                self.assertEqual(result.stderr, diagnostic)
+                self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+                self.assertEqual(self.record(lane_id)["playbook"], saved)
+                (self.seat / "state" / "lanes" / lane_id / "brief.md").write_text("PLAYBOOK: changed\n")
+                self.assertIn(f"PLAYBOOK: {shown}", self.cli("lane", "show", lane_id).stdout.splitlines())
+
+    def test_missing_playbook_directory_does_not_prevent_startup(self):
+        self.env["TSTACK_HOME"] = str(self.root / "missing-engine")
+        self.brief.write_text("PLAYBOOK: feature\nReply with the word done.\n")
+        result = self.cli("lane", "start", "Fix it", "--repo", "acme/demo", "--brief", str(self.brief))
+        self.assertEqual(result.stdout, "demo-fix-it-1\n")
+        self.assertEqual(result.stderr, "lane: unknown PLAYBOOK 'feature'; valid names: none\n")
+        self.assertEqual(self.cli("lane", "wait", "demo-fix-it-1").stdout, "demo-fix-it-1 exited exit 0\ndone\n")
+
     def test_resume_continues_the_same_session(self):
         lane_id = self.start()
         self.cli("lane", "wait", lane_id)
@@ -535,6 +579,9 @@ class LaneRecords(Sandbox):
                     "session": "abc", "status": "exited", "pr": None, "runs": [{"run": 1, "end": "x", "exit": 0}]})
         (self.stubs / "pr-list.json").write_text(json.dumps([{"url": self.url}]))
         (self.stubs / "pr-view.json").write_text(json.dumps({"headRefOid": "a" * 40, "state": "OPEN"}))
+
+    def test_historical_record_without_playbook_remains_showable(self):
+        self.assertIn("PLAYBOOK: (absent)", self.cli("lane", "show", "demo-x-1").stdout.splitlines())
 
     def test_merge_squashes_at_the_head_and_records_the_merge(self):
         self.assertEqual(self.cli("lane", "merge", "demo-x-1").stdout, f"merged: {self.url} at {'a' * 12} as {'f' * 12}\n")
