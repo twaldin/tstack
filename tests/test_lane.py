@@ -1,7 +1,10 @@
 import json
+import os
+import signal
 import shutil
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from support import Sandbox, git
@@ -34,6 +37,76 @@ class LaneRuns(Sandbox):
         show = self.cli("lane", "show", "demo-fix-it-1").stdout.splitlines()
         self.assertEqual(show[0], "demo-fix-it-1: exited, run 1 exit 0, $0.02")
         self.assertEqual(show[-2:], ["final answer (last 20 lines):", "done"])
+
+    def test_run_end_reports_the_child_killed_by_unit_stop(self):
+        self.omp(answer="left running", child=True)
+        lane_id = self.start()
+        result = self.cli("lane", "wait", lane_id).stdout
+        pid = int((self.stubs / "child.pid").read_text())
+        line = f"run 1 ended with 1 process: killed by unit stop: {pid} sleep 600"
+        self.assertEqual(result, f"{lane_id} exited exit 0\n{line}\nleft running\n")
+        self.assertIn(line, self.cli("lane", "show", lane_id).stdout.splitlines())
+        self.omp(answer="clean")
+        self.cli("lane", "resume", lane_id, "finish cleanly")
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\nclean\n")
+        self.assertIn(line, self.cli("lane", "show", lane_id).stdout.splitlines())
+        self.cli("lane", "clean", lane_id)
+        self.assertFalse((self.seat / "state/run/lanes" / lane_id / "run-1.processes").exists())
+        self.assertIn(line, self.cli("lane", "show", lane_id).stdout.splitlines())
+
+    def test_linux_run_reports_a_unit_child_that_cleared_its_environment(self):
+        self.omp(answer="left running", child=True, clear_env=True)
+        lane_id = self.start()
+        output = self.cli("lane", "wait", lane_id).stdout
+        pid = int((self.stubs / "child.pid").read_text())
+        line = f"run 1 ended with 1 process: killed by unit stop: {pid} sleep 600"
+        self.assertIn(line, output.splitlines())
+        self.assertIn(line, self.cli("lane", "show", lane_id).stdout.splitlines())
+
+    def test_nohup_run_end_reports_the_child_left_running(self):
+        self.omp(answer="left running", child=True, detached=True)
+        lane_id = self.cli_platform("darwin", "lane", "start", "Fix it", "--repo", "acme/demo",
+                                    "--brief", str(self.brief)).stdout.strip()
+        try:
+            result = self.cli_platform("darwin", "lane", "wait", lane_id).stdout
+            pid = int((self.stubs / "child.pid").read_text())
+            line = (f"run 1 ended with 1 process: still running "
+                    f"(partial: macOS hides environments of system binaries): {pid} sleep 600")
+            self.assertEqual(result, f"{lane_id} exited exit 0\n{line}\nleft running\n")
+            self.assertIn(line, self.cli_platform("darwin", "lane", "show", lane_id).stdout.splitlines())
+            os.kill(pid, 0)
+            self.assertNotEqual(os.getpgid(pid), int((self.seat / "state/run/lanes" / lane_id / "run-1.pid").read_text()))
+            self.assertNotIn("must-not-save", json.dumps(self.record(lane_id)["runs"][0]["processes"]))
+        finally:
+            if (self.stubs / "child.pid").exists():
+                os.kill(int((self.stubs / "child.pid").read_text()), signal.SIGTERM)
+        self.omp(answer="clean")
+        self.cli_platform("darwin", "lane", "resume", lane_id, "finish cleanly")
+        self.assertEqual(self.cli_platform("darwin", "lane", "wait", lane_id).stdout,
+                         f"{lane_id} exited exit 0\nclean\n")
+
+    def test_stop_and_oom_report_only_children_without_prompt_or_unbounded_commands(self):
+        command = [sys.executable, "-c", "import time; time.sleep(600)", "x" * 200]
+        expected = " ".join(command)[:117] + "..."
+        for oom in (False, True):
+            with self.subTest(oom=oom):
+                self.brief.write_text("SLOW PRIVATE_PROMPT_MUST_NOT_BE_RECORDED\n")
+                self.omp(child=True, child_command=command, detached=True, oom=oom)
+                lane_id = self.start()
+                if not oom:
+                    self.assertTrue(self.until(lambda: (self.stubs / "child.pid").exists()))
+                    self.cli("lane", "stop", lane_id)
+                output = self.cli("lane", "wait", lane_id).stdout
+                pid = int((self.stubs / "child.pid").read_text())
+                reason = "oom-kill" if oom else "stopped"
+                line = f"run 1 ended with 1 process: {reason}: killed by unit stop: {pid} {expected}"
+                self.assertIn(line, output.splitlines())
+                shown = self.cli("lane", "show", lane_id).stdout
+                self.assertIn(line, shown.splitlines())
+                snapshot = self.record(lane_id)["runs"][0]["processes"]
+                self.assertEqual(snapshot, {"reason": reason, "killed": [{"pid": pid, "command": expected}], "running": []})
+                self.assertNotIn("PRIVATE_PROMPT", json.dumps(snapshot))
+                (self.stubs / "child.pid").unlink()
 
     def test_start_records_playbook_and_reports_unknown_names_without_refusing(self):
         engine = self.root / "engine"
@@ -127,7 +200,9 @@ class LaneRuns(Sandbox):
         self.omp(exit=137)
         lane_id = self.start("--memory", "8G")
         run = self.seat / "state/run/lanes" / lane_id
-        self.assertTrue(self.until(lambda: (run / "run-1.exit").exists()))
+        self.assertTrue(self.until(lambda: (run / "run-1.processes").exists()))
+        self.assertTrue(self.until(
+            lambda: (self.stubs / f"tstack-lane-{lane_id}.state").read_text() == "inactive"))
         (self.stubs / "systemd-properties.json").write_text(json.dumps(
             {"LoadState": "loaded", "Result": "oom-kill", "MemoryPeak": 8 * 2**30, "MemoryMax": 8 * 2**30}))
         callback = next(a for a in self.log("systemd-run")[0]["args"] if a.startswith("ExecStopPost="))
@@ -291,8 +366,7 @@ class LaneRuns(Sandbox):
         lane_id = self.start()
         record_path = self.seat / "state/lanes" / lane_id / "lane.json"
         stream = self.seat / "state/run/lanes" / lane_id / "run-1.jsonl"
-        exit_file = stream.with_suffix(".exit")
-        self.assertTrue(self.until(exit_file.exists))
+        self.assertTrue(self.until(lambda: stream.with_suffix(".processes").exists()))
         worktree = Path(self.record(lane_id)["worktree"])
         (self.stubs / "pr-list.json").write_text(json.dumps([{"url": "https://github.com/acme/demo/pull/7"}]))
         for merged in (False, True):

@@ -13,8 +13,9 @@ PRELUDE = r'''#!/usr/bin/env python3
 import json, os, subprocess, sys, time, uuid
 from pathlib import Path
 stubs, args = Path(__file__).resolve().parents[1], sys.argv[1:]
-with open(stubs / f"{Path(__file__).name}.log", "a") as log:
-    log.write(json.dumps({"args": args, "cwd": os.getcwd(), "lane": os.environ.get("TSTACK_LANE")}) + "\n")
+if not (Path(__file__).name == "systemd-run" and args[:1] == ["_supervise"]):
+    with open(stubs / f"{Path(__file__).name}.log", "a") as log:
+        log.write(json.dumps({"args": args, "cwd": os.getcwd(), "lane": os.environ.get("TSTACK_LANE")}) + "\n")
 '''
 FAKES = {
     "sudo": PRELUDE + r'''
@@ -32,9 +33,18 @@ import signal
 signal.signal(signal.SIGTERM, lambda *_: (time.sleep(1), sys.exit(143)))
 (stubs / "omp.pid").write_text(str(os.getpid()))
 cfg = json.loads((stubs / "omp.json").read_text())
+if cfg.get("child"):
+    child = subprocess.Popen(cfg.get("child_command", ["sleep", "600"]), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=cfg.get("detached", False),
+                             env={} if cfg.get("clear_env") else None)
+    (stubs / "child.pid").write_text(str(child.pid))
 print(json.dumps({"type": "session", "id": args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())}), flush=True)
 for event in cfg.get("events", []):
     print(json.dumps(event), flush=True)
+if cfg.get("oom"):
+    os.kill(int(os.environ["TSTACK_TEST_SUPERVISOR"]), signal.SIGUSR1)
+    time.sleep(60)
 time.sleep(60 if "SLOW" in args[-1] else cfg.get("sleep", 0))
 content = [{"type": "text", "text": cfg["answer"]}] if cfg.get("answer") else []
 message = {"role": "assistant", "content": content, "usage": {"cost": {"total": cfg.get("cost", 0.01)}}}
@@ -185,9 +195,48 @@ if args[0] not in ("board.get", "agent.list", "object.get", "object.find", "layo
     path.write_text(json.dumps(store, indent=1))
 print(json.dumps(out))
 ''',
-    # Starts the command detached with its --working-directory and --setenv, keeping its pid for systemctl.
-    # Real systemd-run expands $VAR in the command unless told not to.
     "systemd-run": PRELUDE + r'''
+import shlex, signal
+if args[0] == "_supervise":
+    spec = json.loads(Path(args[1]).read_text())
+    proc = subprocess.Popen(spec["command"], cwd=spec["cwd"], start_new_session=True,
+                            env={**os.environ, "TSTACK_TEST_SUPERVISOR": str(os.getpid())})
+    unit, stopping = spec["unit"], False
+    def collect(result):
+        (stubs / f"{unit}.state").write_text("deactivating")
+        for callback in spec["stop"]:
+            subprocess.run(shlex.split(callback), env={**os.environ, "SERVICE_RESULT": result,
+                           "MAINPID": str(proc.pid), "TSTACK_TEST_GROUP": str(proc.pid),
+                           "TSTACK_TEST_MARKER": spec["command"][7]}, check=False)
+    def stop(signum, _):
+        global stopping
+        if not stopping:
+            stopping = True
+            collect("oom-kill" if signum == signal.SIGUSR1 else "success")
+            os.killpg(proc.pid, signal.SIGTERM)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGUSR1, stop)
+    (stubs / f"{unit}.state").write_text("active")
+    (stubs / f"{unit}.supervisor.pid").write_text(str(os.getpid()))
+    (stubs / f"{unit}.pid").write_text(str(proc.pid))
+    proc.wait()
+    if not stopping:
+        collect("success")
+    marker = f"TSTACK_LANE_RUN={spec['command'][7]}".encode()
+    for candidate in Path("/proc").iterdir():
+        if not candidate.name.isdigit():
+            continue
+        try:
+            if candidate.stat().st_uid == os.getuid() and marker in (candidate / "environ").read_bytes().split(b"\0"):
+                os.kill(int(candidate.name), signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    (stubs / f"{unit}.state").write_text("inactive")
+    sys.exit(0)
 if "--expand-environment=no" not in args:
     sys.exit("fake systemd-run: would expand $ in the command line")
 if (stubs / "systemd-run.err").exists():
@@ -198,20 +247,59 @@ while args[i].startswith("-"):
     env.update([value.split("=", 1)] if key == "--setenv" else [])
     cwd, unit = (value if key == "--working-directory" else cwd), (value if key == "--unit" else unit)
     i += 2 if args[i] == "-p" else 1
-proc = subprocess.Popen(args[i:], cwd=cwd, env=env, start_new_session=True, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-(stubs / f"{unit}.pid").write_text(str(proc.pid))
+spec = stubs / f"{unit}.supervisor.json"
+spec.write_text(json.dumps({"command": args[i:], "cwd": cwd, "unit": unit,
+                           "stop": [a.removeprefix("ExecStop=-") for a in args if a.startswith("ExecStop=-")]}))
+(stubs / f"{unit}.pid").unlink(missing_ok=True)
+subprocess.Popen([sys.executable, __file__, "_supervise", str(spec)], env=env,
+                 start_new_session=True, stdin=subprocess.DEVNULL,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+while not (stubs / f"{unit}.pid").exists():
+    time.sleep(0.01)
 ''',
     "systemctl": PRELUDE + r'''
 if args[1:4] == ["show", "-p", "MainPID"]:
     print((stubs / f"{args[-1]}.pid").read_text())
+elif args[1:4] == ["show", "-p", "ActiveState"]:
+    print((stubs / f"{args[-1]}.state").read_text())
 elif args[1:3] == ["show", "-p"]:
     path = stubs / "systemd-properties.json"
     if path.exists():
         for key, value in json.loads(path.read_text()).items():
             print(f"{key}={value}")
 elif args[1] == "stop":
-    os.killpg(int((stubs / f"{args[2]}.pid").read_text()), 15)
+    os.kill(int((stubs / f"{args[2]}.supervisor.pid").read_text()), 15)
+    while (stubs / f"{args[2]}.state").read_text() != "inactive":
+        time.sleep(0.01)
+''',
+    "ps": PRELUDE + r'''
+if args[:1] == ["-wwE"]:
+    result = subprocess.run(["/bin/ps", "-ww", "-U", args[2], "-o", "pid=,command="],
+                            capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        pid = line.strip().split(None, 1)[0]
+        try:
+            values = (Path("/proc") / pid / "environ").read_bytes().split(b"\0")
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        marker = next((v.decode() for v in values if v.startswith(b"TSTACK_LANE_RUN=")), "")
+        print(line + " " + marker + " TEST_ONLY_SECRET=must-not-save")
+    sys.exit(result.returncode)
+if os.environ.get("TSTACK_TEST_GROUP") and args[-1:] == ["pid=,stat=,command="]:
+    result = subprocess.run(["/bin/ps", *args[:-1], "pid=,pgid=,stat=,command="],
+                            capture_output=True, text=True)
+    token = f"TSTACK_LANE_RUN={os.environ['TSTACK_TEST_MARKER']}".encode()
+    for line in result.stdout.splitlines():
+        pid, group, state, command = line.strip().split(None, 3)
+        if group != os.environ["TSTACK_TEST_GROUP"]:
+            try:
+                if token not in (Path("/proc") / pid / "environ").read_bytes().split(b"\0"):
+                    continue
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+        print(f"{pid} {state} {command}")
+    sys.exit(result.returncode)
+os.execv("/bin/ps", ["/bin/ps", *args])
 ''',
 }
 

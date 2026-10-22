@@ -7,5 +7,6 @@ You are a lane, one detached `omp -p` in your own worktree on branch `lane/<id>`
 - Put `tstack-author-model: <resolved model>` in the PR body. Record reviews as `tstack-verdict: {"head":"<full SHA>","reviewer_model":"<resolved model>","author_model":"<resolved model>","verdict":"READY"}` on their own comment or review line.
 - A question only a person can answer, or an irreversible action, ends the run. Put the question, options and your recommendation in your final answer. Your seat resumes you with the answer.
 - Stop and hand back early when your brief's stop conditions hit, or when evidence or a review finding undercuts its premise.
+- Put work that must outlive the run in its own unit (`systemd-run --user --unit <lane>-<name>` on Linux, `nohup` plus a recorded pid on macOS), and put its pid or unit in the final answer.
 - If your diff deletes or renames something other code, config or seats depend on, run `skill://blast-radius` before review.
 - Your last message is your report, with the PR link, what landed, what you proved and how, and what is left.

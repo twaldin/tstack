@@ -45,7 +45,11 @@ Briefs carry `PLAYBOOK: <name>`, where the name is a file stem in `pstack/skills
 
 `lane resume <id> <text> --memory <size>` changes the Linux memory cap and saves it for later runs. Without `--memory`, resume reuses the saved cap. Both commands pass the size to systemd for validation. A rejected resume leaves the previous cap and run history intact. macOS ignores the cap.
 
-Linux runs capture systemd's exit result before unit collection, with the peak memory and cap when available. `show` and `wait` report failures such as `oom-kill (peak 8.0G of 8G cap)`. `list` includes the failure reason in its status column and reads captured results without changing files. macOS reports only the process exit code.
+Linux runs capture systemd's exit result before unit collection, with the peak memory and cap when available. `show` and `wait` report failures such as `oom-kill (peak 8.0G of 8G cap)`. `list` includes the failure reason in its status column and reads captured results without changing files. macOS reports the process exit code without systemd memory data.
+
+Each run marks omp and its descendants with a unique `TSTACK_LANE_RUN` environment value. The collector excludes the runner pipeline and omp main pid, never saves omp's argv, and limits saved commands to 120 characters. Linux snapshots the unit's cgroup before teardown, including children that clear their environment; a same-uid `/proc` marker scan also finds survivors outside the unit. macOS scans same-uid environments with `ps -wwE`. Linux cgroup members are labeled `killed by unit stop`; Linux survivors outside the unit are labeled `still running after the run`. Stop and OOM snapshots include their end reason. `show` prints each non-empty historical snapshot; `wait` prints the latest run's snapshot. Empty snapshots print nothing, and cleanup preserves captured facts.
+
+macOS reports only environment-visible processes. Its non-empty inventory says `still running (partial: macOS hides environments of system binaries)`. The kernel can omit inherited environments for system shells and `sleep`, so these processes can remain running without appearing in the inventory. An empty snapshot prints no extra line.
 
 A failed PR refresh reports the native error on stderr without blocking local run operations. Missing merge SHAs never authorize automatic cleanup.
 

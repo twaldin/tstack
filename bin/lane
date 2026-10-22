@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """lane: run one task as a detached `omp -p` session in its own worktree.
 
-A lane lives in <seat>/state/lanes/<id>/ (lane.json, brief.md, final.md). Each run's omp json stream,
-stderr, exit code and pid sit in <seat>/state/run/lanes/<id>/run-<n>.{jsonl,err,exit,pid}.
+A lane lives in <seat>/state/lanes/<id>/ (lane.json, brief.md, final.md). Each run's stream,
+stderr, exit code, process snapshot and runner/agent pids sit in <seat>/state/run/lanes/<id>/run-<n>.*.
 """
 
 import argparse
@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,8 +34,10 @@ BUS = {**os.environ, "XDG_RUNTIME_DIR": RUNTIME,
        "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={RUNTIME}/bus"}
 # The run goes through sh so its exit code outlives the detached process that ran it. The TERM trap keeps the
 # shell waiting until omp has exited, and the exit file appears whole, by rename.
-RUNNER = ('trap : TERM; python="$1"; writer="$2"; shift 2; '
-          '(trap : TERM; "$@" 2> "$0.err"; echo $? > "$0.exit.tmp") | "$python" "$writer" _stream > "$0.jsonl"; '
+RUNNER = ('trap : TERM; python="$1"; writer="$2"; backend="$3"; marker="$4"; shift 4; '
+          '(trap : TERM; "$python" "$writer" _agent "$0.agent" "$marker" "$@" '
+          '2> "$0.err"; echo $? > "$0.exit.tmp") | "$python" "$writer" _stream > "$0.jsonl"; '
+          'if [ "$backend" = nohup ]; then "$python" "$writer" _processes "$0.processes" nohup "$marker"; fi; '
           'mv -f "$0.exit.tmp" "$0.exit"')
 
 
@@ -100,6 +103,99 @@ def capture_result(path: Path, unit: str) -> None:
     temporary = path.with_suffix(".result.tmp")
     temporary.write_text(json.dumps(outcome) + "\n")
     temporary.replace(path)
+
+
+def capture_processes(path: Path, backend: str, marker: str) -> None:
+    excluded = {os.getpid()}
+    agent = path.with_suffix(".agent")
+    if agent.exists():
+        excluded.add(int(agent.read_text()))
+    members, marked = set(), set()
+    if backend == "nohup":
+        result = subprocess.run(["ps", "-wwE", "-U", str(os.getuid()), "-o", "pid=,command="],
+                                capture_output=True, text=True)
+        if result.returncode:
+            raise Fail(result.stderr.strip() or f"ps exited {result.returncode}")
+        match = re.compile(r"(?:^|\s)TSTACK_LANE_RUN=" + re.escape(marker) + r"(?:\s|$)")
+        for line in result.stdout.splitlines():
+            pid, _, environment = line.strip().partition(" ")
+            if pid.isdigit() and int(pid) not in excluded and match.search(environment):
+                marked.add(int(pid))
+    else:
+        group = next(line.split(":", 2)[2] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                     if line.startswith("0::"))
+        root = Path("/sys/fs/cgroup") / group.lstrip("/")
+        for procs in root.glob("**/cgroup.procs"):
+            try:
+                members.update(int(pid) for pid in procs.read_text().split())
+            except FileNotFoundError:
+                continue
+        runner = path.with_suffix(".pid")
+        main = os.environ.get("MAINPID") or (runner.read_text().strip() if runner.exists() else "")
+        if main.isdigit():
+            excluded.add(int(main))
+            for pid in members:
+                try:
+                    parent = (Path("/proc") / str(pid) / "stat").read_text().rpartition(")")[2].split()[1]
+                    if parent == main:
+                        excluded.add(pid)
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+        token = f"TSTACK_LANE_RUN={marker}".encode()
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit() or int(proc.name) in excluded:
+                continue
+            try:
+                if proc.stat().st_uid == os.getuid() and token in (proc / "environ").read_bytes().split(b"\0"):
+                    marked.add(int(proc.name))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+    candidates = (members | marked) - excluded
+    snapshot = {"reason": "exited", "killed": [], "running": []}
+    result = os.environ.get("SERVICE_RESULT", "")
+    if result and result != "success":
+        snapshot["reason"] = result
+    elif path.with_suffix(".stop").exists() or not any(path.with_suffix(ext).exists() for ext in (".exit", ".exit.tmp")):
+        snapshot["reason"] = "stopped"
+    if candidates:
+        result = subprocess.run(["ps", "-ww", "-p", ",".join(map(str, sorted(candidates))),
+                                 "-o", "pid=,stat=,command="], capture_output=True, text=True)
+        if result.returncode and result.stderr.strip():
+            raise Fail(result.stderr.strip())
+        for line in result.stdout.splitlines():
+            fields = line.strip().split(None, 2)
+            if len(fields) != 3:
+                continue
+            pid, state, command = fields
+            pid = int(pid)
+            if pid not in candidates or state.startswith("Z"):
+                continue
+            key = "killed" if pid in members else "running"
+            command = " ".join(command.split())
+            snapshot[key].append({"pid": pid, "command": command if len(command) <= 120 else command[:117] + "..."})
+    temporary = path.with_suffix(".processes.tmp")
+    temporary.write_text(json.dumps(snapshot) + "\n")
+    temporary.replace(path)
+
+
+def process_lines(runs: list) -> list:
+    lines = []
+    for entry in runs:
+        snapshot = entry.get("processes") or {}
+        count = len(snapshot.get("killed") or []) + len(snapshot.get("running") or [])
+        if count:
+            details = []
+            if snapshot.get("reason") != "exited":
+                details.append(snapshot["reason"])
+            for key, label in (("killed", "killed by unit stop"), ("running", "still running after the run")):
+                if snapshot.get(key):
+                    if key == "running" and entry.get("backend") == "nohup":
+                        label = "still running (partial: macOS hides environments of system binaries)"
+                    commands = "; ".join(f"{p['pid']} {p['command']}" for p in snapshot[key])
+                    details.append(f"{label}: {commands}")
+            noun = "process" if count == 1 else "processes"
+            lines.append(f"run {entry['run']} ended with {count} {noun}: {': '.join(details)}")
+    return lines
 
 
 def run(argv, cwd=None, env=None, check=True) -> str:
@@ -185,6 +281,11 @@ class Lane:
         return path.read_text().strip() if path.exists() else ""
 
     def alive(self, number: int) -> bool:
+        if sys.platform != "darwin" and self.load()["runs"][number - 1].get("backend") != "nohup":
+            state = run(["systemctl", "--user", "show", "-p", "ActiveState", "--value", self.unit],
+                        env=BUS, check=False)
+            if state in {"active", "activating", "deactivating"}:
+                return True
         pid = self.pid(number)
         if self.file(number, "exit").exists() or not pid.isdigit():
             return False
@@ -193,12 +294,13 @@ class Lane:
     def read_outcomes(self, record: dict) -> bool:
         changed = False
         for entry in record.get("runs") or []:
-            path = self.file(entry["run"], "result")
-            if path.exists():
-                outcome = json.loads(path.read_text())
-                if entry.get("systemd") != outcome:
-                    entry["systemd"] = outcome
-                    changed = True
+            for ext, key in (("result", "systemd"), ("processes", "processes")):
+                path = self.file(entry["run"], ext)
+                if path.exists():
+                    outcome = json.loads(path.read_text())
+                    if entry.get(key) != outcome:
+                        entry[key] = outcome
+                        changed = True
         return changed
 
     def start_process(self, command: list, record: dict, env: dict) -> str:
@@ -211,13 +313,19 @@ class Lane:
             sys.executable, str(Path(__file__).resolve()), "_result",
             str(self.file(record["runs"][-1]["run"], "result")), self.unit))
         result_command = result_command.replace("$", "$$")
+        processes_command = " ".join(json.dumps(arg, ensure_ascii=False) for arg in (
+            sys.executable, str(Path(__file__).resolve()), "_processes",
+            str(self.file(record["runs"][-1]["run"], "processes")), "systemd",
+            record["runs"][-1]["marker"])).replace("$", "$$")
         spawn = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={self.unit}",
                  "--expand-environment=no", f"--working-directory={record['worktree']}",
-                 "-p", f"MemoryMax={record['memory']}", "-p", f"ExecStopPost=-{result_command}"]
+                 "-p", f"MemoryMax={record['memory']}", "-p", f"ExecStop=-{processes_command}",
+                 "-p", f"ExecStopPost=-{result_command}"]
         run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
         return run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
 
     def stop_process(self, number: int) -> None:
+        self.file(number, "stop").touch()
         if sys.platform == "darwin":
             if self.alive(number):
                 with contextlib.suppress(ProcessLookupError):
@@ -234,6 +342,7 @@ class Lane:
                 if changed:
                     self.save(record)
                 return record
+            changed = self.read_outcomes(record) or changed
             if not last.get("systemd") and last.get("backend") != "nohup" and sys.platform != "darwin":
                 outcome = unit_outcome(self.unit)
                 if outcome.get("result"):
@@ -292,13 +401,14 @@ class Lane:
         """Append a run and launch it. Caller holds the lock, so no refresh sees the run before its pid."""
         number = len(record["runs"]) + 1
         record["runs"].append({"run": number, "start": now(), "compacted": True,
-                               "backend": "nohup" if sys.platform == "darwin" else "systemd"})
+                               "backend": "nohup" if sys.platform == "darwin" else "systemd",
+                               "marker": f"{self.id}:{number}:{uuid.uuid4().hex}"})
         self.save({**record, "status": "running"})
         argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
                 "--append-system-prompt", str(ENGINE / "roles" / "lane.md")] + ["--resume", record["session"]] * resume
         env = {**{k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}, "TSTACK_LANE": self.id, "TSTACK_SEAT": str(self.seat)}
         command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), sys.executable, str(Path(__file__).resolve()),
-                   *argv, text]
+                   record["runs"][-1]["backend"], record["runs"][-1]["marker"], *argv, text]
         pid = self.start_process(command, record, env)
         self.file(number, "pid").write_text(f"{pid}\n")
         return number
@@ -607,7 +717,8 @@ def cleanup(lane: Lane, record: dict) -> str:
         git(repo, "worktree", "prune")
         done.append(git(repo, "branch", "-D", record["branch"]))
     for entry in record.get("runs") or []:
-        for ext in ("jsonl", "err", "exit", "exit.tmp", "pid", "tmp", "result", "result.tmp"):
+        for ext in ("jsonl", "err", "exit", "exit.tmp", "pid", "tmp", "result", "result.tmp",
+                    "processes", "processes.tmp", "agent", "agent.tmp", "stop"):
             lane.file(entry["run"], ext).unlink(missing_ok=True)
     record["cleaned"] = now()
     return "\n".join(done) or "already clean"
@@ -666,6 +777,7 @@ def show(lane: Lane) -> str:
            f"PLAYBOOK: {record.get('playbook') if record.get('playbook') is not None else '(absent)'}"]
     out += [f"run {r['run']}: {r.get('start')} to {r.get('end') or 'running'}, exit {exit_code(r)}, "
             f"${r.get('cost_usd') or 0:.2f}" for r in record.get("runs") or []]
+    out += process_lines(record.get("runs") or [])
     if record["status"] == "running":
         return "\n".join(out + ["final answer: run in progress"])
     if final.exists():
@@ -694,7 +806,9 @@ def wait(lanes: list) -> str:
             if record["status"] != "running":
                 final = lane.dir / "final.md"
                 answer = final.read_text().rstrip("\n") if final.exists() else "(no final answer)"
-                return f"{lane.id} {record['status']} exit {exit_code((record.get('runs') or [{}])[-1])}\n{answer}"
+                last = (record.get("runs") or [{}])[-1]
+                return "\n".join([f"{lane.id} {record['status']} exit {exit_code(last)}",
+                                  *process_lines([last]), answer])
         time.sleep(2)
 
 
@@ -752,6 +866,18 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 6 and sys.argv[1] == "_agent":
+        path = Path(sys.argv[2])
+        temporary = path.with_suffix(".agent.tmp")
+        temporary.write_text(f"{os.getpid()}\n")
+        temporary.replace(path)
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), signal.SIG_DFL)
+        os.execvpe(sys.argv[4], sys.argv[4:], {**os.environ, "TSTACK_LANE_RUN": sys.argv[3]})
+    if len(sys.argv) == 5 and sys.argv[1] == "_processes":
+        capture_processes(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
+        sys.exit(0)
     if len(sys.argv) == 4 and sys.argv[1] == "_result":
         capture_result(Path(sys.argv[2]), sys.argv[3])
         sys.exit(0)
