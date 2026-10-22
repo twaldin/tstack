@@ -33,6 +33,12 @@ import signal
 signal.signal(signal.SIGTERM, lambda *_: (time.sleep(1), sys.exit(143)))
 (stubs / "omp.pid").write_text(str(os.getpid()))
 cfg = json.loads((stubs / "omp.json").read_text())
+if cfg.get("worker"):
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)",
+                               "/home/tim/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+                               "__omp_worker_daemon_broker"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (stubs / "worker.pid").write_text(str(worker.pid))
 if cfg.get("child"):
     child = subprocess.Popen(cfg.get("child_command", ["sleep", "600"]), stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

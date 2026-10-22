@@ -54,6 +54,29 @@ class LaneRuns(Sandbox):
         self.assertFalse((self.seat / "state/run/lanes" / lane_id / "run-1.processes").exists())
         self.assertIn(line, self.cli("lane", "show", lane_id).stdout.splitlines())
 
+    def test_run_end_excludes_omp_workers_but_keeps_lane_children(self):
+        for platform in ("linux", "darwin"):
+            for child in (False, True):
+                with self.subTest(platform=platform, child=child):
+                    self.omp(answer="done", worker=True, child=child)
+                    lane_id = self.cli_platform(platform, "lane", "start", "Fix it", "--repo", "acme/demo",
+                                                "--brief", str(self.brief)).stdout.strip()
+                    try:
+                        output = self.cli_platform(platform, "lane", "wait", lane_id).stdout
+                        lines = []
+                        if child:
+                            pid = int((self.stubs / "child.pid").read_text())
+                            label = ("killed by unit stop" if platform == "linux" else
+                                     "still running (partial: macOS hides environments of system binaries)")
+                            lines = [f"run 1 ended with 1 process: {label}: {pid} sleep 600"]
+                        self.assertEqual(output, "\n".join([f"{lane_id} exited exit 0", *lines, "done", ""]))
+                        shown = self.cli_platform(platform, "lane", "show", lane_id).stdout.splitlines()
+                        self.assertEqual([line for line in shown if line.startswith("run 1 ended with")], lines)
+                    finally:
+                        if platform == "darwin":
+                            for name in (("worker", "child") if child else ("worker",)):
+                                os.kill(int((self.stubs / f"{name}.pid").read_text()), signal.SIGTERM)
+
     def test_linux_run_reports_a_unit_child_that_cleared_its_environment(self):
         self.omp(answer="left running", child=True, clear_env=True)
         lane_id = self.start()

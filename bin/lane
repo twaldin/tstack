@@ -168,7 +168,7 @@ def capture_processes(path: Path, backend: str, marker: str) -> None:
                 continue
             pid, state, command = fields
             pid = int(pid)
-            if pid not in candidates or state.startswith("Z"):
+            if pid not in candidates or state.startswith("Z") or re.search(r"(?:^|\s)__omp_worker", command):
                 continue
             key = "killed" if pid in members else "running"
             command = " ".join(command.split())
