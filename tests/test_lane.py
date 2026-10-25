@@ -321,6 +321,130 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.log("systemctl"), [])
         self.assertTrue(self.log("omp")[0]["args"][-1].endswith("Print ${HOME} and $PATH as written.\n"))
 
+    def slow_nohup(self):
+        self.brief.write_text("SLOW\n")
+        lane_id = self.cli_platform("darwin", "lane", "start", "Mac", "--repo", "acme/demo",
+                                    "--brief", str(self.brief)).stdout.strip()
+        run = self.seat / "state/run/lanes" / lane_id
+        pid = int((run / "run-1.pid").read_text())
+        def finish():
+            (self.stubs / "ps-mode").unlink(missing_ok=True)
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            self.until(lambda: (run / "run-1.exit").exists())
+        self.addCleanup(finish)
+        self.assertTrue(self.until(lambda: (run / "run-1.jsonl").exists() and
+                                  (run / "run-1.jsonl").read_text()))
+        return lane_id, run
+
+    def test_nohup_live_pid_survives_empty_failed_or_renamed_ps(self):
+        for mode in ("empty-once", "error", "renamed"):
+            with self.subTest(mode=mode):
+                (self.stubs / "ps-mode").unlink(missing_ok=True)
+                lane_id, run = self.slow_nohup()
+                (self.stubs / "ps-mode").write_text(mode)
+                output = self.cli_platform("darwin", "lane", "show", lane_id).stdout
+                self.assertIn(f"{lane_id}: running, run 1 exit -", output)
+                self.assertNotIn("end", self.record(lane_id)["runs"][0])
+                self.assertIn(f"{lane_id}\trunning\texit -", self.cli("lane", "list").stdout)
+                os.kill(int((run / "run-1.pid").read_text()), 0)
+
+    def test_nohup_wait_does_not_return_on_empty_ps_while_pid_lives(self):
+        lane_id, run = self.slow_nohup()
+        (self.stubs / "ps-mode").write_text("empty-once")
+        waiter = subprocess.Popen([sys.executable, str(Path(__file__).resolve().parents[1] / "bin/lane"),
+                                   "wait", lane_id], env=self.env, cwd=self.seat,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                waiter.communicate(timeout=1)
+            os.kill(int((run / "run-1.pid").read_text()), 0)
+            os.killpg(int((run / "run-1.pid").read_text()), signal.SIGTERM)
+            output, error = waiter.communicate(timeout=15)
+            self.assertEqual((waiter.returncode, error), (0, ""))
+            self.assertEqual(output, f"{lane_id} exited exit 143\n(no final answer)\n")
+        finally:
+            if waiter.poll() is None:
+                waiter.terminate()
+                waiter.communicate(timeout=5)
+
+    def test_resume_refuses_live_nohup_pid_despite_cached_end(self):
+        lane_id, _ = self.slow_nohup()
+        record = self.record(lane_id)
+        record.update(status="exited", session="existing-session")
+        record["runs"][0].update(end="2026-10-25T00:00:00Z", exit=7, cost_usd=1.25)
+        (self.seat / "state/lanes" / lane_id / "lane.json").write_text(json.dumps(record))
+        self.assertIn(f"{lane_id}\trunning\texit -", self.cli("lane", "list").stdout)
+        self.assertNotIn("2026-10-25T00:00:00Z", self.cli("lane", "list").stdout)
+        self.assertEqual(self.record(lane_id)["status"], "exited")
+        result = self.cli_platform("darwin", "lane", "resume", lane_id, "continue", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is running run 1", result.stderr)
+        self.assertEqual(len(self.record(lane_id)["runs"]), 1)
+        self.assertEqual(len(self.log("omp")), 1)
+
+    def test_nohup_missing_launch_identity_keeps_live_pid_running(self):
+        (self.stubs / "ps-mode").write_text("error")
+        lane_id, _ = self.slow_nohup()
+        self.assertNotIn("pid_start", self.record(lane_id)["runs"][0])
+        self.assertIn(f"{lane_id}: running,", self.cli_platform("darwin", "lane", "show", lane_id).stdout)
+        (self.stubs / "ps-mode").unlink()
+        self.assertIn(f"{lane_id}: running,", self.cli_platform("darwin", "lane", "show", lane_id).stdout)
+
+    def test_nohup_reused_pid_does_not_keep_a_dead_run_running(self):
+        lane_id, run = self.slow_nohup()
+        record = self.record(lane_id)
+        record["runs"][0]["pid_start"] = "Thu Jan 1 00:00:00 1970"
+        (self.seat / "state/lanes" / lane_id / "lane.json").write_text(json.dumps(record))
+        self.assertIn(f"{lane_id}: exited, run 1 exit -",
+                      self.cli_platform("darwin", "lane", "show", lane_id).stdout)
+        os.kill(int((run / "run-1.pid").read_text()), 0)
+
+    def test_nohup_exit_file_wins_over_a_live_pid_and_failed_ps(self):
+        lane_id, run = self.slow_nohup()
+        (run / "run-1.exit").write_text("7\n")
+        self.addCleanup((run / "run-1.exit").unlink, missing_ok=True)
+        (self.stubs / "ps-mode").write_text("error")
+        self.assertEqual(self.cli_platform("darwin", "lane", "wait", lane_id).stdout,
+                         f"{lane_id} exited exit 7\n(no final answer)\n")
+        os.kill(int((run / "run-1.pid").read_text()), 0)
+
+    def test_nohup_stop_does_not_signal_without_confirmed_identity(self):
+        lane_id, run = self.slow_nohup()
+        (self.stubs / "ps-mode").write_text("error")
+        result = self.cli_platform("darwin", "lane", "stop", lane_id, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no signal sent", result.stderr)
+        os.kill(int((run / "run-1.pid").read_text()), 0)
+
+    def test_nohup_stop_does_not_signal_a_reused_legacy_pid(self):
+        lane_id, run = self.slow_nohup()
+        other = subprocess.Popen(["sleep", "600"], start_new_session=True)
+        def finish_other():
+            other.terminate()
+            other.wait(timeout=5)
+        self.addCleanup(finish_other)
+        record = self.record(lane_id)
+        record["runs"][0].pop("pid_start", None)
+        (self.seat / "state/lanes" / lane_id / "lane.json").write_text(json.dumps(record))
+        (run / "run-1.pid").write_text(str(other.pid))
+        result = self.cli_platform("darwin", "lane", "stop", lane_id, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no signal sent", result.stderr)
+        self.assertIsNone(other.poll())
+
+    def test_nohup_stop_identifies_a_live_legacy_runner(self):
+        lane_id, _ = self.slow_nohup()
+        record = self.record(lane_id)
+        record["runs"][0].pop("pid_start", None)
+        (self.seat / "state/lanes" / lane_id / "lane.json").write_text(json.dumps(record))
+        self.assertEqual(self.cli_platform("darwin", "lane", "stop", lane_id).stdout,
+                         f"{lane_id} stopped (run 1)\n")
+        self.assertEqual(self.cli_platform("darwin", "lane", "wait", lane_id).stdout,
+                         f"{lane_id} stopped exit 143\n(no final answer)\n")
+
     def test_darwin_stop_records_exit_and_leaves_another_lane_running(self):
         self.brief.write_text("SLOW\n")
         def start_mac(name):

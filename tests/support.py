@@ -279,6 +279,18 @@ elif args[1] == "stop":
         time.sleep(0.01)
 ''',
     "ps": PRELUDE + r'''
+if "-p" in args and "," not in args[args.index("-p") + 1]:
+    mode = stubs / "ps-mode"
+    if mode.exists():
+        value = mode.read_text()
+        if value == "empty-once":
+            mode.unlink()
+            sys.exit(0)
+        if value == "error":
+            sys.exit("ps: temporarily unavailable")
+        if value == "renamed" and "command=" in args:
+            print("omp")
+            sys.exit(0)
 if args[:1] == ["-wwE"]:
     result = subprocess.run(["/bin/ps", "-ww", "-U", args[2], "-o", "pid=,command="],
                             capture_output=True, text=True)

@@ -246,6 +246,26 @@ def assistant_text(event: dict):
     return "\n".join(c.get("text", "") for c in message.get("content") or [] if c.get("type") == "text").strip()
 
 
+def process_identity(pid: str, backend: str | None) -> tuple[str, str] | None:
+    if sys.platform != "darwin" and backend != "nohup":
+        try:
+            fields = (Path("/proc") / pid / "stat").read_text().rpartition(")")[2].split()
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            return (fields[0], f"linux:{boot}:{fields[19]}") if fields[19].isdigit() else None
+        except (OSError, IndexError):
+            return None
+    try:
+        result = subprocess.run(["ps", "-ww", "-o", "stat=,lstart=", "-p", pid],
+                                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+                                capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    fields = result.stdout.split()
+    if result.returncode or len(fields) != 6:
+        return None
+    return fields[0], " ".join(fields[1:])
+
+
 class Lane:
     def __init__(self, seat: Path, lane_id: str):
         self.seat, self.id, self.unit = seat, lane_id, f"tstack-lane-{lane_id}"
@@ -281,15 +301,28 @@ class Lane:
         return path.read_text().strip() if path.exists() else ""
 
     def alive(self, number: int) -> bool:
-        if sys.platform != "darwin" and self.load()["runs"][number - 1].get("backend") != "nohup":
+        entry = self.load()["runs"][number - 1]
+        if sys.platform != "darwin" and entry.get("backend") != "nohup":
             state = run(["systemctl", "--user", "show", "-p", "ActiveState", "--value", self.unit],
                         env=BUS, check=False)
             if state in {"active", "activating", "deactivating"}:
                 return True
-        pid = self.pid(number)
-        if self.file(number, "exit").exists() or not pid.isdigit():
+        if self.file(number, "exit").exists():
             return False
-        return str(self.run_dir / f"run-{number}") in run(["ps", "-ww", "-o", "command=", "-p", pid], check=False)
+        pid = self.pid(number)
+        if not pid.isdigit() or int(pid) <= 0:
+            return False
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        identity = process_identity(pid, entry.get("backend"))
+        if identity is None:
+            return True
+        state, start = identity
+        return not state.startswith("Z") and (not entry.get("pid_start") or entry["pid_start"] == start)
 
     def read_outcomes(self, record: dict) -> bool:
         changed = False
@@ -324,13 +357,40 @@ class Lane:
         run(spawn + [f"--setenv={k}={v}" for k, v in env.items()] + command, env=BUS)
         return run(["systemctl", "--user", "show", "-p", "MainPID", "--value", self.unit], env=BUS)
 
-    def stop_process(self, number: int) -> None:
+    def signal_process(self, number: int, sig: int) -> None:
+        pid = self.pid(number)
+        if not pid.isdigit() or int(pid) <= 0:
+            return
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        entry = self.load()["runs"][number - 1]
+        if entry.get("pid_start"):
+            identity = process_identity(pid, entry.get("backend"))
+            owned = identity is not None and identity[1] == entry["pid_start"]
+        else:
+            try:
+                result = subprocess.run(["ps", "-ww", "-o", "command=", "-p", pid],
+                                        capture_output=True, text=True, timeout=2)
+                command = re.compile(r"(?:^|\s)" + re.escape(str(self.run_dir / f"run-{number}")) + r"(?:\s|$)")
+                owned = result.returncode == 0 and command.search(result.stdout) is not None
+            except (OSError, subprocess.TimeoutExpired):
+                owned = False
+        if not owned:
+            raise Fail(f"{self.id} run {number} PID {pid}: process identity unconfirmed; no signal sent")
         self.file(number, "stop").touch()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(int(pid), sig)
+
+    def stop_process(self, number: int) -> None:
         if sys.platform == "darwin":
             if self.alive(number):
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(int(self.pid(number)), signal.SIGTERM)
+                self.signal_process(number, signal.SIGTERM)
         else:
+            self.file(number, "stop").touch()
             run(["systemctl", "--user", "stop", self.unit], env=BUS)
 
     def refresh(self, stopped: bool = False, auto_clean: bool = True) -> dict:
@@ -338,7 +398,13 @@ class Lane:
             record = self.load()
             changed = self.read_outcomes(record)
             last = (record.get("runs") or [{}])[-1]
-            if not last or (not last.get("end") and not stopped and self.alive(last["run"])):
+            if not last or (not stopped and self.alive(last["run"])):
+                if last and (last.get("end") or record["status"] != "running"):
+                    for key in ("end", "exit", "cost_usd"):
+                        last.pop(key, None)
+                    record["status"] = "running"
+                    (self.dir / "final.md").unlink(missing_ok=True)
+                    changed = True
                 if changed:
                     self.save(record)
                 return record
@@ -411,6 +477,10 @@ class Lane:
                    record["runs"][-1]["backend"], record["runs"][-1]["marker"], *argv, text]
         pid = self.start_process(command, record, env)
         self.file(number, "pid").write_text(f"{pid}\n")
+        identity = process_identity(pid, record["runs"][-1]["backend"]) if pid.isdigit() and int(pid) > 0 else None
+        if identity is not None:
+            record["runs"][-1]["pid_start"] = identity[1]
+            self.save({**record, "status": "running"})
         return number
 
 
@@ -490,6 +560,8 @@ def resume(lane: Lane, text: str, memory: str | None) -> str:
         previous = {**record, "runs": list(record["runs"])}
         if memory is not None:
             record["memory"] = memory
+        if record["runs"] and lane.alive(record["runs"][-1]["run"]):
+            raise Fail(f"{lane.id} is running run {len(record['runs'])}; `lane stop {lane.id}` first")
         try:
             return f"{lane.id} run {lane.begin_run(record, text, resume=True)}"
         except Fail:
@@ -507,8 +579,7 @@ def stop(lane: Lane) -> str:
     while lane.alive(number) and time.monotonic() < deadline:
         time.sleep(0.2)
     if lane.alive(number):
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(int(lane.pid(number)), signal.SIGKILL)
+        lane.signal_process(number, signal.SIGKILL)
     lane.refresh(stopped=True)
     return f"{lane.id} stopped (run {number})"
 
@@ -754,6 +825,10 @@ def listing(seat: Path, show_all: bool) -> str:
         if last.get("systemd") and record["status"] == "running":
             record["status"] = "exited"
         if show_all or Path(record["worktree"]).exists():
+            if record["status"] != "running" and not record.get("cleaned") and last and lane.alive(last["run"]):
+                record["status"] = "running"
+                for key in ("end", "exit", "cost_usd"):
+                    last.pop(key, None)
             last, pr, cost = summary(record)
             reason = (last.get("systemd") or {}).get("result")
             status = record["status"] + (f" ({reason})" if reason and reason != "success" else "")
