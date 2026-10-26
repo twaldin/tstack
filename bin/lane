@@ -463,14 +463,15 @@ class Lane:
                     print(f"lane: {self.id} cleanup: {record['cleanup']}", file=sys.stderr)
             return record
 
-    def begin_run(self, record: dict, text: str, resume: bool) -> int:
+    def begin_run(self, record: dict, text: str, resume: bool, max_time: str) -> int:
         """Append a run and launch it. Caller holds the lock, so no refresh sees the run before its pid."""
         number = len(record["runs"]) + 1
-        record["runs"].append({"run": number, "start": now(), "compacted": True,
+        record["runs"].append({"run": number, "start": now(), "max_time": max_time, "compacted": True,
                                "backend": "nohup" if sys.platform == "darwin" else "systemd",
                                "marker": f"{self.id}:{number}:{uuid.uuid4().hex}"})
         self.save({**record, "status": "running"})
         argv = ["omp", "-p", "--mode", "json", "--model", record["model"], "--thinking", record["thinking"],
+                f"--max-time={max_time}",
                 "--append-system-prompt", str(ENGINE / "roles" / "lane.md")] + ["--resume", record["session"]] * resume
         env = {**{k: os.environ[k] for k in PASS_ENV if os.environ.get(k)}, "TSTACK_LANE": self.id, "TSTACK_SEAT": str(self.seat)}
         command = ["/bin/sh", "-c", RUNNER, str(self.run_dir / f"run-{number}"), sys.executable, str(Path(__file__).resolve()),
@@ -543,11 +544,11 @@ def start(seat: Path, a) -> str:
     text = (f"You are lane {lane.id}, in {worktree} on branch {branch} (base {base}, repo {record['repo']}). "
             f"Your brief, also at {lane.dir / 'brief.md'}:\n\n{brief}")
     with lane.locked():
-        lane.begin_run(record, text, resume=False)
+        lane.begin_run(record, text, resume=False, max_time=a.max_time)
     return lane.id
 
 
-def resume(lane: Lane, text: str, memory: str | None) -> str:
+def resume(lane: Lane, text: str, memory: str | None, max_time: str) -> str:
     lane.refresh()
     with lane.locked():
         record = lane.load()
@@ -563,7 +564,7 @@ def resume(lane: Lane, text: str, memory: str | None) -> str:
         if record["runs"] and lane.alive(record["runs"][-1]["run"]):
             raise Fail(f"{lane.id} is running run {len(record['runs'])}; `lane stop {lane.id}` first")
         try:
-            return f"{lane.id} run {lane.begin_run(record, text, resume=True)}"
+            return f"{lane.id} run {lane.begin_run(record, text, resume=True, max_time=max_time)}"
         except Fail:
             lane.save(previous)
             raise
@@ -591,7 +592,10 @@ def merge(lane: Lane, admin: bool) -> str:
         raise Fail(f"no PR for {record['branch']} in {record['repo']}")
     pr = json.loads(run(["gh", "pr", "view", url, "--json", "headRefOid,body,reviews,comments"]))
     head = pr["headRefOid"]
-    print(render_verdict(verdict_fact(pr, record.get("model"))), flush=True)
+    verdict = verdict_fact(pr, record.get("model"))
+    print(render_verdict(verdict), flush=True)
+    if not verdict["ready"]:
+        raise Fail(f"merge requires a READY other-family verdict on current head {head}")
     # Run outside any clone, so gh deletes only the remote branch and leaves the worktree's checkout alone.
     run(["gh", "pr", "merge", url, "--squash", "--delete-branch", "--match-head-commit", head]
         + ["--admin"] * admin, cwd="/")
@@ -851,7 +855,7 @@ def show(lane: Lane) -> str:
            f"model {record['model']} {record['thinking']}, session {record.get('session')}",
            f"PLAYBOOK: {record.get('playbook') if record.get('playbook') is not None else '(absent)'}"]
     out += [f"run {r['run']}: {r.get('start')} to {r.get('end') or 'running'}, exit {exit_code(r)}, "
-            f"${r.get('cost_usd') or 0:.2f}" for r in record.get("runs") or []]
+            f"max-time {r.get('max_time', '(unrecorded)')}, ${r.get('cost_usd') or 0:.2f}" for r in record.get("runs") or []]
     out += process_lines(record.get("runs") or [])
     if record["status"] == "running":
         return "\n".join(out + ["final answer: run in progress"])
@@ -898,7 +902,7 @@ def main(argv) -> int:
             ("logs", ["id"], "the latest run as readable lines"),
             ("wait", ["ids"], "block until a run of any listed lane ends; print its id, exit and final answer"),
             ("stop", ["id"], "stop the running run"),
-            ("merge", ["id"], "squash-merge the lane's PR at its current head and delete the branch"),
+            ("merge", ["id"], "require a READY other-family verdict on the current head, squash-merge and delete the branch"),
             ("clean", ["id"], "remove the worktree and delete the local branch")):
         p[name] = sub.add_parser(name, help=text, description=text)
         p[name].add_argument("--seat", help="seat dir (default $TSTACK_SEAT, else the nearest ancestor with state/)")
@@ -911,6 +915,8 @@ def main(argv) -> int:
     p["start"].add_argument("--model", default="@sol")
     p["start"].add_argument("--thinking", default="high")
     for name in ("start", "resume"):
+        p[name].add_argument("--max-time", required=True,
+                             help="required omp hard deadline for this run, e.g. 600, 10m, 1h; no default or reuse")
         p[name].add_argument("--memory", default="8G" if name == "start" else None,
                              help="MemoryMax of the run's systemd unit on Linux; ignored on macOS"
                                   + (" (default: reuse the previous cap)" if name == "resume" else ""))
@@ -931,7 +937,7 @@ def main(argv) -> int:
         if not seat:
             raise Fail("no seat: pass --seat DIR, set TSTACK_SEAT, or run inside a seat dir")
     lane = Lane(seat, a.id) if getattr(a, "id", None) else None
-    out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text, a.memory), "list": lambda: listing(seat, a.all),
+    out = {"start": lambda: start(seat, a), "resume": lambda: resume(lane, a.text, a.memory, a.max_time), "list": lambda: listing(seat, a.all),
            "show": lambda: show(lane), "logs": lambda: logs(lane, a.n), "stop": lambda: stop(lane),
            "wait": lambda: wait([Lane(seat, i) for i in a.ids]), "merge": lambda: merge(lane, a.admin),
            "clean": lambda: clean_listing(seat) if a.list else clean(lane)}[a.cmd]()

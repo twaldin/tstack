@@ -33,11 +33,11 @@ PLAYBOOK: feature
 #### Steps
 
 1. **Frame.** Write the countable done predicate, units, dependencies, and merge order in the effort file. Read standing orders and reconcile existing lanes and PRs before starting more work.
-2. **Prepare.** Write briefs and task rows. Use `lane start <name> --repo <repo> --brief <file>` with an explicit base for dependent work. Record each returned lane id.
+2. **Prepare.** Write briefs and task rows. Use `lane start <name> --repo <repo> --brief <file> --max-time <duration>` with an explicit base for dependent work. Choose a budget for each run. There is no default. Record each returned lane id.
 3. **Pilot.** Take one unit through proof, review, and merge. Fix the brief and verification recipe from its result before repeating the unit across the program.
 4. **Scale.** Keep a rolling window of independent lanes. Refill as lanes finish, not after the slowest member of a batch. Start dependent work only with the required upstream context and base.
 5. **Drain.** `lane wait <ids>` returns one ended lane. Remove that id from the wait list, read it with `lane show <id>`, and repeat for the remaining lanes. Apply the queue discipline below before dispatching more work.
-6. **Land.** Keep landing verified units while other lanes work. Use the stack rules below. Run `lane merge <id>` when the project's merge rule holds, then `lane clean <id>` for completed worktrees.
+6. **Land.** Keep landing verified units while other lanes work. Use the stack rules below. Run `lane merge <id>` when the project's merge rule holds and a cross-family `READY` verdict covers the exact current PR head. The command refuses without that verdict. Then run `lane clean <id>` for completed worktrees.
 7. **Close.** Reconcile every lane to landed, abandoned, or blocked. Confirm the done predicate on the real artifact and record remaining work and questions. Leave the effort file and lane reports as the trail.
 
 #### Queue and drain
@@ -46,7 +46,7 @@ Finish the brief or state update in progress before processing a completion. A c
 
 At each drain, read the completed lane reports, update task rows and the effort file, and classify each unit as landed, needs review, failed, or blocked. Account for every started lane. Record missing results rather than silently redoing their work. Read reports before authoring dependent briefs.
 
-Use `lane resume <id> "<consolidated instructions>"` when a fix needs that lane's existing session or worktree. Give a fresh lane a consolidated brief for replacement work. A resume starts work; never use it to check liveness.
+Use `lane resume <id> "<consolidated instructions>" --max-time <duration>` when a fix needs that lane's existing session or worktree. After a budget expires, read the result and choose a new explicit budget. Resume never inherits the previous budget. Give a fresh lane a consolidated brief for replacement work. A resume starts work; never use it to check liveness.
 
 #### Stack safety
 
