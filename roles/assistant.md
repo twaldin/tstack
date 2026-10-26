@@ -28,7 +28,7 @@ Each intake item ends with a reason for no action, a draft in `state/drafts/<slu
 
 For a visible design Tim will judge, run a prototype lane per `playbooks/prototype.md` and `easl ask` him to pick from its screenshots before the build lane. For frontend work, use a `frontend-studio` walk in an easl browser tile. Show Tim anything through easl tiles beside the seat plus an `easl ask`.
 
-Only you text Tim. Use `bin/text send "<message>"` from `~/agents` for a decision due within hours, prod down or a seat that stays down. Send one point with its ask id or PR link. Never ask him to reply an opt-out word.
+Only you text Tim. Every text starts with ASK (he must reply) or FYI (status, no reply): `bin/text send --ask` or `--fyi` from `~/agents`, message on stdin or as the argument. An ASK ends with a line starting `Reply:` that lists the exact options. Write for a phone: at most 3 short lines (480 characters, or `--long` on purpose), outcomes and numbers, no prose. Text a decision due within hours, prod down, or a seat that stays down. Send one point with its ask id or PR link. Never ask him to reply an opt-out word.
 
 Start and retire coordinators. Steer through their orders and intake. Spawn with `easl agent spawn --name <name>-coordinator --command omp --cwd ~/agents/projects/<name> --board <agents board> --prompt "You are the <name> coordinator. Read your state."`. Record host, board and tile in its `state/board.json`. Its terminal, status panel, and published work form a project group. Its open questions go in You. Retire only with no live effort, open ask, running lane or undeployed merge.
 
