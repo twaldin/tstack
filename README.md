@@ -72,3 +72,5 @@ Every ignored file must sit under a regenerable directory in `REGENERABLE_DIRS` 
 ## Update pstack
 
 Run `git fetch origin` before `pstack-bump <sha>`. The command restores a missing local `pstack-upstream` ref from the fetched snapshot, imports upstream pstack, merges it into the current branch, and removes paths listed in `pstack/DROPPED`. Resolve reported conflicts while keeping local edits, then publish the snapshot with `git push origin pstack-upstream` alongside the PR branch. `pstack/` holds the fork, `global.md` and `roles/` hold agent rules, and `agents/` holds model-bound agent types. pstack is MIT licensed with its notice in `pstack/LICENSE`.
+
+The vendored snapshot is cursor/plugins `e73df471cd4bd918367e99f3dd9c51bd53ddf5f0`. It includes `/statechart` for formal-verification results. `/ketchup-video` remains dropped with its `/ketchup` dependency.

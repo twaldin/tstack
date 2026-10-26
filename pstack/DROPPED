@@ -51,6 +51,7 @@ skills/sharpen/*
 # Unused restatement and catch-up helpers
 skills/bro/*
 skills/ketchup/*
+skills/ketchup-video/*
 skills/in-your-own-words/*
 
 # Unused examples; TypeScript rules remain in the entrypoint
