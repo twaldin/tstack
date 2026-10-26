@@ -531,19 +531,48 @@ class LaneRuns(Sandbox):
         self.assertEqual(self.cli("lane", "list").stdout, "")
         self.assertTrue(self.cli("lane", "list", "--all").stdout.startswith(f"{lane_id}\texited"))
 
-    def test_live_stream_drops_updates_but_keeps_logs_session_cost_and_final(self):
+    def test_projected_stream_keeps_lane_commands_without_tool_results_or_thinking(self):
+        args = {"path": "x" * 300}
         self.omp(answer="answer", cost=0.7, events=[
             123, [], None, "not an event",
-            {"type": "tool_execution_update", "partialResult": "discard me"},
-            {"type": "tool_execution_start", "toolName": "read", "intent": "Reading file"},
-            {"type": "message_update", "delta": "discard me too"}])
+            {"type": "tool_execution_update", "partialResult": "discard-update"},
+            {"type": "tool_execution_start", "toolName": "read", "intent": "Reading file",
+             "args": {"payload": "discard-arguments"}},
+            {"type": "tool_execution_start", "toolName": "read", "args": args},
+            {"type": "message_end", "message": {"role": "toolResult", "content": [
+                {"type": "text", "text": "discard-result"}]}},
+            {"type": "message_end", "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "discard-thinking"},
+                {"type": "toolCall", "arguments": {"payload": "discard-call"}},
+                {"type": "text", "text": "intermediate"}],
+                "usage": {"cost": {"total": 0.2}}}},
+            {"type": "message_update", "delta": "discard-delta"}])
         lane_id = self.start()
         self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\nanswer\n")
         stream = self.seat / "state" / "run" / "lanes" / lane_id / "run-1.jsonl"
-        self.assertEqual([json.loads(line)["type"] for line in stream.read_text().splitlines()],
-                         ["session", "tool_execution_start", "message_end"])
-        self.assertEqual(self.cli("lane", "logs", lane_id).stdout, "> read: Reading file\nanswer\n")
-        self.assertEqual(self.record(lane_id)["runs"][0]["cost_usd"], 0.7)
+        self.assertNotIn("discard-", stream.read_text())
+        self.assertEqual(self.cli("lane", "logs", lane_id).stdout,
+                         f"> read: Reading file\n> read: {json.dumps(args)[:200]}\nintermediate\nanswer\n")
+        self.assertEqual(self.record(lane_id)["runs"][0]["cost_usd"], 0.9)
+        shown = self.cli("lane", "show", lane_id).stdout
+        self.assertIn("session " + self.record(lane_id)["session"], shown)
+        self.assertTrue(shown.endswith("final answer (last 20 lines):\nanswer\n"))
+        self.assertIn(f"{lane_id}\texited\texit 0\t$0.90\t", self.cli("lane", "list").stdout)
+
+    def test_refresh_leaves_existing_stream_bytes_unchanged(self):
+        lane_id = self.start()
+        stream = self.seat / "state/run/lanes" / lane_id / "run-1.jsonl"
+        self.assertTrue(self.until(lambda: stream.with_suffix(".exit").exists()))
+        with stream.open("a") as output:
+            output.write(json.dumps({"type": "message_update", "delta": "legacy payload"}) + "\n")
+        record_path = self.seat / "state/lanes" / lane_id / "lane.json"
+        record = self.record(lane_id)
+        record["runs"][0]["compacted"] = False
+        record_path.write_text(json.dumps(record))
+        before = stream.read_bytes()
+        self.assertEqual(self.cli("lane", "wait", lane_id).stdout, f"{lane_id} exited exit 0\ndone\n")
+        self.assertTrue(self.cli("lane", "show", lane_id).stdout.endswith("done\n"))
+        self.assertEqual(stream.read_bytes(), before)
 
     def merged(self, lane_id, head):
         path = self.seat / "state" / "lanes" / lane_id / "lane.json"

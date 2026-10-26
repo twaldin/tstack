@@ -212,18 +212,29 @@ def git(repo, *args, check=True) -> str:
     return run(["git", "-C", str(repo), *args], check=check)
 
 
-KEPT_EVENTS = {"session", "message_end", "tool_execution_start"}
-
-
 def filter_stream(source, target):
     for line in source:
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("type") in KEPT_EVENTS:
-            target.write(line)
-            target.flush()
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "session":
+            projected = {"type": kind, "id": event.get("id")}
+        elif kind == "tool_execution_start":
+            projected = {"type": kind, "toolName": event.get("toolName"),
+                         "intent": event.get("intent") or json.dumps(event.get("args"))[:200]}
+        elif (text := assistant_text(event)) is not None:
+            total = ((event["message"].get("usage") or {}).get("cost") or {}).get("total") or 0
+            projected = {"type": kind, "message": {"role": "assistant",
+                         "content": [{"type": "text", "text": text}],
+                         "usage": {"cost": {"total": total}}}}
+        else:
+            continue
+        target.write(json.dumps(projected, separators=(",", ":")) + "\n")
+        target.flush()
 
 
 def events(path: Path):
@@ -431,15 +442,6 @@ class Lane:
                     (self.dir / "final.md").write_text(final + "\n")
                 else:
                     (self.dir / "final.md").unlink(missing_ok=True)
-            for entry in record.get("runs") or []:
-                stream = self.file(entry["run"], "jsonl")
-                if not entry.get("compacted") and stream.exists():
-                    temporary = stream.with_suffix(".tmp")
-                    with stream.open(errors="replace") as source, temporary.open("w") as target:
-                        filter_stream(source, target)
-                    temporary.replace(stream)
-                    entry["compacted"] = True
-                    changed = True
             if changed:
                 self.save(record)
             if github(record) and record.get("pr") and (not record.get("merge") or not record.get("merged_head")):
@@ -466,7 +468,7 @@ class Lane:
     def begin_run(self, record: dict, text: str, resume: bool, max_time: str) -> int:
         """Append a run and launch it. Caller holds the lock, so no refresh sees the run before its pid."""
         number = len(record["runs"]) + 1
-        record["runs"].append({"run": number, "start": now(), "max_time": max_time, "compacted": True,
+        record["runs"].append({"run": number, "start": now(), "max_time": max_time,
                                "backend": "nohup" if sys.platform == "darwin" else "systemd",
                                "marker": f"{self.id}:{number}:{uuid.uuid4().hex}"})
         self.save({**record, "status": "running"})

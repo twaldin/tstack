@@ -940,7 +940,7 @@ if not marker.exists():
 
 HEADER = "id\teffort\ttitle\tstate\tlane\tpr\tupdated\n"
 AGENT = {"tile": "obj_t", "kind": "omp", "live": True, "open": True, "lifecycle": {"state": "idle"}}
-CLEAN = "layout.check\tclean\n"
+CLEAN = "layout.check\tprecision unreported\tclean\n"
 
 
 class Board(Sandbox):
@@ -1012,6 +1012,27 @@ class Board(Sandbox):
 
     def members(self, key):
         return set(self.obj(key)["props"]["members"])
+
+    def test_layout_check_labels_precision_and_preserves_findings(self):
+        finding = {"id": "obj_t", "x": 12, "y": 0}
+        for approximate, overflow, precision in (
+                (None, [], "precision unreported"),
+                (None, [finding], "precision unreported"),
+                (True, [finding], "approximate")):
+            with self.subTest(approximate=approximate, overflow=overflow):
+                store = json.loads(self.store.read_text())
+                store["layout_check"] = {"overflow": overflow}
+                if approximate:
+                    store["layout_check"]["approximate"] = approximate
+                self.store.write_text(json.dumps(store))
+                output = self.board_cli()
+                report = next(line for line in output.splitlines() if line.startswith("layout.check\t"))
+                _, label, findings = report.split("\t", 2)
+                self.assertEqual(label, precision)
+                if overflow:
+                    self.assertEqual(json.loads(findings)["overflow"], overflow)
+                else:
+                    self.assertEqual(findings, "clean")
 
     def test_status_keeps_tasks_and_running_prs_for_parked_and_down_projects(self):
         alpha = self.coordinator("alpha", "obj_a")

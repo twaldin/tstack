@@ -8,15 +8,11 @@ The coordinator owns scope, dependencies, merge order, state, and the operator r
 
 #### Seat state
 
-Use the seat's existing `state/`, not a second store. The coordinator writes program state; lane commands write lane records and run output.
+Follow `roles/coordinator.md` for seat state and ownership.
 
-- `orders.md` holds standing rules. Read it before dispatch and carry the relevant rules into every brief and resume.
-- `tasks.tsv` tracks units, dependencies, lane ids, state, and PRs. Reconcile it from lane reports and forge facts.
-- `lanes/<id>/` holds the brief, lane record, and final answer. Read these through `lane show <id>`.
-- `efforts/<name>.md` holds the done predicate, ordered PRs and heads, verification receipts, decisions, blocked questions, and follow-ups.
-- `status.json` holds the current operator summary, per the coordinator role.
+`state/efforts/<name>.md` holds the done predicate, ordered PRs and heads, proof receipts, decisions, blockers, and follow-ups.
 
-Record facts once and link to receipts. Do not copy lane run logs into program state.
+Read lanes through `lane show <id>`. Link receipts instead of copying run logs.
 
 #### The brief
 

@@ -1006,8 +1006,9 @@ def reconcile_board(board_id: str, design: BoardDesign, objects: dict, existing:
         output.append(f"{key}\t{'created' if not old else 'updated' if changed or moved else 'unchanged'}")
     flush()
     check = easl("layout.check", board=board_id, ids=sorted(set(ids.values()) | design.borrowed))
+    precision = "approximate" if check.get("approximate") is True else "precision unreported"
     findings = {key: value for key, value in check.items() if value and key not in ("hints", "approximate")}
-    return output + ["layout.check\t" + (json.dumps(findings, sort_keys=True) if findings else "clean")]
+    return output + [f"layout.check\t{precision}\t" + (json.dumps(findings, sort_keys=True) if findings else "clean")]
 
 
 def draw(snap: Snapshot, pointer: dict) -> list:

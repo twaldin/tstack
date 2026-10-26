@@ -188,7 +188,7 @@ def apply(method, p, board):
         pairs = [[a["id"], b["id"]] for n, a in enumerate(held) for b in held[n + 1:]
                  if (a["id"] in p["ids"] or b["id"] in p["ids"]) and hits(a["frame"], b["frame"])]
         return {"overlaps": pairs, "overflow": [], "truncated": [], "scrolls": [], "arrowCrossings": [],
-                "labelOverlaps": [], "arrowOverlaps": [], "arrowIntersections": []}
+                "labelOverlaps": [], "arrowOverlaps": [], "arrowIntersections": [], **store.get("layout_check", {})}
     raise Refused(f"fake easl: no method {method}")
 try:
     params = {}
