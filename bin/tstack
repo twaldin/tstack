@@ -151,6 +151,10 @@ def setup(name: str) -> int:
                                      lambda p: p.suffix == ".md"), out)
     link_dir(HOME / ".local" / "bin", sources([ENGINE / "bin", INSTANCE / "bin", box / "bin"],
                                               lambda p: p.is_file() and os.access(p, os.X_OK)), out)
+    seats = [INSTANCE / "assistant", *sorted((INSTANCE / "projects").glob("*"))]
+    for seat in seats:
+        if (seat / "state").is_dir():
+            link_dir(seat / ".omp" / "extensions", {"seat-waits.js": ENGINE / "extensions" / "seat-waits.js"}, out)
     if sys.platform == "darwin":
         out.append("skip systemd update units on macOS; coordinators run tstack update on heartbeat")
     else:

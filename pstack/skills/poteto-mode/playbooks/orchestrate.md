@@ -32,7 +32,7 @@ PLAYBOOK: feature
 2. **Prepare.** Write briefs and task rows. Use `lane start <name> --repo <repo> --brief <file> --max-time <duration>` with an explicit base for dependent work. Choose a budget for each run. There is no default. Record each returned lane id.
 3. **Pilot.** Take one unit through proof, review, and merge. Fix the brief and verification recipe from its result before repeating the unit across the program.
 4. **Scale.** Keep a rolling window of independent lanes. Refill as lanes finish, not after the slowest member of a batch. Start dependent work only with the required upstream context and base.
-5. **Drain.** `lane wait <ids>` returns one ended lane. Remove that id from the wait list, read it with `lane show <id>`, and repeat for the remaining lanes. Apply the queue discipline below before dispatching more work.
+5. **Drain.** The seat-waits extension delivers lane completion notices. Read each completed lane with `lane show <id>`. Apply the queue discipline below before dispatching more work.
 6. **Land.** Keep landing verified units while other lanes work. Use the stack rules below. Run `lane merge <id>` when the project's merge rule holds and a cross-family `READY` verdict covers the exact current PR head. The command refuses without that verdict. Then run `lane clean <id>` for completed worktrees.
 7. **Close.** Reconcile every lane to landed, abandoned, or blocked. Confirm the done predicate on the real artifact and record remaining work and questions. Leave the effort file and lane reports as the trail.
 
@@ -46,7 +46,7 @@ Use `lane resume <id> "<consolidated instructions>" --max-time <duration>` when 
 
 #### Stack safety
 
-Keep PRs in base-branch order in the effort file. Confirm current heads and bases with `gh pr view <pr> --json state,headRefOid,headRefName,baseRefName`. Use `watch-pr <pr> --once` for checks, reviews, threads, and mergeability. Use `watch-pr <pr> --until change` when waiting on the lowest unmerged PR.
+Keep PRs in base-branch order in the effort file and record owned PRs in `state/tasks.tsv`. Confirm current heads and bases with `gh pr view <pr> --json state,headRefOid,headRefName,baseRefName`. Use `watch-pr <pr> --once` for checks, reviews, threads, and mergeability. The seat-waits extension delivers PR change notices.
 
 Work that PR before upper-stack fixes. Follow `playbooks/babysit.md` for review and CI. Assign one lane to stack mutations; never let lanes rebase or retarget the same chain concurrently. After a merge, reconcile dependent bases and heads before accepting their proof. Delegate any required code or conflict resolution.
 

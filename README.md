@@ -19,6 +19,14 @@ Engine, instance, and machine skills override either managed default, in that or
 
 Setup does not install the studio's JavaScript dependencies or start a server or daemon. Follow the skill when you need the studio.
 
+## Seat waits
+
+Setup links `extensions/seat-waits.js` into `<seat>/.omp/extensions/seat-waits.js` for the existing assistant and `projects/<name>` directories that have `state/`. It preserves foreign files and links and reports collisions. It installs no global extension link and no extension in lanes. omp discovers the seat-local link on startup. After creating a new seat's `state/`, run `tstack setup` before `easl agent spawn --command omp`. For an explicit load with `-e` or `--extension`, use that seat-local link, not the engine path, so discovery and the flag name the same file.
+
+The extension runs inside the main omp agent only when its working directory is exactly the instance's assistant or a project seat. It does not run in lanes or subagents. It reads `state/lanes/*/lane.json` for lanes, `state/tasks.tsv` for PR references, and `state/board.json` for the board tile used to find open questions. It owns lane waits, `watch-pr --until change`, question waits, and the 30-minute heartbeat. The assistant also watches `bin/text inbox --wait` with the existing text cursor unchanged.
+
+The extension restores waits from state on startup, reconciles them as state changes, and re-arms a completed wait before delivering its notice. A state-refresh error cannot prevent completion delivery. Notices contain fixed facts, IDs, and references, not outside PR or question text. Lane final answers and the existing text inbox output retain their contents. A failing wait retries with a delay that doubles from 5 seconds to at most 10 minutes. Only the first failure in an episode wakes the model; success resets that episode. Discovery and state-read failures also notify once until recovery. Every wait error remains available as tool-readable output. Shutdown stops the waits. No separate daemon runs, and a dead seat remains a plain shell until someone restarts it.
+
 ## Update
 
 `tstack update` pulls the engine and both installed managed checkouts with `git pull --ff-only`, fetches the instance, syncs upstream files without overwriting changed local files or seat state, and reruns setup. Setup clones either managed checkout if it is missing and restores missing skill and sibling links. Updates do not reset, stash, or discard local checkout edits. A failed pull reports git's native error and makes update return nonzero, even if the other repositories and setup succeed. The hourly systemd timer runs the same command.
