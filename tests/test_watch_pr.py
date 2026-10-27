@@ -1,14 +1,17 @@
-"""watch-pr against gh output recorded from real PRs, replayed by a fake gh on PATH."""
-
 import json
 import os
-import re
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = {
+    "example-fixtures/review-demo#101": "open-review-limit.json",
+    "example-fixtures/workflow-demo#102": "merged-workflow.json",
+    "example-fixtures/deployment-demo#103": "merged-deployment.json",
+}
+
 FAKE_GH = r'''#!/usr/bin/env python3
 import json, os, sys
 args, here = sys.argv[1:], os.path.dirname(__file__)
@@ -36,7 +39,7 @@ class WatchPr(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         tmp = Path(scratch.name)
-        recorded = json.loads((ROOT / "tests/fixtures/watch_pr" / f"{re.sub('[/#]', '-', pr)}.json").read_text())
+        recorded = json.loads((ROOT / "tests/fixtures/watch_pr" / FIXTURES[pr]).read_text())
         (tmp / "recorded.json").write_text(json.dumps(recorded))
         if polls:
             snapshots = [{**recorded, "pr view": {**recorded["pr view"], **poll}} for poll in polls]
@@ -61,17 +64,17 @@ class WatchPr(unittest.TestCase):
                               capture_output=True, text=True, env=env, timeout=60)
 
     def test_coderabbit_review_limit_notice_is_reported(self):
-        result = self.watch("example/team-instance#1", "--once")
+        result = self.watch("example-fixtures/review-demo#101", "--once")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("  coderabbitai 2026-10-13T21:09:05Z: Review limit reached", result.stdout.splitlines())
+        self.assertIn("  sample-review-bot 2025-01-01T12:00:00Z: Review limit reached", result.stdout.splitlines())
 
     def test_until_change_and_checks_wait_out_a_pending_check(self):
         def pending(recorded):
             recorded["pr view"]["statusCheckRollup"][0]["state"] = "PENDING"
-        title = "example/team-instance#1 OPEN: Add a sample greeting"
+        title = "example-fixtures/review-demo#101 OPEN: Add a sample greeting"
         for mode, first_line in (("change", "changed: checks"), ("checks", title)):
             with self.subTest(mode):
-                lines = self.watch("example/team-instance#1", "--until", mode, earlier=pending).stdout.splitlines()
+                lines = self.watch("example-fixtures/review-demo#101", "--until", mode, earlier=pending).stdout.splitlines()
                 self.assertEqual(lines[0], first_line)
                 self.assertIn("  SUCCESS (1): CodeRabbit", lines)
 
@@ -79,7 +82,7 @@ class WatchPr(unittest.TestCase):
         for fields in ({"mergeable": "UNKNOWN"}, {"mergeStateStatus": "UNKNOWN"},
                        {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}):
             with self.subTest(fields):
-                result = self.watch("example/team-instance#1", "--until", "change",
+                result = self.watch("example-fixtures/review-demo#101", "--until", "change",
                                     polls=[{}, fields, {}, {**fields, "headRefOid": "new-head"}])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines()[0], "changed: head")
@@ -91,7 +94,7 @@ class WatchPr(unittest.TestCase):
                 ("mergeStateStatus", "CLEAN", "BLOCKED", "changed: merge_state")):
             for initial in (known, "UNKNOWN"):
                 with self.subTest(field=field, initial=initial):
-                    result = self.watch("example/team-instance#1", "--until", "change",
+                    result = self.watch("example-fixtures/review-demo#101", "--until", "change",
                                         polls=[{field: initial}, {field: known}, {field: "UNKNOWN"},
                                                {field: changed}])
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -107,7 +110,7 @@ class WatchPr(unittest.TestCase):
                             (("--once", "--json"), [unknown]),
                             (("--until", "change", "--json"), [{}, {**unknown, "headRefOid": "new-head"}])):
             with self.subTest(args=args):
-                result = self.watch("example/team-instance#1", *args, polls=polls)
+                result = self.watch("example-fixtures/review-demo#101", *args, polls=polls)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 if "--json" in args:
                     report = json.loads(result.stdout)
@@ -122,20 +125,19 @@ class WatchPr(unittest.TestCase):
     def test_until_change_stops_at_once_on_a_closed_pr(self):
         def closed(recorded):
             recorded["pr view"]["state"] = "CLOSED"
-        lines = self.watch("example/team-instance#1", "--until", "change", earlier=closed).stdout.splitlines()
-        self.assertEqual(lines[0], "example/team-instance#1 CLOSED: Add a sample greeting"
-                                   "")
+        lines = self.watch("example-fixtures/review-demo#101", "--until", "change", earlier=closed).stdout.splitlines()
+        self.assertEqual(lines[0], "example-fixtures/review-demo#101 CLOSED: Add a sample greeting")
 
     def test_until_merged_reports_the_merge_sha_and_its_runs(self):
         def still_open(recorded):
             recorded["pr view"].update(state="OPEN", mergeCommit=None, mergedAt=None)
-        lines = self.watch("twaldin/tstack#2", "--until", "merged", earlier=still_open).stdout.splitlines()
-        self.assertIn("merged 2026-10-13T21:30:39Z as a02d46c2e540cbcacda0de6dacec2fb0a89f355a", lines)
-        self.assertIn("  CI (push) on a02d46c2e540: success https://github.com/twaldin/tstack/actions/runs/38471157784",
+        lines = self.watch("example-fixtures/workflow-demo#102", "--until", "merged", earlier=still_open).stdout.splitlines()
+        self.assertIn("merged 2025-01-02T12:00:00Z as 2222222222222222222222222222222222222222", lines)
+        self.assertIn("  CI (push) on 222222222222: success https://github.com/example-fixtures/workflow-demo/actions/runs/2001",
                       lines)
 
     def test_merge_reports_deploy_jobs_without_deployment_or_later_commit_tracking(self):
-        result = self.watch("example/sample-app#34610", "--once", "--json")
+        result = self.watch("example-fixtures/deployment-demo#103", "--once", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         merge = json.loads(result.stdout)["merge"]
         self.assertEqual(set(merge), {"sha", "at", "runs"})
@@ -146,32 +148,32 @@ class WatchPr(unittest.TestCase):
         self.assertEqual(jobs[0]["result"], "success")
 
     def test_gh_failure_passes_through_with_exit_1(self):
-        result = self.watch("example/team-instance#1", earlier=lambda recorded: recorded.pop("api graphql"))
+        result = self.watch("example-fixtures/review-demo#101", earlier=lambda recorded: recorded.pop("api graphql"))
         self.assertEqual((result.returncode, result.stdout), (1, ""))
         self.assertEqual(result.stderr, "watch-pr: no fixture for api graphql\n")
 
     def review_record(self, **changes):
-        record = {"head": "f08be0ca3e03ad5597e09a241eb698a155ce568f",
+        record = {"head": "1111111111111111111111111111111111111111",
                   "reviewer_model": "anthropic/claude-opus-5-5",
                   "author_model": "openai-codex/gpt-6.1-sol", "verdict": "READY"}
         record.update(changes)
-        return {"author": {"login": "twaldin"}, "createdAt": "2026-10-20T12:00:00Z",
-                "body": "tstack-verdict: " + json.dumps(record), "url": "https://github.com/example/review"}
+        return {"author": {"login": "sample-reviewer"}, "createdAt": "2026-10-20T12:00:00Z",
+                "body": "tstack-verdict: " + json.dumps(record), "url": "https://github.com/example-fixtures/review-demo/pull/101#issuecomment-1002"}
 
     def verdict_poll(self, *comments, body="tstack-author-model: openai-codex/gpt-6.1-sol", **fields):
         return {"body": body, "comments": list(comments), "reviews": [], **fields}
 
     def test_current_other_family_verdict_in_text_and_json(self):
         poll = self.verdict_poll(self.review_record())
-        result = self.watch("example/team-instance#1", polls=[poll], symlink=True)
+        result = self.watch("example-fixtures/review-demo#101", polls=[poll], symlink=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = [line for line in result.stdout.splitlines() if line.startswith("other-family verdict")]
-        self.assertEqual(lines, ["other-family verdict READY at f08be0ca3e03ad5597e09a241eb698a155ce568f: "
+        self.assertEqual(lines, ["other-family verdict READY at 1111111111111111111111111111111111111111: "
                                  "anthropic/claude-opus-5-5 reviewed openai-codex/gpt-6.1-sol"])
-        result = self.watch("example/team-instance#1", "--json", polls=[poll])
+        result = self.watch("example-fixtures/review-demo#101", "--json", polls=[poll])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["verdict"],
-                         {"ready": True, "head": "f08be0ca3e03ad5597e09a241eb698a155ce568f",
+                         {"ready": True, "head": "1111111111111111111111111111111111111111",
                           "reviewer_model": "anthropic/claude-opus-5-5",
                           "author_model": "openai-codex/gpt-6.1-sol", "verdict": "READY",
                           "source": "comments", "at": "2026-10-20T12:00:00Z"})
@@ -183,7 +185,7 @@ class WatchPr(unittest.TestCase):
                 ("missing", self.verdict_poll()),
                 ("same family", self.verdict_poll(self.review_record(reviewer_model="openai/gpt-6.1"))),
                 ("stale", self.verdict_poll(self.review_record(head="a" * 40))),
-                ("short SHA", self.verdict_poll(self.review_record(head="f08be0c"))),
+                ("short SHA", self.verdict_poll(self.review_record(head="1111111"))),
                 ("malformed", self.verdict_poll(malformed)),
                 ("unknown reviewer", self.verdict_poll(self.review_record(reviewer_model="@opus"))),
                 ("unknown provider", self.verdict_poll(self.review_record(reviewer_model="other/claude-opus-5-5"))),
@@ -195,7 +197,7 @@ class WatchPr(unittest.TestCase):
                     "tstack-author-model: openai-codex/gpt-6.1-sol\n"
                     "tstack-author-model: anthropic/claude-opus-5-5"))):
             with self.subTest(label):
-                result = self.watch("example/team-instance#1", polls=[poll])
+                result = self.watch("example-fixtures/review-demo#101", polls=[poll])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual([line for line in result.stdout.splitlines()
                                   if line.startswith("other-family verdict")],
@@ -208,7 +210,7 @@ class WatchPr(unittest.TestCase):
                 ("@sol", "tstack-author-model: openai-codex/gpt-6.1-sol", True),
                 ("@sol", "", False)):
             with self.subTest(model=model, body=body):
-                result = self.watch("example/team-instance#1", "--json", lane_model=model,
+                result = self.watch("example-fixtures/review-demo#101", "--json", lane_model=model,
                                     polls=[self.verdict_poll(self.review_record(), body=body)])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["verdict"]["ready"], ready)
@@ -217,7 +219,7 @@ class WatchPr(unittest.TestCase):
         rejection = self.review_record(verdict="NOT_READY")
         rejection.update(submittedAt="2026-10-20T13:00:00Z", state="COMMENTED")
         poll = self.verdict_poll(self.review_record(), reviews=[rejection])
-        result = self.watch("example/team-instance#1", "--json", polls=[poll])
+        result = self.watch("example-fixtures/review-demo#101", "--json", polls=[poll])
         self.assertEqual(result.returncode, 0, result.stderr)
         fact = json.loads(result.stdout)["verdict"]
         self.assertEqual((fact["ready"], fact["verdict"], fact["source"]), (False, "NOT_READY", "reviews"))
@@ -228,13 +230,13 @@ class WatchPr(unittest.TestCase):
                 review = self.review_record()
                 review.update(submittedAt="2026-10-20T13:00:00Z", state=state)
                 comments = [] if state == "PENDING" else [self.review_record()]
-                result = self.watch("example/team-instance#1", "--json",
+                result = self.watch("example-fixtures/review-demo#101", "--json",
                                     polls=[self.verdict_poll(*comments, reviews=[review])])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(json.loads(result.stdout)["verdict"]["ready"])
 
     def test_verdict_change_is_reported_by_until_change(self):
-        result = self.watch("example/team-instance#1", "--until", "change", "--json",
+        result = self.watch("example-fixtures/review-demo#101", "--until", "change", "--json",
                             polls=[self.verdict_poll(), self.verdict_poll(self.review_record())])
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
@@ -248,17 +250,17 @@ class WatchPr(unittest.TestCase):
                 valid.replace('"verdict": "READY"', '"verdict": "NOT_READY", "verdict": "READY"'),
                 valid.replace('"reviewer_model": "anthropic/claude-opus-5-5"', '"reviewer_model": null'),
                 valid.replace('"verdict": "READY"', '"verdict": "ready"'),
-                "Independent exact-head review approved f08be0ca3e03ad5597e09a241eb698a155ce568f "
+                "Independent exact-head review approved 1111111111111111111111111111111111111111 "
                 "by anthropic/claude-opus-5-5; author openai-codex/gpt-6.1-sol. READY."):
             with self.subTest(body=body):
                 comment = {**self.review_record(), "body": body}
-                result = self.watch("example/team-instance#1", "--json", polls=[self.verdict_poll(comment)])
+                result = self.watch("example-fixtures/review-demo#101", "--json", polls=[self.verdict_poll(comment)])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(json.loads(result.stdout)["verdict"]["ready"])
 
     def test_latest_comment_wins_by_time_not_array_order(self):
         rejection = {**self.review_record(verdict="NOT_READY"), "createdAt": "2026-10-20T14:00:00Z"}
-        result = self.watch("example/team-instance#1", "--json",
+        result = self.watch("example-fixtures/review-demo#101", "--json",
                             polls=[self.verdict_poll(rejection, self.review_record())])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(json.loads(result.stdout)["verdict"]["ready"])
@@ -266,14 +268,14 @@ class WatchPr(unittest.TestCase):
     def test_ready_evidence_becomes_stale_when_head_changes(self):
         current = self.verdict_poll(self.review_record())
         stale = {**current, "headRefOid": "a" * 40}
-        result = self.watch("example/team-instance#1", "--until", "change", "--json", polls=[current, stale])
+        result = self.watch("example-fixtures/review-demo#101", "--until", "change", "--json", polls=[current, stale])
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(report["changed"], ["head", "verdict"])
         self.assertFalse(report["verdict"]["ready"])
 
     def test_resolved_grok_reviewer_counts_as_other_family(self):
-        result = self.watch("example/team-instance#1", "--json",
+        result = self.watch("example-fixtures/review-demo#101", "--json",
                             polls=[self.verdict_poll(self.review_record(reviewer_model="xai/grok-4"))])
         self.assertEqual(result.returncode, 0, result.stderr)
         fact = json.loads(result.stdout)["verdict"]

@@ -1,0 +1,68 @@
+{
+  "pr view": {
+    "url": "https://github.com/example-fixtures/workflow-demo/pull/102",
+    "title": "Add a sample workflow",
+    "body": "Update the synthetic sample application.",
+    "state": "MERGED",
+    "isDraft": false,
+    "headRefOid": "2222222222222222222222222222222222222222",
+    "baseRefName": "main",
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "CLEAN",
+    "reviewDecision": "",
+    "autoMergeRequest": null,
+    "mergeCommit": {
+      "oid": "2222222222222222222222222222222222222222"
+    },
+    "mergedAt": "2025-01-02T12:00:00Z",
+    "reviews": [],
+    "comments": [],
+    "statusCheckRollup": [
+      {
+        "context": "CI",
+        "state": "SUCCESS",
+        "targetUrl": "https://github.com/example-fixtures/workflow-demo/actions/runs/102"
+      }
+    ]
+  },
+  "api graphql": [
+    {
+      "data": {
+        "repository": {
+          "pullRequest": {
+            "reviewThreads": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "api repos/example-fixtures/workflow-demo/actions/runs?head_sha=2222222222222222222222222222222222222222&per_page=100": {
+    "workflow_runs": [
+      {
+        "id": 2001,
+        "name": "CI",
+        "event": "push",
+        "head_sha": "2222222222222222222222222222222222222222",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/workflow-demo/actions/runs/2001"
+      }
+    ]
+  },
+  "api repos/example-fixtures/workflow-demo/actions/runs/2001/jobs?per_page=100": {
+    "jobs": [
+      {
+        "name": "test",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/workflow-demo/actions/runs/2001/job/2002"
+      }
+    ]
+  }
+}

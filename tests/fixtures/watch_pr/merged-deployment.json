@@ -1,0 +1,86 @@
+{
+  "pr view": {
+    "url": "https://github.com/example-fixtures/deployment-demo/pull/103",
+    "title": "Deploy the sample application",
+    "body": "Update the synthetic sample application.",
+    "state": "MERGED",
+    "isDraft": false,
+    "headRefOid": "3333333333333333333333333333333333333333",
+    "baseRefName": "main",
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "CLEAN",
+    "reviewDecision": "",
+    "autoMergeRequest": null,
+    "mergeCommit": {
+      "oid": "3333333333333333333333333333333333333333"
+    },
+    "mergedAt": "2025-01-02T12:00:00Z",
+    "reviews": [],
+    "comments": [],
+    "statusCheckRollup": [
+      {
+        "context": "CI",
+        "state": "SUCCESS",
+        "targetUrl": "https://github.com/example-fixtures/deployment-demo/actions/runs/103"
+      }
+    ]
+  },
+  "api graphql": [
+    {
+      "data": {
+        "repository": {
+          "pullRequest": {
+            "reviewThreads": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "api repos/example-fixtures/deployment-demo/actions/runs?head_sha=3333333333333333333333333333333333333333&per_page=100": {
+    "workflow_runs": [
+      {
+        "id": 3001,
+        "name": "Deploy sample",
+        "event": "push",
+        "head_sha": "3333333333333333333333333333333333333333",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/deployment-demo/actions/runs/3001"
+      }
+    ]
+  },
+  "api repos/example-fixtures/deployment-demo/actions/runs/3001/jobs?per_page=100": {
+    "jobs": [
+      {
+        "name": "deploy / check-if-should-deploy",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/deployment-demo/actions/runs/3001/job/3002"
+      },
+      {
+        "name": "deploy / deploy-slow-check-policy",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/deployment-demo/actions/runs/3001/job/3003"
+      },
+      {
+        "name": "deploy / prepare",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/deployment-demo/actions/runs/3001/job/3004"
+      },
+      {
+        "name": "deploy / deploy",
+        "conclusion": "success",
+        "status": "completed",
+        "html_url": "https://github.com/example-fixtures/deployment-demo/actions/runs/3001/job/3005"
+      }
+    ]
+  }
+}

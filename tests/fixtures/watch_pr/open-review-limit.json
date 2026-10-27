@@ -1,0 +1,61 @@
+{
+  "pr view": {
+    "url": "https://github.com/example-fixtures/review-demo/pull/101",
+    "title": "Add a sample greeting",
+    "body": "Add a greeting to the sample application.",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "1111111111111111111111111111111111111111",
+    "baseRefName": "main",
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "CLEAN",
+    "reviewDecision": "",
+    "autoMergeRequest": null,
+    "mergeCommit": null,
+    "mergedAt": null,
+    "reviews": [
+      {
+        "author": {
+          "login": "sample-reviewer"
+        },
+        "state": "COMMENTED",
+        "submittedAt": "2025-01-01T11:00:00Z",
+        "body": "The sample greeting is clear."
+      }
+    ],
+    "comments": [
+      {
+        "author": {
+          "login": "sample-review-bot"
+        },
+        "createdAt": "2025-01-01T12:00:00Z",
+        "body": "<!-- Synthetic bot notice -->\n> [!WARNING]\n> ## Review limit reached\n\nTry another sample review later.",
+        "url": "https://github.com/example-fixtures/review-demo/pull/101#issuecomment-1001"
+      }
+    ],
+    "statusCheckRollup": [
+      {
+        "context": "CodeRabbit",
+        "state": "SUCCESS",
+        "targetUrl": "https://github.com/example-fixtures/review-demo/actions/runs/101"
+      }
+    ]
+  },
+  "api graphql": [
+    {
+      "data": {
+        "repository": {
+          "pullRequest": {
+            "reviewThreads": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

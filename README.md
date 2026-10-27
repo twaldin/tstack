@@ -98,4 +98,4 @@ The separation keeps personal state out of the engine and workers out of the ass
 
 [omp](https://github.com/can1357/oh-my-pi), from can1357, runs the agents. easl provides the boards, terminals, and decision objects. tstack connects them to the instance's files and GitHub PR workflow.
 
-See the [operational reference](docs/reference.md) for setup, managed skill sources, seat waits, updates, commits, boards, lanes, merge gates, PR watching, cleanup, and pstack updates.
+Start with the [local instance guide](docs/getting-started.md). See the [operational reference](docs/reference.md) for setup, managed skill sources, seat waits, updates, commits, boards, lanes, merge gates, PR watching, cleanup, and pstack updates.

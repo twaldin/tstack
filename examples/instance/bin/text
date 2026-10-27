@@ -1,0 +1,8 @@
+#!/bin/sh
+if [ "$1" = inbox ]; then
+    if [ "$2" = --wait ]; then sleep 1800; fi
+    printf '%s\n' 'No messages. This example has no inbox.'
+else
+    printf '%s\n' "Local text preview only: $*"
+    if [ ! -t 0 ]; then cat; fi
+fi
