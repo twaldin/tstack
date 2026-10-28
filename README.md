@@ -96,6 +96,10 @@ The separation keeps personal state out of the engine and workers out of the ass
 
 [pstack](https://github.com/cursor/plugins/tree/main/pstack) is a collection of engineering playbooks by Lauren Tan, known as poteto, in `cursor/plugins`. The vendored fork retains its [MIT license](pstack/LICENSE).
 
+[Ponytail](https://github.com/DietrichGebert/ponytail), by DietrichGebert, supplies the smallest-complete-change ladder and connected-code review skill. Setup links selected skills from a full checkout that retains its [MIT license](https://github.com/DietrichGebert/ponytail/blob/09c434ab73ca43761c5d8b0c5d341926c2fba710/LICENSE).
+
+[Aspera](https://github.com/Swader/aspera), by Bruno Skvorc, informed the independent-first review instruction. tstack uses omp's cross-family roles rather than Aspera's Codex CLI workflow. No Swader skill text or scripts are copied or installed. The [skill assessment](docs/reference.md#swader-skill-assessment) records the adoption decisions and license limits.
+
 [omp](https://github.com/can1357/oh-my-pi), from can1357, runs the agents. easl provides the boards, terminals, and decision objects. tstack connects them to the instance's files and GitHub PR workflow.
 
 Start with the [local instance guide](docs/getting-started.md). See the [operational reference](docs/reference.md) for setup, managed skill sources, seat waits, updates, commits, boards, lanes, merge gates, PR watching, cleanup, and pstack updates.
