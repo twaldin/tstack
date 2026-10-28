@@ -33,7 +33,7 @@ Choose unused paths for the engine and instance. Keep the exported variables in 
 
 Setup links commands into `~/.local/bin`, skills and agents into `~/.omp/agent`, and the seat-waits extension into each seat. It generates `~/.omp/agent/AGENTS.md` from engine, instance, and machine rules. The template's seat instructions do not import the Tim-specific shared assistant and coordinator roles.
 
-Setup also clones external skills into `~/worktrees/frontend-studio/main` and `~/worktrees/mattpocock-skills/main`. These Tim-specific paths and the upstream revisions are not configurable or pinned. Review the [managed skill sources](reference.md) before use. This repository's CI uses self-hosted runners. It does not provision runners for your fork.
+Setup also clones external skills into `~/worktrees/frontend-studio/main` and `~/worktrees/mattpocock-skills/main`. These Tim-specific paths and the upstream revisions are not configurable or pinned. Review the [managed skill sources](reference.md) before use. This repository's CI runs the unit tests and a temporary-HOME setup check on GitHub-hosted Ubuntu with Python 3.12. Forks do not need a self-hosted runner.
 
 On Linux, setup writes systemd user units under `~/.config/systemd/user` and reloads the user manager when a user bus exists. It does not enable the update timer. Leave the timer disabled until you configure an instance Git remote and review `tstack update`. On macOS, setup skips these units. Lanes use the macOS `nohup` backend instead of systemd.
 

@@ -11,13 +11,16 @@ permissions:
 jobs:
   checks:
     name: Unit tests and setup check
-    runs-on: [self-hosted, deckbox]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Unit tests with system Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
         run: python3 -m unittest discover -s tests
       - name: Setup into a temp HOME
         if: ${{ !cancelled() }}
