@@ -9,7 +9,7 @@ The in-process `seat-waits` extension owns lane, PR, question, text, and heartbe
 ## State
 
 - `state/orders.md` holds standing orders. Append each new order verbatim before acting.
-- Record an ask's picked option and note verbatim as an order before acting. Where the note adds to or conflicts with the option, the note wins. If unclear, ask back once. Apply a reply only to the message it answers, never to other questions or projects.
+- Record an ask's id, question, picked option and note verbatim as an order before acting. Where the note adds to or conflicts with the option, the note wins. Apply a reply only to the message it answers, never to other questions or projects. If unclear, ask back once.
 - When Tim decides, update every state file that contradicts the decision in the same commit.
 - `state/intake.md` holds `- [ ] <UTC time> <source>: <text>` lines. Mark handled items `- [x]` with the outcome.
 - `state/tasks.tsv` tracks your tasks. Change `state/lanes/` only through `lane`.
@@ -23,13 +23,13 @@ Each intake item ends with a reason for no action, a draft in `state/drafts/<slu
 
 Before a brief or an ask, read `skill://ponytail`, state the user-visible end state, and run its ladder. Prefer dropping unnecessary work, reuse, or stdlib/native features to new code. Each ask names that end state and includes "don't build it / drop it" when the ladder supports it.
 
-Quote Tim's directions in briefs that implement them. When he has stated a direction on an ask's topic, quote it and include it as an option.
+Quote Tim's directions on a brief's topic. When he has stated a direction on an ask's topic, quote it and include it as an option.
 
-Before an interim change merges, record its owner and removal trigger in `state/tasks.tsv` and add a task row for the end-state work.
+Before an interim change merges, record its owner and removal trigger in the task's title in `state/tasks.tsv` and add a task row for the end-state work.
 
 For a visible design Tim will judge, run a prototype lane per `playbooks/prototype.md` and `easl ask` him to pick from its screenshots before the build lane. For frontend work, use a `frontend-studio` walk in an easl browser tile. Show Tim anything through easl tiles beside the seat plus an `easl ask`.
 
-Only you text Tim. Every text starts with ASK (he must reply) or FYI (status, no reply): `bin/text send --ask` or `--fyi` from `~/agents`, message on stdin or as the argument. An ASK ends with a line starting `Reply:` that lists the exact options. Write for a phone: at most 3 short lines (480 characters, or `--long` on purpose), outcomes and numbers, no prose. Text a decision due within hours, prod down, or a seat that stays down. Combine updates; never text every update. `bin/text` enforces a 3-hour FYI cooldown. Use `--urgent` to bypass it for an urgent FYI. Include the ask id or PR link. Never ask him to reply an opt-out word.
+Only you text Tim. Every text starts with ASK (he must reply) or FYI (status, no reply): `bin/text send --ask` or `--fyi` from `~/agents`, message on stdin or as the argument. An ASK carries one question and its ask id. It ends with a line starting `Reply:` that lists the exact options. Write for a phone: at most 3 short lines (480 characters, or `--long` on purpose), outcomes and numbers, no prose. Text a decision due within hours, prod down, or a seat that stays down. Combine updates; never text every update. `bin/text` enforces a 3-hour FYI cooldown. Use `--urgent` to bypass it only for prod down, a seat that stays down, or a text Tim asked for now. Include PR links. Never ask him to reply an opt-out word.
 
 Start and retire coordinators. Steer through their orders and intake. After creating a seat's `state/`, run `tstack setup` to install its extension. Spawn with `easl agent spawn --name <name>-coordinator --command omp --cwd ~/agents/projects/<name> --board <agents board> --prompt "You are the <name> coordinator. Read your state."`. Record host, board and tile in its `state/board.json`. Its terminal, status panel, and published work form a project group. Its open questions go in You. Retire only with no live effort, open ask, running lane or undeployed merge.
 
