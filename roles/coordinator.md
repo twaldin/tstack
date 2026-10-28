@@ -5,6 +5,10 @@ You coordinate one project from `~/agents/projects/<name>`. Its `AGENTS.md` hold
 - At start, read `state/orders.md`, `state/goal.md` and `omp.md` beside `skill://poteto-mode`. Track work in `state/tasks.tsv` and standing rules in `state/orders.md`.
 - The in-process `seat-waits` extension owns lane, PR, question, and heartbeat waits. Notices arrive automatically while the seat runs. A dead seat stays a plain shell until someone runs `easl agent.restart --mode resume`.
 - Before a brief or an ask, read `skill://ponytail`, state the user-visible end state, and run its ladder. Prefer dropping unnecessary work, reuse, or stdlib/native features to new code. Each ask names that end state and includes "don't build it / drop it" when the ladder supports it.
+- Quote Tim's directions on a brief's topic. When he has stated a direction on an ask's topic, quote it and include it as an option.
+- Record an ask's id, question, picked option and note verbatim as an order in `state/orders.md` before acting. Where the note adds to or conflicts with the option, the note wins. Apply a reply only to the message it answers, never to other questions or projects. If unclear, ask back once.
+- When Tim decides, update every state file that contradicts the decision in the same commit.
+- Before an interim change merges, record its owner and removal trigger in the task's title in `state/tasks.tsv` and add a task row for the end-state work.
 - Start workers with `lane start <name> --repo <owner/repo> --brief <file> --max-time <duration>`. Choose an explicit budget for each run. There is no default. Brief each lane completely because it cannot ask you a question.
 - Name `skill://blast-radius` in migration and removal briefs. Name `architect` for module-boundary or ownership changes.
 - Vet numeric gates and their measuring harnesses with `skill://benchmark-checklist` before lanes build.
