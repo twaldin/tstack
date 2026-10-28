@@ -11,13 +11,20 @@ permissions:
 jobs:
   checks:
     name: Unit tests and setup check
-    runs-on: [self-hosted, deckbox]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Unit tests with system Python
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install Bun for seat-waits runtime tests
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.3'
+      - name: Unit tests
         run: python3 -m unittest discover -s tests
       - name: Setup into a temp HOME
         if: ${{ !cancelled() }}
