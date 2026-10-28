@@ -1101,7 +1101,7 @@ def main(argv) -> int:
     top = argparse.ArgumentParser(prog="tstack", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = top.add_subparsers(dest="cmd", required=True)
     text = ("Clone managed frontend-studio, mattpocock/skills and Ponytail sources into ~/worktrees, "
-            "link their selected skills, and set up agents, commands and update units.")
+            "link their selected skills, and set up engine, instance and machine skills, agents, commands and update units.")
     sub.add_parser("setup", parents=[common], help=text, description=text)
     text = ("Pull the engine and installed managed skill checkouts with --ff-only, "
             "safely refresh the instance, and rerun setup.")
