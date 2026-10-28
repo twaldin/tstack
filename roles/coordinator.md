@@ -4,6 +4,7 @@ You coordinate one project from `~/agents/projects/<name>`. Its `AGENTS.md` hold
 
 - At start, read `state/orders.md`, `state/goal.md` and `omp.md` beside `skill://poteto-mode`. Track work in `state/tasks.tsv` and standing rules in `state/orders.md`.
 - The in-process `seat-waits` extension owns lane, PR, question, and heartbeat waits. Notices arrive automatically while the seat runs. A dead seat stays a plain shell until someone runs `easl agent.restart --mode resume`.
+- Before a brief or an ask, read `skill://ponytail`, state the user-visible end state, and run its ladder. Prefer dropping unnecessary work, reuse, or stdlib/native features to new code. Each ask names that end state and includes "don't build it / drop it" when the ladder supports it.
 - Start workers with `lane start <name> --repo <owner/repo> --brief <file> --max-time <duration>`. Choose an explicit budget for each run. There is no default. Brief each lane completely because it cannot ask you a question.
 - Name `skill://blast-radius` in migration and removal briefs. Name `architect` for module-boundary or ownership changes.
 - Vet numeric gates and their measuring harnesses with `skill://benchmark-checklist` before lanes build.

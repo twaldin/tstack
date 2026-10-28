@@ -8,18 +8,41 @@ tstack runs pstack's engineering playbooks in [omp](https://github.com/can1357/o
 
 `tstack setup` links the engine and instance skills, agent types, and commands, and writes `~/.omp/agent/AGENTS.md` and the systemd update units. It replaces only its own links and files. Install git, Python 3.10 or newer, authenticated `gh`, omp, and easl, then clone the engine to `~/tstack` and the instance to `~/agents`. Run `~/tstack/bin/tstack setup`, with `--machine <name>` if needed. On Linux, enable hourly updates with `systemctl --user enable --now tstack-update.timer`. On macOS, setup skips systemd units, and coordinators run `tstack update` on heartbeat. `TSTACK_HOME`, `TSTACK_INSTANCE`, `TSTACK_MACHINE`, and `TSTACK_WORKTREES` override the engine, instance, machine, and worktree locations. `TSTACK_SEAT` selects a seat instead of the nearest ancestor directory with `state/`.
 
-Setup manages two full git checkouts with the existing git authentication:
+Setup manages three full git checkouts with the existing git authentication:
 
 | Source | Checkout | Installed skill |
 | --- | --- | --- |
 | [twaldin/frontend-studio](https://github.com/twaldin/frontend-studio) | `~/worktrees/frontend-studio/main` | `~/.omp/agent/skills/frontend-studio` links to the checkout root. |
 | [mattpocock/skills](https://github.com/mattpocock/skills) | `~/worktrees/mattpocock-skills/main` | `~/.omp/agent/skills/grilling` links to `skills/productivity/grilling` in the checkout. |
+| [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) | `~/worktrees/ponytail/main` | `~/.omp/agent/skills/ponytail` and `ponytail-review` link to their directories under `skills/`. |
 
-Frontend-studio's `SKILL.md` references `../grilling/SKILL.md`. Setup also links `~/worktrees/frontend-studio/grilling` to the grilling skill root, so that reference works through both the installed skill link and the canonical checkout path. Grilling has no further sibling-skill dependencies. Only these two skills are installed from the managed sources. Full checkouts retain their source and license files. There are no gitlinks or vendored dependency files in the instance.
+Frontend-studio's `SKILL.md` references `../grilling/SKILL.md`. Setup also links `~/worktrees/frontend-studio/grilling` to the grilling skill root, so that reference works through both the installed skill link and the canonical checkout path. Grilling and the two selected Ponytail skills have no further sibling-skill dependencies. Full checkouts retain their source and license files. There are no gitlinks or vendored dependency files in the instance.
 
-Engine, instance, and machine skills override either managed default, in that order. The canonical sibling link continues to use the managed grilling source. Setup preserves user-owned files, directories, and unrelated symlinks at skill destinations and the sibling path, and reports collisions. It also preserves content that blocks a checkout. A failed clone, missing required `SKILL.md`, or unresolved dependency makes setup return nonzero while other setup steps continue. Git failures include git's native error. Repeated setup keeps existing managed links.
+Setup clones each source's default branch, not a pinned commit, and leaves existing checkouts at their current revision. Ponytail currently defaults to `main`; the reviewed revision is [`09c434ab73ca43761c5d8b0c5d341926c2fba710`](https://github.com/DietrichGebert/ponytail/tree/09c434ab73ca43761c5d8b0c5d341926c2fba710). `tstack update` fast-forwards the checkout's tracking branch. The reviewed revision is provenance, not a version lock.
+
+Only `ponytail` and `ponytail-review` are installed from Ponytail. Repository-wide `ponytail-audit` is outside this change-review task. `ponytail-debt` inventories shortcut comments, for which this integration has no inventory to manage. `ponytail-gain` reports upstream benchmark results rather than local evidence. `ponytail-help` describes plugin controls this installation does not provide. Setup installs no Ponytail plugin, hooks, command handlers, or automatic per-turn injection.
+
+The assistant and coordinator load Ponytail before briefs and asks. Lanes load it before code and hand back work that fails its ladder. Reviewers use `ponytail-review` in addition to correctness checks. The existing cross-family READY verdict on the exact head remains the merge gate; Ponytail's "Ship" wording does not replace it. Project safety rules and explicit acceptance criteria still apply.
+
+Engine, instance, and machine skills override managed defaults, in that order. The canonical sibling link continues to use the managed grilling source. Setup preserves user-owned files, directories, and unrelated symlinks at skill destinations and the sibling path, and reports collisions. It also preserves content that blocks a checkout. A failed clone, missing required `SKILL.md`, or unresolved dependency makes setup return nonzero while other setup steps continue. Git failures include git's native error. Repeated setup keeps existing managed links.
 
 Setup does not install the studio's JavaScript dependencies or start a server or daemon. Follow the skill when you need the studio.
+
+### Swader skill assessment
+
+The assessment read each complete `SKILL.md` and searched every tracked tree for license terms at the linked revisions. None contains a license file or an embedded reuse grant. None is installed, copied, or vendored. The Aspera adaptation below uses independently written instructions, not upstream text or scripts.
+
+- [Aspera](https://github.com/Swader/aspera/blob/0be83bcc08934b6a68e33534e08f09fea5af32a8/SKILL.md): adapt. It treats the second model as a peer whose findings the owner must verify, not an authority whose verdict can be pasted back. The lane now requires that check and an independent first pass. pstack already provides adversarial review, and `lane merge` already checks model family and head identity. Reuse omp's roles, including `@review` for GPT-6 Astra when cross-family and `@opus` for OpenAI-authored work. This adds no mandatory review round or separate CLI lifecycle. The source has no license grant, so its launcher and skill text are excluded.
+
+- [Be Thorough](https://github.com/Swader/skill-be-thorough/blob/3d752383e8fd32eab21ae44d67d5f20c7fe12693/SKILL.md): skip. Its requirement-to-evidence ledger is useful for broad work, but pstack's task tracking and actual-artifact proof already cover this integration. It can add coding, completeness, persona, and weaker-model canary reviews. Those passes do not establish anything the existing exact-head gate is missing by default. Its roughly 5 KB skill and conditional references would add another instruction load, and its Codex-specific workflow needs translation. No license grant is present.
+
+- [Audit Code](https://github.com/Swader/agent-skills-audit/blob/c9141547db94ae39d5ef60ab34c0c3da03291ff7/SKILL.md): skip as a default review skill. Its strongest addition is tracing a success-shaped value back to the authority, scope, and freshness that produced it, then trying a counterexample. That is useful for a targeted authorization or lifecycle audit. Its general evidence and invariant checks overlap pstack's review rubric. The full skill, framework, and overlays total about 76 KB before source evidence, too much for routine change review. No license grant is present.
+
+- [Debt Collector](https://github.com/Swader/skills-debt-collector/blob/9e29f429beeb9e006c8de6311ec2e6cc79b8b7cd/SKILL.md): skip. It ranks deletion candidates by risk and gain and checks their historical purpose and alternate uses. pstack's Refactoring, `why`, and `blast-radius` already supply those investigations when deletion needs them. Loading its roughly 9 KB skill and 11 KB protocol for every review would turn a bounded diff review into a debt audit. The cross-family gate remains independent of that audit choice. No license grant is present.
+
+- [Agent Skill Learn](https://github.com/Swader/agent-skill-learn/blob/bf2bff44091e803c366fdb55e3b29f7a41013741/skills/agent-skill-learn/SKILL.md): skip. This is human spaced-repetition practice with recall cards and SQLite scheduling, not a review or agent-improvement workflow. It adds a Python deck tool, persistent learning state, and interactive questions without improving pstack's review evidence or the merge gate. Existing `correct` addresses repeated agent mistakes. No license grant is present.
+
+- [Clauditor](https://github.com/Swader/clauditor/blob/b02f2e878aee535c17b88e4410a029d82cd310ac/SKILL.md): skip. Audience-specific review can expose installer or operator problems, but an all-Claude persona panel does not add model-family independence. pstack's `interrogate` already handles independent findings and lead judgment. Its Claude CLI authentication, watchdog, retries, and result collection duplicate omp, while persona panels and repeated rounds add review cost. The narrow independent-first instruction needs none of that machinery. No license grant is present.
 
 ## Seat waits
 
@@ -31,7 +54,7 @@ The extension restores waits from state on startup, reconciles them as state cha
 
 ## Update
 
-`tstack update` pulls the engine and both installed managed checkouts with `git pull --ff-only`, fetches the instance, syncs upstream files without overwriting changed local files or seat state, and reruns setup. Setup clones either managed checkout if it is missing and restores missing skill and sibling links. Updates do not reset, stash, or discard local checkout edits. A failed pull reports git's native error and makes update return nonzero, even if the other repositories and setup succeed. The hourly systemd timer runs the same command.
+`tstack update` pulls the engine and all installed managed checkouts with `git pull --ff-only`, fetches the instance, syncs upstream files without overwriting changed local files or seat state, and reruns setup. Setup clones any missing managed checkout and restores missing skill and sibling links. Updates do not reset, stash, or discard local checkout edits. A failed pull reports git's native error and makes update return nonzero, even if the other repositories and setup succeed. The hourly systemd timer runs the same command.
 
 ## Commit
 

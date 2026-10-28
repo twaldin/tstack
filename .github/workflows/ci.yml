@@ -36,3 +36,8 @@ jobs:
           test -f "$HOME/.omp/agent/skills/poteto-mode/omp.md"
           test -f "$HOME/.omp/agent/agents/poteto-agent.md"
           test -x "$HOME/.local/bin/lane"
+          test -L "$HOME/.omp/agent/skills/ponytail"
+          test -L "$HOME/.omp/agent/skills/ponytail-review"
+          test -f "$HOME/.omp/agent/skills/ponytail/SKILL.md"
+          test -f "$HOME/.omp/agent/skills/ponytail-review/SKILL.md"
+          test -f "$HOME/worktrees/ponytail/main/LICENSE"

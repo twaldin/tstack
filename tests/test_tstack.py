@@ -49,11 +49,21 @@ class Setup(Sandbox):
             "skills/productivity/grilling/references/guide.md": "Ask the next question.\n",
             "skills/unneeded/SKILL.md": "Do not install me.\n"})
         shutil.rmtree(self.mattpocock)
+        self.ponytail = self.home / "worktrees/ponytail/main"
+        self.ponytail_remote = self.root / "ponytail.git"
+        self.clone(self.ponytail_remote, self.ponytail, {
+            "LICENSE": "Ponytail license\n",
+            "skills/ponytail/SKILL.md": "# Ponytail\n",
+            "skills/ponytail-review/SKILL.md": "# Ponytail review\n",
+            "skills/ponytail-audit/SKILL.md": "Do not install me.\n"})
+        shutil.rmtree(self.ponytail)
         config = self.root / "gitconfig"
         config.write_text(f'[url "{self.frontend_remote}"]\n'
                           '\tinsteadOf = https://github.com/twaldin/frontend-studio.git\n'
                           f'[url "{self.mattpocock_remote}"]\n'
-                          '\tinsteadOf = https://github.com/mattpocock/skills.git\n')
+                          '\tinsteadOf = https://github.com/mattpocock/skills.git\n'
+                          f'[url "{self.ponytail_remote}"]\n'
+                          '\tinsteadOf = https://github.com/DietrichGebert/ponytail.git\n')
         self.env["GIT_CONFIG_GLOBAL"] = str(config)
         self.env["GIT_CONFIG_NOSYSTEM"] = "1"
         self.env["GIT_ALLOW_PROTOCOL"] = "file"
@@ -68,6 +78,8 @@ class Setup(Sandbox):
         self.assertEqual(self.links(".omp/agent/skills"), {
             "frontend-studio": str(self.frontend),
             "grilling": str(self.grilling),
+            "ponytail": str(self.ponytail / "skills/ponytail"),
+            "ponytail-review": str(self.ponytail / "skills/ponytail-review"),
             "mac-gui": str(box / "skills" / "mac-gui"), "poteto-mode": str(pstack / "skills" / "poteto-mode"),
             "principle-x": str(pstack / "skills" / "principle-x"), "writing": str(self.instance / "skills" / "writing")})
         self.assertEqual((self.home / ".omp/agent/skills/frontend-studio/SKILL.md").read_text(),
@@ -95,6 +107,8 @@ class Setup(Sandbox):
         self.assertEqual(self.links(".omp/agent/skills"), {
             "frontend-studio": str(self.frontend),
             "grilling": str(self.grilling),
+            "ponytail": str(self.ponytail / "skills/ponytail"),
+            "ponytail-review": str(self.ponytail / "skills/ponytail-review"),
             "mac-gui": str(box / "skills" / "mac-gui"), "poteto-mode": str(pstack / "skills" / "poteto-mode"),
             "principle-x": str(pstack / "skills" / "principle-x"), "writing": str(self.instance / "skills" / "writing")})
         self.assertEqual(self.links(".omp/agent/agents"), {
@@ -379,11 +393,12 @@ class Setup(Sandbox):
         self.assertIn("already exists and is not an empty directory", result.stdout)
         self.assertEqual((self.mattpocock / "notes.md").read_text(), "user checkout\n")
 
-    def test_update_fast_forwards_both_managed_repositories_and_restores_dependency_links(self):
+    def test_update_fast_forwards_managed_repositories_and_restores_skill_links(self):
         self.cli("tstack", "setup")
         for label, remote, name in (("frontend-studio", self.frontend_remote, "SKILL.md"),
                                     ("mattpocock-skills", self.mattpocock_remote,
-                                     "skills/productivity/grilling/SKILL.md")):
+                                     "skills/productivity/grilling/SKILL.md"),
+                                    ("ponytail", self.ponytail_remote, "skills/ponytail/SKILL.md")):
             seed = self.root / f"seed-{label}"
             with (seed / name).open("a") as file:
                 file.write("upstream update\n")
@@ -391,9 +406,11 @@ class Setup(Sandbox):
             git(seed, "push", "--quiet", str(remote), "main")
         (self.frontend.parent / "grilling").unlink()
         (self.home / ".omp/agent/skills/grilling").unlink()
+        (self.home / ".omp/agent/skills/ponytail-review").unlink()
         (self.grilling / "notes.md").write_text("local dependency content\n")
         result = self.cli("tstack", "update")
-        for label, checkout in (("frontend-studio", self.frontend), ("mattpocock-skills", self.mattpocock)):
+        for label, checkout in (("frontend-studio", self.frontend), ("mattpocock-skills", self.mattpocock),
+                                ("ponytail", self.ponytail)):
             self.assertIn(f"{label}:", result.stdout)
             self.assertEqual(git(checkout, "rev-parse", "HEAD"),
                              git(self.root / f"seed-{label}", "rev-parse", "HEAD"))
@@ -401,6 +418,10 @@ class Setup(Sandbox):
                          "# Grilling\n[Guide](references/guide.md)\nupstream update\n")
         self.assertEqual((self.grilling / "notes.md").read_text(), "local dependency content\n")
         self.assertEqual(os.readlink(self.home / ".omp/agent/skills/grilling"), str(self.grilling))
+        self.assertEqual((self.home / ".omp/agent/skills/ponytail/SKILL.md").read_text(),
+                         "# Ponytail\nupstream update\n")
+        self.assertEqual(os.readlink(self.home / ".omp/agent/skills/ponytail-review"),
+                         str(self.ponytail / "skills/ponytail-review"))
 
     def test_dependency_pull_failure_preserves_local_edit_and_reports_native_error(self):
         self.cli("tstack", "setup")
